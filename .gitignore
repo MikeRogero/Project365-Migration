@@ -1,0 +1,36 @@
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local browser/test captures
+.playwright-cli/
+
+# Private/local Project365 archive material and generated outputs.
+# These contain original photos, diary/media exports, SQLite databases,
+# runtime logs, and reconciliation artifacts that should remain local.
+Project365Canonical/
+Source Data/
+Reports/
+DiariumContractTests/
+LinearExports/
+project365-original-picker.png
+
+# Local planning/workflow notes. Keep GitHub to code, tests, and lightweight
+# code configuration only.
+PROJECT365_TO_DIARIUM_MIGRATION_PLAN.md
+docs/
+
+# Common local secrets/config overrides
+.env
+.env.*
+*.local

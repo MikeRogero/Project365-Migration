@@ -1,0 +1,46 @@
+{
+  "adapter_id": "x_archive_posts_v1",
+  "source_name": "x_archive",
+  "version": 1,
+  "privacy": {
+    "local_only": true,
+    "do_not_upload_source_archives": true,
+    "metadata_reports_only": true
+  },
+  "files": [
+    {
+      "id": "tweets",
+      "path": "data/tweets.js",
+      "format": "json_js_assignment",
+      "assignment_prefix": "window.YTD.tweets.part0 = ",
+      "encoding": "utf-8",
+      "required": true
+    }
+  ],
+  "record": {
+    "file_id": "tweets",
+    "record_selector": "$[*].tweet",
+    "fields": {
+      "source_id": "$.id_str",
+      "timestamp": "$.created_at",
+      "text": "$.full_text",
+      "urls": "$.entities.urls[*].expanded_url",
+      "media_references": [
+        "$.extended_entities.media[*].media_url_https",
+        "$.entities.media[*].media_url_https"
+      ],
+      "latitude": "$.geo.coordinates[0]",
+      "longitude": "$.geo.coordinates[1]",
+      "place_name": "$.place.full_name"
+    },
+    "filters": {
+      "require_any": ["text", "media_references", "place_name", "latitude"]
+    }
+  },
+  "staging_policy": {
+    "default_diarium_action": "review_before_import",
+    "preserve_raw_source_id": true,
+    "preserve_source_file_path": true,
+    "do_not_modify_source_archive": true
+  }
+}
