@@ -1,6 +1,6 @@
-# Project365 Migration Toolkit
+# Project365 and Project365 Pro App Migration Toolkit
 
-Project365 Migration Toolkit is a local-first migration and enrichment workflow for
+Project365 Photo App Migration Toolkit is a local-first migration and enrichment workflow for
 long-running Project365 archives. It validates Project365 exports, builds a
 canonical SQLite archive, helps recover higher-quality original photos, enriches
 entries with modern metadata, and produces Diarium-ready import packages.
