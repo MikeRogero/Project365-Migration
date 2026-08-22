@@ -450,5 +450,4 @@ making the workflow easier for other Project365 users to adapt.
 
 ## License
 
-No license has been selected yet. Add an explicit open-source license before
-announcing or distributing the project publicly.
+This project is released under the MIT License. See `LICENSE` for details.
