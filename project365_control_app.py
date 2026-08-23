@@ -34,6 +34,8 @@ from project365_original_reference_pipeline import (
 )
 from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY, derivative_readiness_summary
 import project365_original_picker as original_picker
+import project365_broad_visual_match as broad_visual_match
+import project365_diary_enrichment as diary_enrichment
 from project365_paths import ORIGINAL_PHOTOS_ROOT, PROJECT365_PRO_EXPORT_ZIPS_DIR
 
 
@@ -46,6 +48,7 @@ ORIGINAL_UNCLEAR_GROUPS = VERIFY_REPORT_DIR / "original_photo_unclear_groups.csv
 ORIGINAL_BATCH_PLAN = VERIFY_REPORT_DIR / "original_photo_search_batch_plan.csv"
 ORIGINAL_SEARCH_ATTEMPTS = VERIFY_REPORT_DIR / "original_photo_search_attempts.csv"
 PHOTO_LIBRARY_INDEX = CANONICAL_ROOT / "photo_library_index.sqlite"
+BROAD_VISUAL_DB = CANONICAL_ROOT / "broad_visual_match.sqlite"
 TAG_QUEUE = VERIFY_REPORT_DIR / "tag_review_queue.csv"
 DIGIKAM_PEOPLE_REPORT = VERIFY_REPORT_DIR / "digikam_people_import_report.csv"
 DIARIUM_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "diarium_import_batches"
@@ -77,13 +80,21 @@ class ControlState:
         self._job_processes: dict[str, subprocess.Popen[Any]] = {}
         self._picker_state: original_picker.PickerState | None = None
         self._active_photo_index_folder = ""
+        self._broad_image_paths: dict[str, Path] = {}
         self.history = _load_control_run_history(CONTROL_RUN_HISTORY)
 
     def status(self, steps: list[str] | None = None) -> dict[str, Any]:
         if steps is not None:
             return self._scoped_status(steps)
+        active_jobs = self._active_jobs()
+        active_owners = {_owner_step(str(job.get("step", ""))) for job in active_jobs}
         diarium_package = _diarium_package_status(DIARIUM_IMPORT_BATCH_DIR)
         diarium_local = _diarium_local_status(DIARIUM_DB_PATH)
+        photo_library_index = (
+            _busy_photo_library_index_status(PHOTO_LIBRARY_INDEX)
+            if "build_photo_index" in active_owners
+            else _photo_library_index_status(PHOTO_LIBRARY_INDEX)
+        )
         status = {
             "paths": {
                 "project365_zips": _path_status(PROJECT365_PRO_EXPORT_ZIPS_DIR),
@@ -93,16 +104,18 @@ class ControlState:
                 "original_batch_plan": _path_status(ORIGINAL_BATCH_PLAN),
                 "original_search_attempts": _path_status(ORIGINAL_SEARCH_ATTEMPTS),
                 "photo_library_index": _path_status(PHOTO_LIBRARY_INDEX),
+                "broad_visual_match": _path_status(BROAD_VISUAL_DB),
                 "tag_queue": _path_status(TAG_QUEUE),
                 "digikam_people_report": _path_status(DIGIKAM_PEOPLE_REPORT),
             },
             "database": _database_status(CANONICAL_ROOT / "canonical.db"),
-            "photo_library_index": _photo_library_index_status(PHOTO_LIBRARY_INDEX),
+            "photo_library_index": photo_library_index,
             "original_queue": _queue_status(ORIGINAL_QUEUE),
             "crop_confirmation": self.crop_confirmation_status(),
             "original_remainder_overview": _remainder_overview(ORIGINAL_UNCLEAR_GROUPS),
             "original_batch_plan": _batch_plan_status(ORIGINAL_BATCH_PLAN, ORIGINAL_SEARCH_ATTEMPTS),
             "original_search_attempts": _search_attempt_status(ORIGINAL_SEARCH_ATTEMPTS),
+            "broad_visual_match": _broad_visual_status(),
             "diarium_package": diarium_package,
             "diarium_local": diarium_local,
             "diarium_import_verification": _diarium_import_verification(
@@ -110,7 +123,7 @@ class ControlState:
                 diarium_local,
             ),
             "history": self.history[-20:],
-            "active_jobs": self._active_jobs(),
+            "active_jobs": active_jobs,
         }
         status["top_metrics"] = _top_metrics(
             status["database"],
@@ -125,10 +138,14 @@ class ControlState:
             for owner in (_owner_step(str(step).strip()) for step in steps)
             if owner in WORKFLOW_STEPS
         }
+        active_jobs = self._active_jobs()
+        active_owners = {_owner_step(str(job.get("step", ""))) for job in active_jobs}
         status: dict[str, Any] = {
-            "top_metrics": _initial_top_metrics(),
+            "top_metrics": _initial_top_metrics(
+                include_photo_index="build_photo_index" not in active_owners
+            ),
             "history": self.history[-20:],
-            "active_jobs": self._active_jobs(),
+            "active_jobs": active_jobs,
             "workflow_history": _workflow_history(self.history),
         }
         paths: dict[str, Any] = {}
@@ -136,13 +153,24 @@ class ControlState:
             paths["project365_zips"] = _path_status(PROJECT365_PRO_EXPORT_ZIPS_DIR)
         if "build_photo_index" in requested:
             paths["photo_library_index"] = _path_status(PHOTO_LIBRARY_INDEX)
-            status["photo_library_index"] = _photo_library_index_status(PHOTO_LIBRARY_INDEX)
+            status["photo_library_index"] = (
+                _busy_photo_library_index_status(PHOTO_LIBRARY_INDEX)
+                if "build_photo_index" in active_owners
+                else _photo_library_index_status(PHOTO_LIBRARY_INDEX)
+            )
         if "match_easy_originals" in requested:
-            status["photo_library_index"] = _photo_library_index_status(PHOTO_LIBRARY_INDEX)
+            status["photo_library_index"] = (
+                _busy_photo_library_index_status(PHOTO_LIBRARY_INDEX)
+                if "build_photo_index" in active_owners
+                else _photo_library_index_status(PHOTO_LIBRARY_INDEX)
+            )
             status["original_queue"] = _queue_status(ORIGINAL_QUEUE)
             status["original_remainder_overview"] = _remainder_overview(ORIGINAL_UNCLEAR_GROUPS)
             status["original_batch_plan"] = _batch_plan_status(ORIGINAL_BATCH_PLAN, ORIGINAL_SEARCH_ATTEMPTS)
             status["original_search_attempts"] = _search_attempt_status(ORIGINAL_SEARCH_ATTEMPTS)
+        if "broad_visual_match" in requested:
+            paths["broad_visual_match"] = _path_status(BROAD_VISUAL_DB)
+            status["broad_visual_match"] = _broad_visual_status()
         if "crop_confirmation" in requested:
             status["crop_confirmation"] = self.crop_confirmation_status()
         if "generate_derivatives" in requested:
@@ -175,15 +203,25 @@ class ControlState:
                 "error": str(exc),
                 "total_count": 0,
                 "with_crop_count": 0,
+                "estimated_crop_count": 0,
+                "confirmed_crop_count": 0,
                 "queued_count": 0,
                 "pending_commit_count": 0,
             }
         with_crop_count = sum(1 for entry in entries if entry.get("crop_has_crop"))
+        estimated_crop_count = sum(
+            1
+            for entry in entries
+            if entry.get("crop_has_crop") and str(entry.get("crop_source", "")).strip().lower() == "estimated"
+        )
+        confirmed_crop_count = max(0, with_crop_count - estimated_crop_count)
         queued_count = max(0, len(entries) - with_crop_count)
         return {
             "exists": True,
             "total_count": len(entries),
             "with_crop_count": with_crop_count,
+            "estimated_crop_count": estimated_crop_count,
+            "confirmed_crop_count": confirmed_crop_count,
             "queued_count": queued_count,
             "pending_commit_count": int(pending_commits.get("pending_count") or 0),
         }
@@ -272,6 +310,20 @@ class ControlState:
     def active_photo_index_folder(self) -> str:
         with self._picker_lock:
             return self._active_photo_index_folder
+
+    def broad_image_token(self, path_text: str) -> str:
+        text = str(path_text or "").strip()
+        if not text:
+            return ""
+        path = Path(text)
+        token = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+        with self._picker_lock:
+            self._broad_image_paths[token] = path
+        return token
+
+    def broad_image_path(self, token: str) -> Path | None:
+        with self._picker_lock:
+            return self._broad_image_paths.get(token)
 
     def _update_active_photo_index_folder(self, step: str, payload: dict[str, Any]) -> None:
         if step not in {"match_easy_originals", "search_originals"}:
@@ -496,7 +548,7 @@ def _run_command(
                 break
     finally:
         process.stdout.close()
-    wait_timeout = 1 if cancel_event and cancel_event.is_set() else 5
+    wait_timeout = 30 if cancel_event and cancel_event.is_set() else 5
     try:
         returncode = process.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
@@ -525,7 +577,7 @@ def _terminate_process_group(process: subprocess.Popen[Any], force: bool = False
 
 
 def _step_timeout_seconds(step: str) -> int:
-    if step in {"build_photo_index", "refresh_photo_index_metadata"}:
+    if step in {"build_photo_index", "refresh_photo_index_metadata", "broad_visual_index", "broad_visual_match"}:
         return 12 * 60 * 60
     return 60 * 60
 
@@ -603,15 +655,19 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             command.extend(["--photo-index-folder", photo_index_folder])
         if payload.get("replace_existing_queue"):
             command.append("--replace-existing-queue")
+        if payload.get("include_low_quality_matches"):
+            command.append("--include-low-quality-matches")
         if _has_targeted_search_scope(payload):
             command.append("--merge-existing-queue")
         return [command]
     if step == "build_photo_index":
         roots = []
         for root in payload.get("search_roots", []):
-            root_text = str(root).strip()
+            root_text = _folder_root_from_text(str(root))
             if root_text and root_text not in roots:
                 roots.append(root_text)
+        if not roots:
+            roots = _photo_library_index_roots(PHOTO_LIBRARY_INDEX)
         if not roots:
             roots.append(str(SOURCE_DATA_ROOT))
         reset_photo_index = bool(payload.get("reset_photo_index"))
@@ -629,7 +685,13 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             command.extend(["--index-root", root])
         return [command]
     if step == "refresh_photo_index_metadata":
-        roots = _photo_library_index_roots(PHOTO_LIBRARY_INDEX)
+        roots = []
+        for root in payload.get("search_roots", []):
+            root_text = _folder_root_from_text(str(root))
+            if root_text and root_text not in roots:
+                roots.append(root_text)
+        if not roots:
+            roots = _photo_library_index_roots(PHOTO_LIBRARY_INDEX)
         if not roots:
             raise ValueError("No existing photo index roots found. Choose folders and build the photo index first.")
         command = [
@@ -640,6 +702,143 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
         ]
         for root in roots:
             command.extend(["--index-root", root])
+        return [command]
+    if step == "broad_visual_index":
+        roots = []
+        for root in payload.get("candidate_roots", []):
+            root_text = _folder_root_from_text(str(root))
+            if root_text and root_text not in roots:
+                roots.append(root_text)
+        confirmed_only = bool(payload.get("confirmed_only"))
+        if confirmed_only:
+            command = [
+                python,
+                "project365_broad_visual_match.py",
+                "--canonical-root",
+                str(CANONICAL_ROOT),
+                "index-confirmed",
+                "--density",
+                str(int(payload.get("density") or broad_visual_match.DEFAULT_DENSITY)),
+            ]
+            for entry_id in _payload_list(payload, "entry_ids"):
+                command.extend(["--entry-id", entry_id])
+            start_date = str(payload.get("start_date", "")).strip()
+            end_date = str(payload.get("end_date", "")).strip()
+            if start_date:
+                command.extend(["--start-date", start_date])
+            if end_date:
+                command.extend(["--end-date", end_date])
+            needed_list = str(payload.get("broad_search_needed_list", "")).strip()
+            if needed_list:
+                command.extend(["--broad-search-needed-list", needed_list])
+            if payload.get("include_low_quality_candidates"):
+                command.append("--include-low-quality")
+            if payload.get("overwrite_existing_fingerprints") or payload.get("rebuild_stale_descriptors"):
+                command.append("--overwrite-existing")
+            if payload.get("dry_run"):
+                command.append("--dry-run")
+            return [command]
+        if not roots:
+            roots = _photo_library_index_roots(PHOTO_LIBRARY_INDEX)
+        if not roots:
+            raise ValueError("Choose candidate folders or build the photo index first.")
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "index",
+            "--density",
+            str(int(payload.get("density") or broad_visual_match.DEFAULT_DENSITY)),
+        ]
+        for root in roots:
+            command.extend(["--candidate-root", root])
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        date_window_days = int(payload.get("date_window_days") or 0)
+        if date_window_days:
+            command.extend(["--date-window-days", str(date_window_days)])
+        if payload.get("include_low_quality_candidates"):
+            command.append("--include-low-quality")
+        if payload.get("overwrite_existing_fingerprints") or payload.get("rebuild_stale_descriptors"):
+            command.append("--overwrite-existing")
+        if payload.get("dry_run"):
+            command.append("--dry-run")
+        return [command]
+    if step == "broad_visual_match":
+        if payload.get("confirmed_only"):
+            raise ValueError(
+                "Confirmed-original accuracy test is not an unresolved search. "
+                "Use Measure accuracy to compare against already confirmed originals, "
+                "or uncheck it before searching unresolved photos."
+            )
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "match",
+            "--candidate-scope",
+            str(payload.get("candidate_scope") or "whole_indexed_library"),
+            "--max-results",
+            str(int(payload.get("max_results") or broad_visual_match.DEFAULT_TOP_N)),
+            "--density",
+            str(int(payload.get("density") or broad_visual_match.DEFAULT_DENSITY)),
+        ]
+        for entry_id in _payload_list(payload, "entry_ids"):
+            command.extend(["--entry-id", entry_id])
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        needed_list = str(payload.get("broad_search_needed_list", "")).strip()
+        if needed_list:
+            command.extend(["--broad-search-needed-list", needed_list])
+        for root in payload.get("candidate_roots", []):
+            root_text = _folder_root_from_text(str(root))
+            if root_text:
+                command.extend(["--candidate-root", root_text])
+        date_window_days = payload.get("date_window_days")
+        if date_window_days not in (None, ""):
+            command.extend(["--date-window-days", str(int(date_window_days))])
+        if payload.get("include_low_quality_candidates"):
+            command.append("--include-low-quality")
+        if payload.get("resume_existing_run"):
+            latest_run_id = _latest_broad_match_run_id(BROAD_VISUAL_DB)
+            if latest_run_id:
+                command.extend(["--resume-run", latest_run_id])
+        if payload.get("dry_run"):
+            command.append("--dry-run")
+        return [command]
+    if step == "broad_visual_benchmark":
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "benchmark",
+            "--max-results",
+            str(int(payload.get("max_results") or broad_visual_match.DEFAULT_TOP_N)),
+            "--report-dir",
+            str(VERIFY_REPORT_DIR),
+        ]
+        for entry_id in _payload_list(payload, "entry_ids"):
+            command.extend(["--entry-id", entry_id])
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        needed_list = str(payload.get("broad_search_needed_list", "")).strip()
+        if needed_list:
+            command.extend(["--broad-search-needed-list", needed_list])
         return [command]
     if step == "apply_original_decisions":
         return [
@@ -745,20 +944,27 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             command.extend(["--suggestions-csv", suggestions_csv])
         return [command]
     if step == "generate_derivatives":
-        return [
-            [
-                python,
-                "project365_media_derivatives.py",
-                "--canonical-root",
-                str(CANONICAL_ROOT),
-                "--format",
-                "jpeg",
-                "--long-edge",
-                "2560",
-                "--quality",
-                "88",
-            ]
+        command = [
+            python,
+            "project365_media_derivatives.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "--format",
+            "jpeg",
+            "--long-edge",
+            "2560",
+            "--quality",
+            "88",
         ]
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        if payload.get("force"):
+            command.append("--force")
+        return [command]
     if step == "generate_diarium_package":
         date_range = _entry_date_range(CANONICAL_ROOT / "canonical.db")
         start_date = str(payload.get("start_date") or date_range[0] or "1900-01-01")
@@ -857,12 +1063,81 @@ def _persistable_history_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _broad_visual_status() -> dict[str, Any]:
+    status = broad_visual_match.broad_status(BROAD_VISUAL_DB)
+    status["latest_benchmark"] = _latest_broad_visual_benchmark(VERIFY_REPORT_DIR)
+    return status
+
+
+def _latest_broad_visual_benchmark(report_dir: Path) -> dict[str, Any]:
+    latest = report_dir / "broad_visual_benchmark_latest.json"
+    candidates = [latest] if latest.exists() else []
+    if not candidates:
+        candidates = sorted(
+            path
+            for path in report_dir.glob("broad_visual_benchmark_*.json")
+            if path.name != "broad_visual_benchmark_latest.json"
+        )
+    if not candidates:
+        return {}
+    report_path = candidates[-1]
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"path": str(report_path), "error": "Could not read latest benchmark report."}
+    summary = dict(payload.get("summary") or {})
+    summary["path"] = str(report_path)
+    return summary
+
+
+def _broad_photo_facts(path_text: str) -> dict[str, Any]:
+    path = Path(str(path_text or ""))
+    if not path_text or not path.exists() or not path.is_file():
+        return {"mime_type": "", "byte_size": 0, "dimensions": "", "has_geolocation": False}
+    mime_type, _encoding = mimetypes.guess_type(str(path))
+    indexed_geo = _photo_index_has_geolocation(PHOTO_LIBRARY_INDEX, path)
+    embedded_geo = False if indexed_geo else original_picker._has_embedded_geolocation(path)
+    return {
+        "mime_type": mime_type or "application/octet-stream",
+        "byte_size": path.stat().st_size,
+        "dimensions": original_picker._image_dimensions(path),
+        "has_geolocation": bool(indexed_geo or embedded_geo),
+    }
+
+
+def _photo_index_has_geolocation(index_path: Path, path: Path) -> bool:
+    if not index_path.exists():
+        return False
+    try:
+        with sqlite3.connect(index_path, timeout=1) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(photo_library_files)")
+            }
+            if not {"gps_latitude", "gps_longitude"}.issubset(columns):
+                return False
+            row = connection.execute(
+                """
+                SELECT gps_latitude, gps_longitude
+                FROM photo_library_files
+                WHERE path = ?
+                LIMIT 1
+                """,
+                (str(path.resolve()),),
+            ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0] is not None and row[1] is not None)
+
+
 def _workflow_snapshot(step: str = "", include_details: bool = True) -> dict[str, Any]:
     snapshot = {
         "database": _database_snapshot(CANONICAL_ROOT / "canonical.db"),
     }
     if step in {"build_photo_index", "refresh_photo_index_metadata", ""}:
         snapshot["photo_index"] = _photo_index_snapshot(PHOTO_LIBRARY_INDEX)
+    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark", ""}:
+        snapshot["broad_visual_match"] = _broad_visual_status()
     if include_details and step in {"match_easy_originals", "search_originals", ""}:
         snapshot["queue"] = _queue_status(ORIGINAL_QUEUE)
         snapshot["original_remainder_overview"] = _remainder_overview(ORIGINAL_UNCLEAR_GROUPS)
@@ -1030,6 +1305,7 @@ def _summary_metrics(
     tag_after = after.get("tag_queue", {})
     digikam_after = after.get("digikam_people", {})
     package_after = after.get("diarium_package", {})
+    broad_after = after.get("broad_visual_match", {})
     common = {
         "entries": _delta_metric("Diary entries", db_before.get("entries"), db_after.get("entries")),
         "unique_days": _delta_metric("Unique diary days", db_before.get("unique_days"), db_after.get("unique_days")),
@@ -1059,11 +1335,22 @@ def _summary_metrics(
             {"label": "Review-ready entries", "value": str(after.get("original_remainder_overview", {}).get("review_ready_entry_count", 0))},
             {"label": "Search batches", "value": str(batch_after.get("rows", 0))},
         ]
+    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark"}:
+        latest_run = broad_after.get("latest_run") or {}
+        latest_index = broad_after.get("latest_index_run") or {}
+        latest_benchmark = broad_after.get("latest_benchmark") or {}
+        return [
+            {"label": "Stored fingerprints", "value": str(broad_after.get("descriptor_count", 0))},
+            {"label": "New/rebuilt fingerprints", "value": str(latest_index.get("indexed_descriptor_count", 0))},
+            {"label": "Accuracy targets tested", "value": str(latest_benchmark.get("confirmed_count", 0))},
+            {"label": "Unresolved candidates saved", "value": str(latest_run.get("result_count", 0))},
+        ]
     if step == "generate_derivatives":
         return [
             {"label": "Generated working copies", "value": parsed.get("Generated", "0")},
             {"label": "Skipped unchanged copies", "value": parsed.get("Skipped", "0")},
             {"label": "Not ready for export", "value": parsed.get("Not ready", "0")},
+            {"label": "Not ready dates", "value": parsed.get("Not ready dates", "") or "none"},
             _delta_metric("Derivative records", db_before.get("diarium_derivatives"), db_after.get("diarium_derivatives")),
         ]
     if step in {"face_tagging", "import_digikam_people"}:
@@ -1086,6 +1373,8 @@ def _summary_metrics(
             {"label": "Package entries", "value": str(package_after.get("journal_entries", parsed.get("Entries", "0")))},
             {"label": "Package photos", "value": str(package_after.get("photo_files", parsed.get("Media assets", "0")))},
             {"label": "Manifest rows", "value": str(package_after.get("manifest_rows", 0))},
+            {"label": "Skipped entries", "value": parsed.get("Skipped entries", "0")},
+            {"label": "Skipped dates", "value": parsed.get("Skipped dates", "") or "none"},
             {"label": "Photo readiness", "value": "ready" if package_after.get("photo_ready") else "attention"},
         ]
     return [common["entries"], common["media_records"]]
@@ -1096,6 +1385,8 @@ def _summary_deltas(step: str, before: dict[str, Any], after: dict[str, Any]) ->
     db_after = after.get("database", {})
     index_before = before.get("photo_index", {})
     index_after = after.get("photo_index", {})
+    broad_before = before.get("broad_visual_match", {})
+    broad_after = after.get("broad_visual_match", {})
     values = {
         "diary_entries": _numeric_delta(db_before.get("entries"), db_after.get("entries")),
         "unique_diary_days": _numeric_delta(db_before.get("unique_days"), db_after.get("unique_days")),
@@ -1106,6 +1397,8 @@ def _summary_deltas(step: str, before: dict[str, Any], after: dict[str, Any]) ->
         "people": _numeric_delta(db_before.get("people"), db_after.get("people")),
         "tags": _numeric_delta(db_before.get("tags"), db_after.get("tags")),
         "diarium_derivatives": _numeric_delta(db_before.get("diarium_derivatives"), db_after.get("diarium_derivatives")),
+        "broad_descriptors": _numeric_delta(broad_before.get("descriptor_count"), broad_after.get("descriptor_count")),
+        "broad_results": _numeric_delta(broad_before.get("result_count"), broad_after.get("result_count")),
     }
     if step == "import_zips":
         return {key: values[key] for key in ("diary_entries", "unique_diary_days", "source_links", "media_records")}
@@ -1115,6 +1408,8 @@ def _summary_deltas(step: str, before: dict[str, Any], after: dict[str, Any]) ->
         return {key: values[key] for key in ("people", "tags")}
     if step == "generate_derivatives":
         return {"diarium_derivatives": values["diarium_derivatives"]}
+    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark"}:
+        return {key: values[key] for key in ("broad_descriptors", "broad_results")}
     return values
 
 
@@ -1126,10 +1421,28 @@ def _summary_scope(step: str, payload: dict[str, Any]) -> list[str]:
         reset = "replace existing index" if payload.get("reset_photo_index") else "incremental"
         return [f"Folders: {'; '.join(str(root) for root in roots)}", f"Mode: {reset}"]
     if step == "refresh_photo_index_metadata":
+        roots = payload.get("search_roots") or []
+        if roots:
+            return [f"Folders: {'; '.join(str(root) for root in roots)}", "Mode: refresh metadata"]
         return ["Existing indexed folders"]
     if step == "match_easy_originals":
         folder = str(payload.get("photo_index_folder") or "").strip()
         return [f"Photo index folder: {folder}" if folder else "Photo index folder: all indexed folders"]
+    if step == "broad_visual_index":
+        roots = payload.get("candidate_roots") or []
+        return [
+            f"Candidate roots: {'; '.join(str(root) for root in roots) if roots else 'existing photo-index roots'}",
+            f"Density: {payload.get('density') or broad_visual_match.DEFAULT_DENSITY}",
+        ]
+    if step == "broad_visual_match":
+        scope = str(payload.get("target_scope") or "all_unresolved")
+        return [
+            f"Target scope: {scope}",
+            f"Candidate scope: {payload.get('candidate_scope') or 'whole_indexed_library'}",
+            f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}",
+        ]
+    if step == "broad_visual_benchmark":
+        return [f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}"]
     if step == "import_digikam_people":
         roots = payload.get("xmp_roots") or []
         csv_path = str(payload.get("suggestions_csv") or "").strip()
@@ -1292,6 +1605,10 @@ def _step_title(step: str) -> str:
         "refresh_photo_index_metadata": "Refresh photo index metadata",
         "match_easy_originals": "Original-photo review",
         "search_originals": "Original-photo search",
+        "broad_visual_index": "Broad descriptor index",
+        "broad_visual_match": "Broad visual match",
+        "broad_visual_benchmark": "Broad visual benchmark",
+        "diary_enrichment": "Diary enrichment",
         "generate_derivatives": "Working photo copies",
         "face_tagging": "Build tag queue",
         "import_digikam_people": "Import digiKam suggestions",
@@ -1302,15 +1619,15 @@ def _step_title(step: str) -> str:
 
 def _top_metrics(database: dict[str, Any], photo_index: dict[str, Any]) -> dict[str, Any]:
     project365_total = int(database.get("project365_entry_count") or 0)
-    missing_photos = int(database.get("project365_missing_photo_count") or 0)
     without_identified_original = int(database.get("without_identified_original_count") or 0)
     return {
         "unique_diary_days": int(database.get("unique_day_count") or 0),
         "diary_entries": int(database.get("entry_count") or 0),
         "photo_index_files": int(photo_index.get("file_count") or 0),
         "project365_entries": project365_total,
-        "missing_photos": missing_photos,
-        "missing_photos_percent": _percentage(missing_photos, project365_total),
+        "missing_photos": without_identified_original,
+        "missing_photos_percent": _percentage(without_identified_original, project365_total),
+        "associated_photos": int(database.get("associated_photo_count") or 0),
         "without_identified_original": without_identified_original,
         "without_identified_original_percent": _percentage(
             without_identified_original,
@@ -1377,12 +1694,13 @@ def _database_status(db_path: Path) -> dict[str, Any]:
         "unique_day_count": unique_day_count,
         "project365_entry_count": project365_entry_count,
         "non_project365_entry_count": entry_count - project365_entry_count,
-        "project365_missing_photo_count": project365_photo_gaps["missing_photos"],
+        "project365_missing_photo_count": project365_photo_gaps["without_identified_original"],
         "project365_missing_photo_percent": _percentage(
-            project365_photo_gaps["missing_photos"],
+            project365_photo_gaps["without_identified_original"],
             project365_entry_count,
         ),
         "identified_original_count": project365_photo_gaps["identified_originals"],
+        "associated_photo_count": project365_photo_gaps["associated_photos"],
         "without_identified_original_count": project365_photo_gaps["without_identified_original"],
         "without_identified_original_percent": _percentage(
             project365_photo_gaps["without_identified_original"],
@@ -1395,8 +1713,31 @@ def _database_status(db_path: Path) -> dict[str, Any]:
         "working_copy_source_count": derivative_readiness.source_count,
         "working_copy_ready_count": derivative_readiness.ready_count,
         "working_copy_not_ready_count": derivative_readiness.not_ready_count,
+        "working_copy_current_count": derivative_readiness.current_count,
+        "working_copy_needs_update_count": derivative_readiness.needs_update_count,
         "source_counts": [dict(row) for row in source_rows],
         "media": [dict(row) for row in rows],
+    }
+
+
+def _working_copy_readiness_status(start_date: str = "", end_date: str = "") -> dict[str, Any]:
+    readiness = derivative_readiness_summary(
+        CANONICAL_ROOT,
+        start_date=str(start_date or "").strip(),
+        end_date=str(end_date or "").strip(),
+    )
+    return {
+        "scope": {
+            "start_date": str(start_date or "").strip(),
+            "end_date": str(end_date or "").strip(),
+        },
+        "database": {
+            "working_copy_source_count": readiness.source_count,
+            "working_copy_ready_count": readiness.ready_count,
+            "working_copy_not_ready_count": readiness.not_ready_count,
+            "working_copy_current_count": readiness.current_count,
+            "working_copy_needs_update_count": readiness.needs_update_count,
+        },
     }
 
 
@@ -1407,22 +1748,14 @@ def _project365_photo_gap_counts(connection: sqlite3.Connection) -> dict[str, in
     }
     if "entry_id" not in columns:
         return {
-            "missing_photos": 0,
             "identified_originals": 0,
+            "associated_photos": 0,
             "without_identified_original": 0,
         }
     row = connection.execute(
         """
         SELECT
             COUNT(*) AS project365_entries,
-            SUM(
-                CASE WHEN NOT EXISTS (
-                    SELECT 1
-                    FROM media_assets AS export_media
-                    WHERE export_media.entry_id = entries.id
-                        AND export_media.role = 'project365_export_png'
-                ) THEN 1 ELSE 0 END
-            ) AS missing_photos,
             SUM(
                 CASE WHEN EXISTS (
                     SELECT 1
@@ -1431,7 +1764,16 @@ def _project365_photo_gap_counts(connection: sqlite3.Connection) -> dict[str, in
                         AND original_media.role = 'external_original_reference'
                         AND original_media.review_status = 'confirmed'
                 ) THEN 1 ELSE 0 END
-            ) AS identified_originals
+            ) AS identified_originals,
+            SUM(
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM media_assets AS associated_media
+                    WHERE associated_media.entry_id = entries.id
+                        AND associated_media.role = 'external_original_associated_photo'
+                        AND associated_media.review_status = 'confirmed'
+                ) THEN 1 ELSE 0 END
+            ) AS associated_photos
         FROM entries
         WHERE entries.source_app = 'project365'
         """
@@ -1439,8 +1781,8 @@ def _project365_photo_gap_counts(connection: sqlite3.Connection) -> dict[str, in
     project365_entries = int(row["project365_entries"] or 0)
     identified_originals = int(row["identified_originals"] or 0)
     return {
-        "missing_photos": int(row["missing_photos"] or 0),
         "identified_originals": identified_originals,
+        "associated_photos": int(row["associated_photos"] or 0),
         "without_identified_original": max(0, project365_entries - identified_originals),
     }
 
@@ -1525,8 +1867,10 @@ def _csv_value(row: list[str], index: int | None) -> str:
 def _photo_library_index_status(index_path: Path) -> dict[str, Any]:
     if not index_path.exists():
         return {"exists": False}
-    connection = sqlite3.connect(index_path)
+    connection: sqlite3.Connection | None = None
     try:
+        connection = sqlite3.connect(index_path, timeout=1)
+        connection.execute("PRAGMA busy_timeout = 1000")
         _ensure_photo_library_index_run_table(connection)
         file_count = connection.execute(
             "SELECT COUNT(*) FROM photo_library_files"
@@ -1556,12 +1900,14 @@ def _photo_library_index_status(index_path: Path) -> dict[str, Any]:
             if {"gps_latitude", "gps_longitude"}.issubset(file_columns)
             else 0
         )
-        roots = [
-            row[0]
-            for row in connection.execute(
-                "SELECT root FROM photo_library_files GROUP BY root ORDER BY root"
-            ).fetchall()
-        ]
+        roots = _canonical_index_root_strings(
+            [
+                row[0]
+                for row in connection.execute(
+                    "SELECT root FROM photo_library_files GROUP BY root ORDER BY root"
+                ).fetchall()
+            ]
+        )
         recent_runs = [
             {
                 "started_at": row[0],
@@ -1594,8 +1940,13 @@ def _photo_library_index_status(index_path: Path) -> dict[str, Any]:
                 """
             ).fetchall()
         ]
+    except sqlite3.Error as exc:
+        status = _busy_photo_library_index_status(index_path)
+        status["error"] = str(exc)
+        return status
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
     return {
         "exists": True,
         "path": str(index_path),
@@ -1605,6 +1956,20 @@ def _photo_library_index_status(index_path: Path) -> dict[str, Any]:
         "gps_coordinate_count": gps_coordinate_count,
         "roots": roots,
         "recent_runs": recent_runs,
+    }
+
+
+def _busy_photo_library_index_status(index_path: Path) -> dict[str, Any]:
+    return {
+        "exists": index_path.exists(),
+        "path": str(index_path),
+        "busy": True,
+        "file_count": 0,
+        "date_count": 0,
+        "capture_timestamp_count": 0,
+        "gps_coordinate_count": 0,
+        "roots": [],
+        "recent_runs": [],
     }
 
 
@@ -1626,7 +1991,54 @@ def _photo_library_index_roots(index_path: Path) -> list[str]:
         return []
     finally:
         connection.close()
-    return [str(row[0]) for row in rows if str(row[0]).strip()]
+    return _canonical_index_root_strings([str(row[0]) for row in rows if str(row[0]).strip()])
+
+
+def _latest_broad_match_run_id(db_path: Path) -> str:
+    if not db_path.exists():
+        return ""
+    connection = sqlite3.connect(db_path, timeout=60)
+    try:
+        row = connection.execute(
+            """
+            SELECT run_id
+            FROM broad_match_runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return str(row[0]) if row else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        connection.close()
+
+
+def _canonical_index_root_strings(roots: list[str]) -> list[str]:
+    root_pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for root in roots:
+        root_text = str(root).strip()
+        if not root_text:
+            continue
+        resolved = str(Path(root_text).expanduser().resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        root_pairs.append((root_text, resolved))
+    redundant: set[str] = set()
+    resolved_roots = [resolved for _, resolved in root_pairs]
+    for resolved in resolved_roots:
+        for possible_parent in resolved_roots:
+            if resolved != possible_parent and _path_is_within(resolved, possible_parent):
+                redundant.add(resolved)
+                break
+    return [root_text for root_text, resolved in root_pairs if resolved not in redundant]
+
+
+def _path_is_within(path_text: str, parent_text: str) -> bool:
+    parent_prefix = parent_text if parent_text.endswith(os.sep) else f"{parent_text}{os.sep}"
+    return path_text.startswith(parent_prefix)
 
 
 def _ensure_photo_library_index_run_table(connection: sqlite3.Connection) -> None:
@@ -2192,6 +2604,10 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self._send_html(_control_html(config.picker_url, initial_step=initial_step), no_store=True)
                 elif parsed.path in {"/picker", "/picker/"}:
                     self._send_html(_embedded_picker_html())
+                elif parsed.path in {"/enrich", "/enrich/"}:
+                    self._send_html(diary_enrichment.ENRICHMENT_HTML, no_store=True)
+                elif parsed.path in {"/broad-review", "/broad-review/"}:
+                    self._send_html(BROAD_REVIEW_HTML, no_store=True)
                 elif parsed.path in {"/crop", "/crop/"}:
                     self._send_html(_embedded_crop_html())
                 elif parsed.path == "/favicon.ico":
@@ -2201,6 +2617,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     query = urllib.parse.parse_qs(parsed.query)
                     steps = query.get("step")
                     self._send_json(state.status(steps if steps else None))
+                elif parsed.path == "/api/working-copy-readiness":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_json(
+                        _working_copy_readiness_status(
+                            start_date=query.get("start_date", [""])[0],
+                            end_date=query.get("end_date", [""])[0],
+                        )
+                    )
                 elif parsed.path.startswith("/api/crop-estimate-batch/"):
                     job_id = urllib.parse.unquote(parsed.path.removeprefix("/api/crop-estimate-batch/"))
                     job = state.picker_state().crop_estimate_job(job_id)
@@ -2214,6 +2638,47 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         self._send_json(state.job_status(job_id))
                     except KeyError as exc:
                         self._send_error(HTTPStatus.NOT_FOUND, str(exc))
+                elif parsed.path == "/broad/api/status":
+                    self._send_json(_broad_visual_status())
+                elif parsed.path == "/broad/api/results":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_json(
+                        broad_visual_match.review_results(
+                            BROAD_VISUAL_DB,
+                            run_id=query.get("run_id", [""])[0],
+                            entry_id=query.get("entry_id", [""])[0],
+                            limit=original_picker._query_int(
+                                query,
+                                "limit",
+                                broad_visual_match.DEFAULT_RESULT_PAGE_SIZE,
+                            )
+                            or broad_visual_match.DEFAULT_RESULT_PAGE_SIZE,
+                            offset=original_picker._query_int(query, "offset", 0) or 0,
+                        )
+                    )
+                elif parsed.path == "/broad/api/review-entries":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    payload = broad_visual_match.review_entries(
+                        CANONICAL_ROOT,
+                        BROAD_VISUAL_DB,
+                        run_id=query.get("run_id", [""])[0],
+                        entry_id=query.get("entry_id", [""])[0],
+                        limit=original_picker._query_int(query, "limit", 1) or 1,
+                        offset=original_picker._query_int(query, "offset", 0) or 0,
+                    )
+                    self._send_json(self._with_broad_image_urls(payload))
+                elif parsed.path == "/broad/api/benchmark-entries":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    payload = broad_visual_match.benchmark_review_entries(
+                        CANONICAL_ROOT,
+                        report_dir=VERIFY_REPORT_DIR,
+                        entry_id=query.get("entry_id", [""])[0],
+                        limit=original_picker._query_int(query, "limit", 1) or 1,
+                        offset=original_picker._query_int(query, "offset", 0) or 0,
+                    )
+                    self._send_json(self._with_broad_image_urls(payload))
+                elif parsed.path.startswith("/broad/image/"):
+                    self._send_broad_image(parsed.path.removeprefix("/broad/image/"))
                 elif parsed.path == "/api/choose-folder":
                     self._send_json(_choose_folder_dialog())
                 elif parsed.path == "/picker/api/choose-folder":
@@ -2226,6 +2691,30 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self._send_json(summary)
                 elif parsed.path == "/picker/api/batches":
                     self._send_json(state.picker_state().batches())
+                elif parsed.path == "/enrich/api/entries":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_json(
+                        diary_enrichment.entry_list(
+                            CANONICAL_ROOT,
+                            image_tokens=state.picker_state(),
+                            start_date=query.get("start_date", [""])[0],
+                            end_date=query.get("end_date", [""])[0],
+                            limit=original_picker._query_int(query, "limit", 500) or 500,
+                        )
+                    )
+                elif parsed.path.startswith("/enrich/api/entry/"):
+                    query = urllib.parse.parse_qs(parsed.query)
+                    entry_id = urllib.parse.unquote(parsed.path.removeprefix("/enrich/api/entry/"))
+                    detail = diary_enrichment.entry_detail(
+                        CANONICAL_ROOT,
+                        entry_id,
+                        image_tokens=state.picker_state(),
+                        candidate_days=original_picker._query_int(query, "days", 0) or 0,
+                    )
+                    if detail is None:
+                        self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
+                    else:
+                        self._send_json(detail)
                 elif parsed.path == "/picker/api/entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     status = query.get("status", ["all"])[0]
@@ -2346,6 +2835,10 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         )
                     )
                     return
+                if parsed.path == "/api/validate-folder-path":
+                    payload = self._read_json()
+                    self._send_json(_validate_folder_path(str(payload.get("path", ""))))
+                    return
                 if parsed.path.startswith("/api/job/") and parsed.path.endswith("/cancel"):
                     job_id = parsed.path.removeprefix("/api/job/").removesuffix("/cancel")
                     try:
@@ -2354,7 +2847,44 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         self._send_error(HTTPStatus.NOT_FOUND, str(exc))
                     return
                 if parsed.path == "/api/crop-estimate-batch":
-                    self._send_json(state.picker_state().start_crop_estimate_batch())
+                    payload = self._read_json()
+                    self._send_json(
+                        state.picker_state().start_crop_estimate_batch(
+                            apply_estimates=bool(payload.get("apply_estimates"))
+                        )
+                    )
+                    return
+                if parsed.path == "/broad/api/send-to-picker":
+                    payload = self._read_json()
+                    result = broad_visual_match.send_results_to_picker(
+                        canonical_root=CANONICAL_ROOT,
+                        db_path=BROAD_VISUAL_DB,
+                        queue_path=ORIGINAL_QUEUE,
+                        result_ids=[int(value) for value in payload.get("result_ids", [])],
+                    )
+                    state._invalidate_picker_state()
+                    self._send_json(result)
+                    return
+                if parsed.path == "/broad/api/confirm-match":
+                    payload = self._read_json()
+                    result = broad_visual_match.confirm_broad_match(
+                        canonical_root=CANONICAL_ROOT,
+                        db_path=BROAD_VISUAL_DB,
+                        result_id=int(payload.get("result_id") or 0),
+                    )
+                    state._invalidate_picker_state()
+                    self._send_json(result)
+                    return
+                if parsed.path == "/broad/api/reject-entry":
+                    payload = self._read_json()
+                    result = broad_visual_match.reject_broad_entry(
+                        canonical_root=CANONICAL_ROOT,
+                        db_path=BROAD_VISUAL_DB,
+                        run_id=str(payload.get("run_id", "")),
+                        entry_id=str(payload.get("entry_id", "")),
+                    )
+                    state._invalidate_picker_state()
+                    self._send_json(result)
                     return
                 if parsed.path == "/picker/api/decision":
                     payload = self._read_json()
@@ -2364,8 +2894,19 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         decision=str(payload.get("decision", "")),
                         notes=str(payload.get("notes", "")),
                         include_candidates=False,
+                        associated_entry_date=str(payload.get("associated_entry_date", "")),
+                        associated_date_source=str(payload.get("associated_date_source", "manual")),
                     )
                     self._send_json(detail)
+                    return
+                if parsed.path == "/picker/api/associated-date-choices":
+                    payload = self._read_json()
+                    self._send_json(
+                        state.picker_state().associated_date_choices(
+                            entry_id=str(payload.get("entry_id", "")),
+                            candidate_path=str(payload.get("candidate_path", "")),
+                        )
+                    )
                     return
                 if parsed.path == "/picker/api/reject-all":
                     payload = self._read_json()
@@ -2419,7 +2960,12 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self._send_json(result)
                     return
                 if parsed.path in {"/picker/api/crop-estimate-batch", "/crop/api/crop-estimate-batch"}:
-                    self._send_json(state.picker_state().start_crop_estimate_batch())
+                    payload = self._read_json()
+                    self._send_json(
+                        state.picker_state().start_crop_estimate_batch(
+                            apply_estimates=bool(payload.get("apply_estimates"))
+                        )
+                    )
                     return
                 if parsed.path == "/picker/api/crawl":
                     payload = self._read_json()
@@ -2488,7 +3034,45 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                     self._send_json(detail)
                     return
+                if parsed.path == "/enrich/api/add-associated":
+                    payload = self._read_json()
+                    self._send_json(
+                        diary_enrichment.add_associated_photo(
+                            CANONICAL_ROOT,
+                            target_entry_id=str(payload.get("target_entry_id", "")),
+                            source_media_asset_id=str(payload.get("source_media_asset_id", "")),
+                            image_tokens=state.picker_state(),
+                        )
+                    )
+                    return
+                if parsed.path == "/enrich/api/create-subentry":
+                    payload = self._read_json()
+                    self._send_json(
+                        diary_enrichment.create_subentry_from_candidate(
+                            CANONICAL_ROOT,
+                            parent_entry_id=str(payload.get("parent_entry_id", "")),
+                            source_media_asset_id=str(payload.get("source_media_asset_id", "")),
+                            image_tokens=state.picker_state(),
+                        )
+                    )
+                    return
+                if parsed.path == "/enrich/api/import-dropped-associated":
+                    payload = self._read_bytes(original_picker.MAX_DROP_BYTES)
+                    detail = diary_enrichment.add_dropped_associated_photo(
+                        CANONICAL_ROOT,
+                        target_entry_id=urllib.parse.unquote(self.headers.get("x-entry-id", "")),
+                        filename=urllib.parse.unquote(self.headers.get("x-file-name", "")),
+                        content_type=self.headers.get("content-type", ""),
+                        payload=payload,
+                        image_tokens=state.picker_state(),
+                    )
+                    self._send_json(detail)
+                    return
                 if parsed.path == "/picker/api/apply-decisions":
+                    payload = self._read_json()
+                    if payload.get("confirm_apply_decisions") != original_picker.APPLY_DECISIONS_CONFIRM_TOKEN:
+                        self._send_error(HTTPStatus.BAD_REQUEST, "Apply decisions requires explicit confirmation.")
+                        return
                     self._send_json(state.picker_state().apply_decisions())
                     return
                 else:
@@ -2546,6 +3130,44 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
             self.end_headers()
             self.wfile.write(payload)
 
+        def _send_broad_image(self, token: str) -> None:
+            path = state.broad_image_path(urllib.parse.unquote(token))
+            if path is None or not path.exists() or not path.is_file():
+                self._send_error(HTTPStatus.NOT_FOUND, "Image not found")
+                return
+            payload = path.read_bytes()
+            mime_type, _ = mimetypes.guess_type(str(path))
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", mime_type or "application/octet-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.send_header("cache-control", "private, max-age=86400")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _with_broad_image_urls(self, payload: dict[str, Any]) -> dict[str, Any]:
+            enriched = dict(payload)
+            entries = []
+            for entry in payload.get("entries", []):
+                entry_copy = dict(entry)
+                entry_copy["source_url"] = self._broad_image_url(entry_copy.get("source_path", ""))
+                entry_copy["source_facts"] = _broad_photo_facts(entry_copy.get("source_path", ""))
+                entry_copy["confirmed_url"] = self._broad_image_url(entry_copy.get("confirmed_path", ""))
+                entry_copy["confirmed_facts"] = _broad_photo_facts(entry_copy.get("confirmed_path", ""))
+                results = []
+                for result in entry_copy.get("results", []):
+                    result_copy = dict(result)
+                    result_copy["candidate_url"] = self._broad_image_url(result_copy.get("candidate_path", ""))
+                    result_copy.update(_broad_photo_facts(result_copy.get("candidate_path", "")))
+                    results.append(result_copy)
+                entry_copy["results"] = results
+                entries.append(entry_copy)
+            enriched["entries"] = entries
+            return enriched
+
+        def _broad_image_url(self, path_text: str) -> str:
+            token = state.broad_image_token(str(path_text or ""))
+            return f"/broad/image/{urllib.parse.quote(token)}" if token else ""
+
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             payload = json.dumps({"error": message}).encode("utf-8")
             self.send_response(status)
@@ -2561,9 +3183,11 @@ WORKFLOW_STEPS = (
     "import_zips",
     "build_photo_index",
     "match_easy_originals",
+    "broad_visual_match",
     "crop_confirmation",
     "generate_derivatives",
     "face_tagging",
+    "diary_enrichment",
     "generate_diarium_package",
 )
 
@@ -2571,6 +3195,8 @@ STEP_OWNER = {
     "refresh_photo_index_metadata": "build_photo_index",
     "search_originals": "match_easy_originals",
     "apply_original_decisions": "match_easy_originals",
+    "broad_visual_index": "broad_visual_match",
+    "broad_visual_benchmark": "broad_visual_match",
     "import_digikam_people": "face_tagging",
 }
 
@@ -2587,16 +3213,10 @@ def _control_html(picker_url: str, initial_step: str = "") -> str:
         .replace("__INITIAL_UNIQUE_DIARY_DAYS__", str(metrics["unique_diary_days"]))
         .replace("__INITIAL_DIARY_ENTRIES__", str(metrics["diary_entries"]))
         .replace("__INITIAL_PHOTO_INDEX_FILES__", str(metrics["photo_index_files"]))
+        .replace("__INITIAL_ASSOCIATED_PHOTOS__", str(metrics["associated_photos"]))
         .replace(
             "__INITIAL_MISSING_PHOTOS__",
             f'{metrics["missing_photos"]} · {metrics["missing_photos_percent"]}%',
-        )
-        .replace(
-            "__INITIAL_WITHOUT_IDENTIFIED_ORIGINAL__",
-            (
-                f'{metrics["without_identified_original"]} · '
-                f'{metrics["without_identified_original_percent"]}%'
-            ),
         )
     )
     requested_step = _owner_step(initial_step.strip())
@@ -2618,18 +3238,26 @@ def _control_html(picker_url: str, initial_step: str = "") -> str:
     return html
 
 
-def _initial_top_metrics() -> dict[str, Any]:
+def _initial_top_metrics(include_photo_index: bool = True) -> dict[str, Any]:
     canonical_db = CANONICAL_ROOT / "canonical.db"
     photo_gaps = _initial_project365_photo_gap_counts(canonical_db)
     project365_entries = photo_gaps["project365_entries"]
     return {
         "unique_diary_days": _initial_unique_day_count(canonical_db),
         "diary_entries": _initial_entry_count(canonical_db),
-        "photo_index_files": _initial_photo_index_file_count(PHOTO_LIBRARY_INDEX),
+        "photo_index_files": (
+            _initial_photo_index_file_count(PHOTO_LIBRARY_INDEX)
+            if include_photo_index
+            else 0
+        ),
         "project365_entries": project365_entries,
-        "missing_photos": photo_gaps["missing_photos"],
-        "missing_photos_percent": _percentage(photo_gaps["missing_photos"], project365_entries),
+        "missing_photos": photo_gaps["without_identified_original"],
+        "missing_photos_percent": _percentage(
+            photo_gaps["without_identified_original"],
+            project365_entries,
+        ),
         "without_identified_original": photo_gaps["without_identified_original"],
+        "associated_photos": photo_gaps["associated_photos"],
         "without_identified_original_percent": _percentage(
             photo_gaps["without_identified_original"],
             project365_entries,
@@ -2653,6 +3281,7 @@ def _initial_project365_photo_gap_counts(db_path: Path) -> dict[str, int]:
     empty = {
         "project365_entries": 0,
         "missing_photos": 0,
+        "associated_photos": 0,
         "without_identified_original": 0,
     }
     if not db_path.exists():
@@ -2670,7 +3299,7 @@ def _initial_project365_photo_gap_counts(db_path: Path) -> dict[str, int]:
             )
             return {
                 "project365_entries": project365_entries,
-                "missing_photos": full_counts["missing_photos"],
+                "associated_photos": full_counts["associated_photos"],
                 "without_identified_original": full_counts["without_identified_original"],
             }
         finally:
@@ -2718,7 +3347,6 @@ def _embedded_crop_html() -> str:
 
 def _choose_folder_dialog() -> dict[str, str]:
     script = (
-        'tell application "Finder" to activate\n'
         'POSIX path of (choose folder with prompt '
         '"Choose the photo folder to scan for the Project365 photo index")'
     )
@@ -2740,6 +3368,37 @@ def _choose_folder_dialog() -> dict[str, str]:
     return {"path": path}
 
 
+def _validate_folder_path(path_text: str) -> dict[str, str]:
+    path_text = _strip_wrapping_quotes(path_text)
+    if not path_text:
+        raise ValueError("Enter a folder path.")
+    path = Path(path_text).expanduser()
+    if not path.exists():
+        raise ValueError(f"Folder does not exist: {path_text}")
+    if path.is_file():
+        path = path.parent
+    if not path.is_dir():
+        raise ValueError(f"Path is not a folder: {path_text}")
+    return {"path": str(path.resolve())}
+
+
+def _folder_root_from_text(path_text: str) -> str:
+    path_text = _strip_wrapping_quotes(path_text)
+    if not path_text:
+        return ""
+    path = Path(path_text).expanduser()
+    if path.exists() and path.is_file():
+        return str(path.parent)
+    return path_text
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
 def _photo_index_folder_from_file(
     filename: str,
     byte_size: int,
@@ -2757,31 +3416,54 @@ def _photo_index_folder_from_file(
         raise ValueError("Photo index does not exist. Build the photo index first.")
     connection = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
     try:
+        columns = _sqlite_table_columns(connection, "photo_library_files")
+        sha256_select = "sha256" if "sha256" in columns else "'' AS sha256"
         rows = connection.execute(
-            """
-            SELECT path, root
+            f"""
+            SELECT path, root, byte_size, {sha256_select}
             FROM photo_library_files
             WHERE filename = ?
-                AND byte_size = ?
             ORDER BY path
             """,
-            (filename, byte_size),
+            (filename,),
         ).fetchall()
+        latest_run = _latest_photo_index_run_summary(connection)
     finally:
         connection.close()
+    if not rows:
+        detail = f" No indexed file is named {filename!r}."
+        if latest_run:
+            detail += f" {latest_run}"
+        raise ValueError(
+            "Chosen file was not found in the photo index."
+            f"{detail} Pick a file from an indexed folder, or rebuild the photo index with that folder included."
+        )
+    size_matches = [row for row in rows if int(row[2] or 0) == byte_size]
+    if not size_matches:
+        indexed_sizes = ", ".join(str(size) for size in sorted({int(row[2] or 0) for row in rows})[:5])
+        raise ValueError(
+            "Chosen file was not found in the photo index."
+            f" The index has {filename!r}, but with byte size {indexed_sizes};"
+            f" the selected file is {byte_size} bytes."
+        )
     matches = []
-    for path_text, root_text in rows:
+    for path_text, root_text, _, indexed_sha256 in size_matches:
         path = Path(path_text)
-        if not path.exists() or not path.is_file():
-            continue
+        indexed_sha256 = str(indexed_sha256 or "").strip().lower()
         try:
-            if _sha256_file(path) == sha256:
+            hash_matches = indexed_sha256 == sha256
+            if not indexed_sha256 and path.exists() and path.is_file():
+                hash_matches = _sha256_file(path) == sha256
+            if hash_matches:
                 root = Path(root_text)
                 matches.append((path, root if root.exists() and root.is_dir() else path.parent))
         except OSError:
             continue
     if not matches:
-        raise ValueError("Chosen file was not found in the photo index. Pick a file from an indexed folder.")
+        raise ValueError(
+            "Chosen file was not found in the photo index."
+            f" The index has {filename!r} with the selected byte size, but the file hash does not match."
+        )
     indexed_roots = sorted({str(root) for _, root in matches})
     if len(indexed_roots) > 1:
         raise ValueError(
@@ -2790,12 +3472,371 @@ def _photo_index_folder_from_file(
     return {"path": indexed_roots[0], "matched_file": str(matches[0][0])}
 
 
+def _sqlite_table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _latest_photo_index_run_summary(connection: sqlite3.Connection) -> str:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'photo_library_index_runs'"
+        )
+    }
+    if "photo_library_index_runs" not in tables:
+        return ""
+    row = connection.execute(
+        """
+        SELECT finished_at, roots, new_file_count
+        FROM photo_library_index_runs
+        ORDER BY started_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return ""
+    finished_at, roots, new_file_count = row
+    roots_text = str(roots or "").strip() or "unknown roots"
+    if len(roots_text) > 180:
+        roots_text = roots_text[:177] + "..."
+    date_text = str(finished_at or "").split("T", 1)[0]
+    return f"Latest index run {date_text} scanned {roots_text} and added {int(new_file_count or 0)} new files."
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+BROAD_REVIEW_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broad Visual Review</title>
+<style>
+:root {
+  --bg: #f6f6f2;
+  --panel: #fff;
+  --ink: #202124;
+  --muted: #667085;
+  --line: #d7d9d2;
+  --accent: #17695d;
+  --fail: #9f2d2d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.shell { max-width: 1400px; margin: 0 auto; padding: 18px; display: grid; gap: 12px; }
+.header { display: grid; gap: 8px; justify-items: start; }
+.button-row, .entry-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.entry-head { position: sticky; top: 0; z-index: 5; background: var(--panel); padding: 8px 0; border-bottom: 1px solid var(--line); }
+h1 { margin: 0; font-size: 24px; }
+h2 { margin: 0; font-size: 18px; }
+h3 { margin: 0; font-size: 14px; }
+.subtle, .status, .meta { color: var(--muted); font-size: 13px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.field { display: grid; gap: 5px; }
+label { font-size: 12px; color: var(--muted); }
+input, select { width: 100%; min-height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; background: #fff; }
+input[type="checkbox"] { width: 16px; min-height: 16px; }
+.button { border: 1px solid var(--line); background: #fff; border-radius: 6px; min-height: 34px; padding: 0 10px; cursor: pointer; }
+.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.button.danger { color: var(--fail); border-color: #d8a2a2; }
+.review-layout { display: grid; grid-template-columns: minmax(380px, 520px) minmax(360px, 1fr); gap: 18px; align-items: start; }
+.source-pane { position: sticky; top: 64px; align-self: start; display: grid; gap: 8px; }
+.source-frame { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; display: grid; gap: 8px; min-width: 0; }
+.source-image { width: 100%; max-height: 560px; object-fit: contain; background: #f1f1ec; border-radius: 6px; }
+.source-meta { display: grid; gap: 4px; }
+.candidate-pane { display: grid; gap: 8px; min-width: 0; }
+.candidate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; align-items: start; }
+.candidate-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px; overflow: hidden; display: grid; grid-template-rows: 210px auto auto; gap: 7px; min-width: 0; background: #fff; }
+.candidate-image { width: 100%; height: 210px; object-fit: contain; background: #f1f1ec; border-radius: 6px; }
+.candidate-meta { display: grid; gap: 4px; min-width: 0; }
+.candidate-filename-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.candidate-title { font-weight: 600; }
+.file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--muted); }
+.facts { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+.location-indicator { width: 17px; height: 17px; margin-left: auto; flex: 0 0 17px; color: #98a2b3; }
+.location-indicator.has-location { color: #b42318; }
+.match-badge { color: var(--accent); font-size: 12px; font-weight: 700; }
+.candidate-actions { display: flex; justify-content: flex-end; align-items: end; }
+.action-button { border: 1px solid var(--line); background: #fff; border-radius: 6px; min-height: 34px; padding: 0 10px; cursor: pointer; }
+.action-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.candidate-card.known-match { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(23, 105, 93, 0.18); }
+.path { overflow-wrap: anywhere; font-size: 12px; color: var(--muted); }
+.bad { color: var(--fail); }
+a { color: var(--accent); }
+@media (max-width: 850px) {
+  .review-layout { grid-template-columns: 1fr; }
+  .source-pane { position: static; }
+  .entry-head { position: static; }
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <div class="header">
+    <a href="/?step=broad_visual_match" title="Return to the Broad Visual Match controls">Project365 Control Panel</a>
+    <div>
+      <h1>Broad Visual Review</h1>
+      <div class="subtle">Visual review for stored broad-search results. Accuracy mode shows the known original when one is already confirmed; unresolved mode keeps review focused on one selected candidate at a time.</div>
+    </div>
+  </div>
+  <section class="panel">
+    <div class="field-row">
+      <div class="field">
+        <label>Review type</label>
+        <select id="reviewMode">
+          <option value="search">Unresolved search results</option>
+          <option value="benchmark">Accuracy benchmark</option>
+        </select>
+      </div>
+      <div class="field"><label>Run ID</label><input id="runId" placeholder="latest"></div>
+      <div class="field"><label>Project365 entry ID</label><input id="entryId" placeholder="optional"></div>
+      <div class="field"><label>Entries per page</label><input id="limit" type="number" min="1" max="10" value="1"></div>
+    </div>
+    <div class="button-row">
+      <button class="button primary" onclick="loadEntries(0)">Load entries</button>
+      <button class="button" onclick="previousPage()">Previous entry</button>
+      <button class="button" onclick="nextPage()">Next entry</button>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite">Loading...</div>
+  </section>
+  <section id="entries"></section>
+</main>
+<script>
+let currentOffset = 0;
+let currentHasMore = false;
+function applyInitialQuery() {
+  const query = new URLSearchParams(window.location.search);
+  const mode = query.get("mode");
+  if (mode === "search" || mode === "benchmark") {
+    document.getElementById("reviewMode").value = mode;
+  }
+  const runId = query.get("run_id") || "";
+  if (runId) document.getElementById("runId").value = runId;
+  const entryId = query.get("entry_id") || "";
+  if (entryId) document.getElementById("entryId").value = entryId;
+}
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Request failed");
+  return payload;
+}
+async function loadEntries(offset = currentOffset) {
+  const params = new URLSearchParams();
+  const mode = document.getElementById("reviewMode").value;
+  const runId = document.getElementById("runId").value.trim();
+  const entryId = document.getElementById("entryId").value.trim();
+  const limit = document.getElementById("limit").value || "1";
+  if (mode === "search" && runId) params.set("run_id", runId);
+  if (entryId) params.set("entry_id", entryId);
+  params.set("limit", limit);
+  params.set("offset", String(offset));
+  setStatus(mode === "benchmark" ? "Loading latest accuracy benchmark..." : "Loading stored broad-search candidates...");
+  try {
+    const endpoint = mode === "benchmark" ? "/broad/api/benchmark-entries" : "/broad/api/review-entries";
+    const payload = await fetchJson(`${endpoint}?${params.toString()}`);
+    currentOffset = payload.offset || 0;
+    currentHasMore = Boolean(payload.has_more);
+    renderEntries(payload, mode);
+    const source = mode === "benchmark" ? (payload.report_path || "no benchmark report") : `run ${payload.run_id || "none"}`;
+    setStatus(`${payload.returned_count || 0} entries · ${source} · offset ${currentOffset}`);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+function renderEntries(payload, mode) {
+  const target = document.getElementById("entries");
+  const entries = payload.entries || [];
+  if (!entries.length) {
+    const message = mode === "benchmark"
+      ? "No visual accuracy benchmark is available. Run Measure accuracy first."
+      : "No stored broad-search results. Run Search unresolved photos first.";
+    target.innerHTML = `<section class="panel"><div class="subtle">${message}</div></section>`;
+    return;
+  }
+  target.innerHTML = entries.map(entry => `
+    <section class="panel">
+      <div class="entry-head">
+        <div>
+          <h2>${escapeHtml(entry.entry_date || "")}</h2>
+          <div class="subtle">${escapeHtml(entry.entry_id || "")}</div>
+        </div>
+        <div class="button-row">
+          <div class="meta">${entryStatus(entry, mode)} · ${(entry.results || []).length} stored candidates</div>
+          ${mode === "search" ? `<button class="button danger" onclick="rejectBroadEntry('${escapeJs(payload.run_id || "")}', '${escapeJs(entry.entry_id || "")}')">Reject all</button>` : ""}
+        </div>
+      </div>
+      <div class="review-layout">
+        <div class="source-pane">
+          ${sourceBox("Project365 target", entry.source_url, entry.source_path, entry.source_facts)}
+          ${entry.confirmed_url
+            ? sourceBox("Known confirmed original", entry.confirmed_url, entry.confirmed_path, entry.confirmed_facts)
+            : `<div class="source-frame"><h3>Known confirmed original</h3><div class="subtle">None recorded for this entry.</div></div>`}
+        </div>
+        <div class="candidate-pane">
+          <h3>Calculated candidates</h3>
+          <div class="candidate-grid">${renderCandidates(entry, entry.results || [], mode)}</div>
+        </div>
+      </div>
+    </section>
+  `).join("");
+}
+function sourceBox(title, url, path, facts = {}) {
+  return `
+    <div class="source-frame">
+      <h3>${escapeHtml(title)}</h3>
+      ${url ? `<img class="source-image" src="${escapeHtml(url)}" loading="lazy" alt="">` : `<div class="subtle">Image path unavailable.</div>`}
+      <div class="source-meta">
+        <div class="candidate-filename-row">
+          <div class="file-name" title="${escapeHtml(path || "")}">${escapeHtml(fileName(path))}</div>
+          ${locationIndicator(Boolean(facts.has_geolocation))}
+        </div>
+        <div class="facts">${escapeHtml(formatBroadPhotoFacts(facts))}</div>
+      </div>
+    </div>
+  `;
+}
+function entryStatus(entry, mode) {
+  if (mode !== "benchmark") return "Unresolved search";
+  const rank = Number(entry.expected_rank || 0);
+  if (!rank) return `Accuracy: miss`;
+  return `Accuracy: hit at rank ${rank}`;
+}
+function renderCandidates(entry, rows, mode) {
+  if (!rows.length) return `<div class="subtle">No candidates stored for this entry.</div>`;
+  return rows.map(row => {
+    const matchesKnown = candidateMatchesKnownOriginal(entry, row);
+    return `
+    <div class="candidate-card ${matchesKnown ? "known-match" : ""}">
+      ${row.candidate_url ? `<img class="candidate-image" src="${escapeHtml(row.candidate_url)}" loading="lazy" alt="">` : `<div class="candidate-image subtle">Image unavailable.</div>`}
+      <div class="candidate-meta">
+        <div class="candidate-title">${matchesKnown ? "Known original" : "Candidate"}${matchesKnown ? ` <span class="match-badge">match</span>` : ""}</div>
+        <div class="candidate-filename-row">
+          <div class="file-name" title="${escapeHtml(row.candidate_path || "")}">${escapeHtml(row.candidate_filename || fileName(row.candidate_path))}</div>
+          ${locationIndicator(row.has_geolocation)}
+        </div>
+        <div class="facts">${escapeHtml(formatBroadPhotoFacts({
+          mime_type: row.mime_type,
+          byte_size: row.byte_size,
+          dimensions: row.dimensions,
+          has_geolocation: row.has_geolocation
+        }))}</div>
+      </div>
+      ${mode === "search" && row.result_id
+        ? `<div class="candidate-actions"><button class="action-button primary" onclick="confirmBroadMatch(${Number(row.result_id || 0)})">Match</button></div>`
+        : ""}
+    </div>
+  `;
+  }).join("");
+}
+function candidateMatchesKnownOriginal(entry, row) {
+  return Boolean(entry.confirmed_path && row.candidate_path && entry.confirmed_path === row.candidate_path);
+}
+function locationIndicator(hasLocation) {
+  return `
+    <svg class="location-indicator ${hasLocation ? "has-location" : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="${hasLocation ? "Embedded location metadata" : "No embedded location metadata"}">
+      <circle cx="12" cy="12" r="10"></circle>
+      <path d="M2 12h20M12 2a15.3 15.3 0 0 1 0 20M12 2a15.3 15.3 0 0 0 0 20"></path>
+    </svg>
+  `;
+}
+async function confirmBroadMatch(resultId) {
+  if (!resultId) {
+    setStatus("This row cannot be matched.", true);
+    return;
+  }
+  setStatus("Recording broad visual match...");
+  try {
+    const payload = await fetchJson("/broad/api/confirm-match", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({result_id: resultId})
+    });
+    setStatus(`Matched ${payload.entry_id || "entry"}.`);
+    await loadEntries(currentOffset);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+async function rejectBroadEntry(runId, entryId) {
+  if (!entryId) {
+    setStatus("This entry cannot be rejected.", true);
+    return;
+  }
+  setStatus("Recording broad visual rejection...");
+  try {
+    const payload = await fetchJson("/broad/api/reject-entry", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({run_id: runId, entry_id: entryId})
+    });
+    setStatus(`Rejected ${payload.rejected_count || 0} candidates for ${payload.entry_id || entryId}.`);
+    await loadEntries(currentOffset);
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+function formatBroadPhotoFacts(facts = {}) {
+  const parts = [];
+  const mime = String(facts.mime_type || "");
+  if (mime) parts.push(mime.replace(/^image\\//, "").toUpperCase());
+  const size = formatFileSize(Number(facts.byte_size || 0));
+  if (size) parts.push(size);
+  if (String(facts.dimensions || "").trim()) parts.push(String(facts.dimensions).trim());
+  return parts.join(" | ");
+}
+function formatFileSize(bytes) {
+  if (!bytes) return "";
+  if (bytes >= 1000000000) return `${(bytes / 1000000000).toFixed(1)} GB`;
+  if (bytes >= 1000000) return `${(bytes / 1000000).toFixed(1)} MB`;
+  if (bytes >= 1000) return `${(bytes / 1000).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+function previousPage() {
+  const limit = Number(document.getElementById("limit").value || "1");
+  loadEntries(Math.max(0, currentOffset - limit));
+}
+function nextPage() {
+  if (!currentHasMore) return;
+  const limit = Number(document.getElementById("limit").value || "1");
+  loadEntries(currentOffset + limit);
+}
+function setStatus(message, error = false) {
+  const target = document.getElementById("status");
+  target.textContent = message;
+  target.classList.toggle("bad", error);
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  }[char]));
+}
+function escapeJs(value) {
+  return String(value).replace(/\\\\/g, "\\\\\\\\").replace(/'/g, "\\\\'");
+}
+function fileName(path) {
+  const text = String(path || "");
+  if (!text) return "";
+  const parts = text.split("/");
+  return parts[parts.length - 1] || text;
+}
+applyInitialQuery();
+loadEntries(0);
+</script>
+</body>
+</html>
+"""
 
 
 def main() -> int:
@@ -3038,7 +4079,13 @@ h1 {
   min-height: 34px;
   padding: 0 10px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
   transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 80ms ease;
+}
+a.button {
+  text-decoration: none;
+  color: var(--ink);
 }
 .button.primary {
   background: var(--accent);
@@ -3087,6 +4134,13 @@ h1 {
   color: var(--subtle);
   font-size: 13px;
 }
+.workflow-guide {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--subtle);
+  font-size: 13px;
+  line-height: 1.45;
+}
 .field {
   display: grid;
   gap: 5px;
@@ -3094,6 +4148,11 @@ h1 {
 .field label {
   font-size: 12px;
   color: var(--muted);
+}
+.field-hint {
+  color: var(--subtle);
+  font-size: 12px;
+  line-height: 1.35;
 }
 .folder-row {
   display: grid;
@@ -3252,6 +4311,28 @@ pre {
   gap: 8px;
   min-width: 0;
 }
+.run-progress-detail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.run-progress-text {
+  min-width: 0;
+}
+.run-progress-live {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  animation: live-pulse 1s ease-in-out infinite;
+}
+.run-progress.status-pass .run-progress-live,
+.run-progress.status-fail .run-progress-live,
+.run-progress.status-cancelled .run-progress-live {
+  animation: none;
+}
 .run-progress-actions {
   display: flex;
   align-items: center;
@@ -3304,6 +4385,10 @@ pre {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+@keyframes live-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
 @keyframes progress-slide {
   0% { transform: translateX(-105%); }
   100% { transform: translateX(255%); }
@@ -3338,7 +4423,7 @@ a { color: var(--accent); }
     <div class="metric-card"><span>Unique diary days</span><strong id="metricUniqueDays">__INITIAL_UNIQUE_DIARY_DAYS__</strong></div>
     <div class="metric-card"><span>Total diary entries</span><strong id="metricDiaryEntries">__INITIAL_DIARY_ENTRIES__</strong></div>
     <div class="metric-card"><span>Missing photos</span><strong id="metricMissingPhotos">__INITIAL_MISSING_PHOTOS__</strong></div>
-    <div class="metric-card"><span>Without identified original</span><strong id="metricWithoutIdentifiedOriginal">__INITIAL_WITHOUT_IDENTIFIED_ORIGINAL__</strong></div>
+    <div class="metric-card"><span>Associated photos</span><strong id="metricAssociatedPhotos">__INITIAL_ASSOCIATED_PHOTOS__</strong></div>
     <div class="metric-card"><span>Photos in index</span><strong id="metricPhotoIndexFiles">__INITIAL_PHOTO_INDEX_FILES__</strong></div>
   </section>
   <div id="statusLoadError" class="inline-status error" role="status" aria-live="polite" hidden></div>
@@ -3379,7 +4464,7 @@ a { color: var(--accent); }
           <input id="indexRoots" placeholder="/Volumes/External Drive/Photos; /another/folder">
           <button class="button" onclick="chooseFolderInFinder('indexRoots')">Choose folder</button>
         </div>
-        <div class="subtle">Leave blank to scan Source Data and all of its subfolders.</div>
+        <div class="subtle">Leave blank to refresh existing indexed folders. First run only: blank scans Source Data.</div>
       </div>
       <label class="checkbox-line">
         <input id="resetPhotoIndex" type="checkbox">
@@ -3412,6 +4497,10 @@ a { color: var(--accent); }
         <input id="limitEasyMatchToIndexFolder" type="checkbox">
         Limit easy matches to one indexed folder
       </label>
+      <label class="checkbox-line">
+        <input id="includeLowQualityMatches" type="checkbox">
+        Recheck low-quality confirmed matches
+      </label>
       <div class="field">
         <label>Indexed folder for easy matches</label>
         <div class="folder-row">
@@ -3438,10 +4527,105 @@ a { color: var(--accent); }
       </div>
     </section>
 
-    <section class="panel workflow-step" data-step="crop_confirmation">
+    <section class="panel workflow-step" data-step="broad_visual_match">
       <div class="workflow-step-header">
         <div>
           <div class="step-kicker">Step 4</div>
+          <h2>Broad Visual Match</h2>
+        </div>
+        <div class="step-status-bar" data-step-status="broad_visual_match">No runs yet</div>
+        <button class="button small step-toggle" data-step-toggle="broad_visual_match" onclick="toggleWorkflowStep('broad_visual_match')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+      <div class="subtle">Separate broad search for unresolved originals. Results stay in the broad database until you explicitly send candidates to the picker.</div>
+      <ol class="workflow-guide">
+        <li><strong>Build/refresh descriptor index</strong> fingerprints original-photo candidates. Existing current fingerprints are reused unless "overwrite existing fingerprints" is checked.</li>
+        <li><strong>Measure accuracy</strong> compares Project365 entries that already have confirmed originals and exports a CSV/JSON report. It does not create review rows.</li>
+        <li><strong>Search unresolved photos</strong> only searches entries without a confirmed original. It will not include already matched entries in the target count.</li>
+        <li><strong>Review search results</strong> shows saved unresolved-search candidates. Use Accuracy benchmark review to compare against known originals.</li>
+      </ol>
+      <div id="broadVisualBox" class="compact-list"></div>
+      <div class="field">
+        <label title="Original-photo folders to fingerprint when building a normal broad index. Not needed when indexing confirmed originals only.">Original-photo folders to fingerprint/search</label>
+        <div class="folder-row">
+          <input id="broadCandidateRoots" placeholder="/Volumes/External Drive/Photos">
+          <button class="button" onclick="chooseFolderInFinder('broadCandidateRoots')">Choose folder</button>
+        </div>
+        <div class="field-hint">Leave blank to reuse existing photo-index roots. Confirmed-only test indexes use the confirmed original paths for the selected Project365 entries.</div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label title="Which Project365 entries to test, benchmark, or search. These dates are the target entries, not candidate-photo metadata dates.">Project365 entries to test/search</label>
+          <select id="broadTargetScope">
+            <option value="all_unresolved">All unresolved</option>
+            <option value="entry_ids">Entry IDs</option>
+            <option value="date_range">Date range</option>
+            <option value="broad_search_needed_list">Broad-search-needed list</option>
+          </select>
+          <div class="field-hint">Use Date range or Entry IDs for a small test before running a broad unresolved search.</div>
+        </div>
+        <div class="field">
+          <label title="Which indexed original-photo candidates each Project365 entry is compared against. This is separate from the Project365 date range.">Original candidates to compare</label>
+          <select id="broadCandidateScope">
+            <option value="whole_indexed_library">Whole indexed library</option>
+            <option value="folder_limited">Folder-limited</option>
+            <option value="date_window_limited">Only candidates dated near each entry</option>
+            <option value="same_setting_folder_limited">Same-setting/folder-limited</option>
+          </select>
+          <div class="field-hint">Use Whole indexed library for accuracy checks. Use date-window only when you want to limit candidate photos by their own dates.</div>
+        </div>
+        <div class="field">
+          <label title="How many candidate originals to keep for each Project365 entry.">Candidates kept per entry</label>
+          <input id="broadMaxResults" type="number" min="1" value="20">
+        </div>
+        <div class="field">
+          <label title="How many square crop positions to sample across a landscape candidate. Higher can help off-center crops but takes longer.">Square crop positions</label>
+          <input id="broadDensity" type="number" min="1" value="9">
+          <div class="field-hint">Default 9 is a balanced setting for landscape originals cropped into square Project365 exports.</div>
+        </div>
+        <div class="field">
+          <label title="Used only when Original candidates to compare is set to 'Only candidates dated near each entry'. A value of 30 means candidates within plus/minus 30 days of each Project365 entry date.">Candidate date window, +/- days</label>
+          <input id="broadDateWindowDays" type="number" min="0" value="0">
+          <div class="field-hint">Not the same as Start/End date. Leave 0 unless using the date-window candidate filter; then try 30 to 90 days.</div>
+        </div>
+        <div class="field">
+          <label title="Use only when Project365 entries to test/search is set to Entry IDs. Separate multiple IDs with semicolons.">Project365 entry IDs</label>
+          <input id="broadEntryIds" placeholder="project365:1998-04-12; project365:1998-04-13">
+        </div>
+        <div class="field">
+          <label title="First Project365 entry date for a date-range target scope. This does not set the candidate date window.">Target start date</label>
+          <input id="broadStartDate" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label title="Last Project365 entry date for a date-range target scope. This does not set the candidate date window.">Target end date</label>
+          <input id="broadEndDate" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label title="Optional file containing Project365 entry IDs that need broad search.">Broad-search-needed list</label>
+          <input id="broadNeededList" placeholder="/path/to/entry_ids.csv">
+        </div>
+      </div>
+      <label class="checkbox-line" title="Include candidates that the broad index would otherwise skip as low quality. Usually leave off for the first pass."><input id="broadIncludeLowQuality" type="checkbox"> Include low-quality candidates</label>
+      <label class="checkbox-line" title="Only affects Build fingerprints. It fingerprints originals that are already confirmed for the selected Project365 entries, so Measure accuracy can compare predicted results to known originals."><input id="broadConfirmedOnly" type="checkbox"> Fingerprint already confirmed originals</label>
+      <label class="checkbox-line" title="Only affects Search unresolved photos. Continues the latest broad match run if one exists."><input id="broadResumeExisting" type="checkbox"> Resume existing match run</label>
+      <label class="checkbox-line" title="Only affects Build/refresh index. When unchecked, already-current fingerprints are skipped for speed. When checked, every scanned item is recomputed."><input id="broadOverwriteFingerprints" type="checkbox"> Overwrite existing fingerprints</label>
+      <label class="checkbox-line" title="Show what would run without writing index, match, or report output."><input id="broadDryRun" type="checkbox"> Dry run</label>
+      <div class="button-row">
+        <button class="button primary" title="Step 1. Fingerprint original-photo candidates into the separate broad database." onclick="buildBroadVisualIndex()">1. Build fingerprints</button>
+        <button class="button" title="Step 2 for known-answer testing. Exports accuracy numbers for entries that already have confirmed originals." onclick="runBroadVisualBenchmark()">2. Measure accuracy</button>
+        <button class="button primary" title="Step 3 for unresolved photos. Uses an existing index to precompute broad candidates for review." onclick="runBroadVisualMatch()">3. Search unresolved photos</button>
+        <button id="broadReviewResultsButton" class="button" data-review-mode="search" title="Step 4. Opens Broad Visual Review. The count updates after status loads." onclick="openBroadVisualReview()">4. Review results (loading)</button>
+      </div>
+      <div id="broadVisualMessage" class="inline-status" role="status" aria-live="polite"></div>
+      <div class="step-result" data-step-result="broad_visual_match"></div>
+      <div class="step-history" data-step-history="broad_visual_match"></div>
+      </div>
+    </section>
+
+    <section class="panel workflow-step" data-step="crop_confirmation">
+      <div class="workflow-step-header">
+        <div>
+          <div class="step-kicker">Step 5</div>
           <h2>Crop confirmation</h2>
         </div>
         <div class="step-status-bar" data-step-status="crop_confirmation">Review selected originals</div>
@@ -3452,6 +4636,10 @@ a { color: var(--accent); }
       <div id="cropConfirmationOverview" class="result-grid"></div>
       <div class="button-row">
         <button id="estimateCropBatchButton" class="button" type="button" onclick="startCropEstimateBatch()">Batch estimate crop</button>
+        <label class="checkbox-line inline-checkbox">
+          <input id="applyCropEstimates" type="checkbox">
+          Apply estimates
+        </label>
         <button id="openCropConfirmationButton" class="button" type="button" onclick="openCropConfirmation()">Open crop confirmation</button>
         <span id="cropEstimateBatchStatus" class="inline-status" role="status" aria-live="polite"></span>
       </div>
@@ -3462,16 +4650,31 @@ a { color: var(--accent); }
     <section class="panel workflow-step" data-step="generate_derivatives">
       <div class="workflow-step-header">
         <div>
-          <div class="step-kicker">Step 5</div>
+          <div class="step-kicker">Step 6</div>
           <h2>Working photo copies</h2>
         </div>
         <div class="step-status-bar" data-step-status="generate_derivatives">No runs yet</div>
         <button class="button small step-toggle" data-step-toggle="generate_derivatives" onclick="toggleWorkflowStep('generate_derivatives')" aria-expanded="false">Open</button>
       </div>
       <div class="workflow-step-body">
-      <div class="subtle">Creates date-organized JPEG working copies from confirmed originals where available. Local face-recognition tools such as digiKam can scan this collection.</div>
+      <div class="subtle">Creates date-organized JPEG working copies from confirmed originals where available. Unchanged copies are skipped unless forced.</div>
+      <div class="grid">
+        <div class="field">
+          <label>Start date</label>
+          <input id="workingCopyStartDate" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label>End date</label>
+          <input id="workingCopyEndDate" placeholder="YYYY-MM-DD">
+        </div>
+        <label class="checkbox-line inline-checkbox">
+          <input id="forceWorkingCopies" type="checkbox">
+          Force rewrite all matching working copies
+        </label>
+      </div>
       <div id="workingCopyReadiness" class="result-grid"></div>
-      <button class="button primary" onclick="runStep('generate_derivatives')">Generate working copies</button>
+      <button class="button primary" onclick="runWorkingCopies()">Generate working copies</button>
+      <div id="workingCopyMessage" class="inline-status" role="status" aria-live="polite"></div>
       <div class="step-result" data-step-result="generate_derivatives"></div>
       <div class="step-history" data-step-history="generate_derivatives"></div>
       </div>
@@ -3480,7 +4683,7 @@ a { color: var(--accent); }
     <section class="panel workflow-step" data-step="face_tagging">
       <div class="workflow-step-header">
         <div>
-          <div class="step-kicker">Step 6</div>
+          <div class="step-kicker">Step 7</div>
           <h2>People / face tagging</h2>
         </div>
         <div class="step-status-bar" data-step-status="face_tagging">No runs yet</div>
@@ -3507,10 +4710,40 @@ a { color: var(--accent); }
       </div>
     </section>
 
+    <section class="panel workflow-step" data-step="diary_enrichment">
+      <div class="workflow-step-header">
+        <div>
+          <div class="step-kicker">Step 8</div>
+          <h2>Diary enrichment</h2>
+        </div>
+        <div class="step-status-bar" data-step-status="diary_enrichment">Choose date range</div>
+        <button class="button small step-toggle" data-step-toggle="diary_enrichment" onclick="toggleWorkflowStep('diary_enrichment')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+      <div class="subtle">Add subordinate photos to existing diary entries or create same-date sub-entries after working copies and face tags are ready.</div>
+      <div class="grid">
+        <div class="field">
+          <label>Start date</label>
+          <input id="diaryEnrichmentStartDate" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label>End date</label>
+          <input id="diaryEnrichmentEndDate" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label>Entry limit</label>
+          <input id="diaryEnrichmentLimit" type="number" min="1" max="1000" value="200">
+        </div>
+      </div>
+      <button class="button primary" type="button" onclick="openDiaryEnrichment()">Open diary enrichment</button>
+      <div id="diaryEnrichmentMessage" class="inline-status" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
     <section class="panel workflow-step" data-step="generate_diarium_package">
       <div class="workflow-step-header">
         <div>
-          <div class="step-kicker">Step 7</div>
+          <div class="step-kicker">Step 9</div>
           <h2>Diarium import package</h2>
         </div>
         <div class="step-status-bar" data-step-status="generate_diarium_package">No runs yet</div>
@@ -3546,10 +4779,15 @@ let progressTimer = null;
 let progressStartedAt = null;
 let progressStep = "";
 let activeJobId = "";
+let statusRefreshTimer = null;
+let startRequestController = null;
+const ACTIVE_STATUS_REFRESH_MS = 1500;
 const STEP_OWNER = {
   refresh_photo_index_metadata: "build_photo_index",
   search_originals: "match_easy_originals",
   apply_original_decisions: "match_easy_originals",
+  broad_visual_index: "broad_visual_match",
+  broad_visual_benchmark: "broad_visual_match",
   import_digikam_people: "face_tagging"
 };
 const initialStep = new URLSearchParams(window.location.search).get("step") || "";
@@ -3584,9 +4822,11 @@ async function loadStatus(steps) {
     renderWorkingCopyReadiness(payload);
     renderPhotoIndexBox(payload);
     renderEasyMatchBox(payload);
+    renderBroadVisualBox(payload);
     renderCropConfirmationBox(payload);
     renderBatchOverview(payload);
     renderAttemptOverview(payload);
+    scheduleActiveStatusRefresh(payload);
   } catch (error) {
     setStatusLoadError(`Could not load current database status: ${error.message}`);
     throw error;
@@ -3654,11 +4894,35 @@ function renderWorkingCopyReadiness(payload) {
   const ready = Number(db.working_copy_ready_count || 0);
   const sources = Number(db.working_copy_source_count || 0);
   const notReady = Number(db.working_copy_not_ready_count || 0);
+  const current = Number(db.working_copy_current_count || 0);
+  const needsUpdate = Number(db.working_copy_needs_update_count || 0);
   target.innerHTML = `
     <div class="result-metric"><span>Ready for export</span><strong>${ready}</strong></div>
     <div class="result-metric"><span>Source chosen</span><strong>${sources}</strong></div>
+    <div class="result-metric"><span>Already current</span><strong>${current}</strong></div>
+    <div class="result-metric"><span>Need update</span><strong>${needsUpdate}</strong></div>
     <div class="result-metric"><span>Needs crop</span><strong>${notReady}</strong></div>
   `;
+}
+
+function workingCopyDateScope() {
+  return {
+    startDate: document.getElementById("workingCopyStartDate")?.value.trim() || "",
+    endDate: document.getElementById("workingCopyEndDate")?.value.trim() || ""
+  };
+}
+
+async function refreshWorkingCopyReadiness() {
+  const scope = workingCopyDateScope();
+  const params = new URLSearchParams();
+  if (scope.startDate) params.set("start_date", scope.startDate);
+  if (scope.endDate) params.set("end_date", scope.endDate);
+  try {
+    const payload = await fetchJson(`/api/working-copy-readiness?${params.toString()}`);
+    renderWorkingCopyReadiness(payload);
+  } catch (error) {
+    setWorkingCopyMessage(`Could not refresh working-copy status: ${error.message}`, true);
+  }
 }
 
 function renderCropConfirmationBox(payload) {
@@ -3671,6 +4935,8 @@ function renderCropConfirmationBox(payload) {
   }
   target.innerHTML = `
     <div class="result-metric"><span>With crop information</span><strong>${crop.with_crop_count || 0}</strong></div>
+    <div class="result-metric"><span>Saved estimates</span><strong>${crop.estimated_crop_count || 0}</strong></div>
+    <div class="result-metric"><span>User saved</span><strong>${crop.confirmed_crop_count || 0}</strong></div>
     <div class="result-metric"><span>Queued without crop</span><strong>${crop.queued_count || 0}</strong></div>
   `;
 }
@@ -3684,10 +4950,7 @@ function renderTopMetrics(payload) {
     "metricMissingPhotos",
     formatCountPercent(metrics.missing_photos || 0, project365Total)
   );
-  setText(
-    "metricWithoutIdentifiedOriginal",
-    formatCountPercent(metrics.without_identified_original || 0, project365Total)
-  );
+  setText("metricAssociatedPhotos", metrics.associated_photos || 0);
   setText("metricPhotoIndexFiles", metrics.photo_index_files || 0);
 }
 
@@ -3701,10 +4964,16 @@ function formatCountPercent(count, total) {
 function renderWorkflowSummaries(payload) {
   const history = payload.workflow_history || {};
   const activeJobs = payload.active_jobs || [];
+  const cancellableJob = activeJobs.find(job => job.job_id && ["queued", "running"].includes(job.status || "running"));
+  if (cancellableJob) activeJobId = cancellableJob.job_id;
   for (const card of document.querySelectorAll(".workflow-step[data-step]")) {
     const owner = card.dataset.step;
     const active = activeJobs.find(job => ownerStep(job.step) === owner);
     const records = workflowRecordsFor(owner, history);
+    if (owner === "build_photo_index" && !active && !records.length) {
+      const latestIndexRun = latestPhotoIndexWorkflowRecord(payload.photo_library_index || {});
+      if (latestIndexRun) records.push(latestIndexRun);
+    }
     renderWorkflowCard(card, owner, active, records);
   }
 }
@@ -3731,6 +5000,8 @@ function renderWorkflowCard(card, owner, active, records) {
   if (statusTarget) {
     if (owner === "crop_confirmation" && !active) {
       statusTarget.innerHTML = formatCropConfirmationStatus((lastStatus || {}).crop_confirmation || {});
+    } else if (owner === "diary_enrichment" && !active) {
+      statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Set date range`;
     } else {
       statusTarget.innerHTML = latest ? formatWorkflowStatus(latest, Boolean(active)) : "No runs yet";
     }
@@ -3746,26 +5017,113 @@ function renderWorkflowCard(card, owner, active, records) {
   if (historyTarget) historyTarget.innerHTML = records.length ? formatWorkflowHistory(records) : "";
 }
 
+function latestPhotoIndexWorkflowRecord(photoIndex) {
+  const run = ((photoIndex || {}).recent_runs || [])[0];
+  if (!run || !run.started_at) return null;
+  return {
+    step: "build_photo_index",
+    status: "pass",
+    started_at: run.started_at,
+    finished_at: run.finished_at || run.started_at,
+    summary: {
+      scope: [`Folders: ${run.roots || "unknown"}`],
+      metrics: [
+        {label: "Scanned files", value: run.scanned_file_count || 0},
+        {label: "Indexed files", value: run.indexed_file_count || 0},
+        {label: "New files in latest index run", value: run.new_file_count || 0},
+        {label: "Skipped files", value: run.skipped_file_count || 0}
+      ],
+      zero_change: Number(run.new_file_count || 0) === 0,
+      zero_change_message: "No new files were added in the latest index run."
+    }
+  };
+}
+
 function formatCropConfirmationStatus(crop) {
   if (crop.error) return `<span class="status-pill fail">Needs attention</span>${escapeHtml(crop.error)}`;
-  return `<span class="status-pill">Crop review</span>${crop.with_crop_count || 0} with crop information · ${crop.queued_count || 0} queued without crop`;
+  return `<span class="status-pill">Crop review</span>${crop.queued_count || 0} without crop · ${crop.estimated_crop_count || 0} saved estimates · ${crop.confirmed_crop_count || 0} user saved`;
 }
 
 function openCropConfirmation() {
   window.location.assign("/crop");
 }
 
+function setDiaryEnrichmentMessage(message, isError = false) {
+  const target = document.getElementById("diaryEnrichmentMessage");
+  if (!target) return;
+  target.textContent = message;
+  target.classList.toggle("error", Boolean(isError));
+}
+
+function setWorkingCopyMessage(message, isError = false) {
+  const target = document.getElementById("workingCopyMessage");
+  if (!target) return;
+  target.textContent = message;
+  target.classList.toggle("error", Boolean(isError));
+}
+
+function validIsoDate(value) {
+  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function openDiaryEnrichment() {
+  const startDate = document.getElementById("diaryEnrichmentStartDate").value.trim();
+  const endDate = document.getElementById("diaryEnrichmentEndDate").value.trim();
+  const limit = Number(document.getElementById("diaryEnrichmentLimit").value || "200");
+  if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
+    setDiaryEnrichmentMessage("Enter both start and end dates as YYYY-MM-DD.", true);
+    return;
+  }
+  if (startDate > endDate) {
+    setDiaryEnrichmentMessage("Start date must be before or equal to end date.", true);
+    return;
+  }
+  const boundedLimit = Math.max(1, Math.min(Math.round(Number.isFinite(limit) ? limit : 200), 1000));
+  const url = new URL("/enrich", window.location.href);
+  url.searchParams.set("start_date", startDate);
+  url.searchParams.set("end_date", endDate);
+  url.searchParams.set("limit", String(boundedLimit));
+  window.location.assign(url.toString());
+}
+
+async function runWorkingCopies() {
+  const startDate = document.getElementById("workingCopyStartDate").value.trim();
+  const endDate = document.getElementById("workingCopyEndDate").value.trim();
+  if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
+    setWorkingCopyMessage("Enter both start and end dates as YYYY-MM-DD.", true);
+    return;
+  }
+  if (startDate > endDate) {
+    setWorkingCopyMessage("Start date must be before or equal to end date.", true);
+    return;
+  }
+  setWorkingCopyMessage(
+    document.getElementById("forceWorkingCopies").checked
+      ? "Starting forced rewrite for selected dates..."
+      : "Starting selected dates; unchanged copies will be skipped."
+  );
+  await runStep("generate_derivatives", {
+    start_date: startDate,
+    end_date: endDate,
+    force: Boolean(document.getElementById("forceWorkingCopies").checked)
+  });
+  await refreshWorkingCopyReadiness();
+}
+
 async function startCropEstimateBatch() {
   const button = document.getElementById("estimateCropBatchButton");
+  const applyEstimates = Boolean(document.getElementById("applyCropEstimates")?.checked);
   if (!button || button.dataset.jobId) return;
   button.disabled = true;
   markButtonRunning(button, true);
-  setCropEstimateBatchStatus("Starting batch estimate.");
+  setCropEstimateBatchStatus(applyEstimates ? "Starting batch estimate and saving estimates." : "Starting batch estimate preview.");
   try {
     const job = await fetchJson("/api/crop-estimate-batch", {
       method: "POST",
       headers: {"content-type": "application/json"},
-      body: JSON.stringify({})
+      body: JSON.stringify({apply_estimates: applyEstimates})
     });
     renderCropEstimateBatchJob(job);
     if (job.status === "queued" || job.status === "running") {
@@ -3836,13 +5194,14 @@ function renderCropEstimateBatchJob(job) {
   const skipped = Number(job.skipped_count || 0);
   const failed = Number(job.failed_count || 0);
   const current = job.current_entry_id ? ` · ${job.current_entry_id}` : "";
+  const mode = job.apply_estimates ? "saved" : "previewed";
   const firstError = Array.isArray(job.errors) && job.errors.length ? job.errors[0] : null;
   const errorDetail = firstError
     ? ` · First error: ${firstError.entry_id || "item"} ${firstError.error || "estimate failed"}`
     : "";
   const label = runningNow ? "Working" : job.status === "pass" ? "Complete" : "Failed";
   setCropEstimateBatchStatus(
-    `${label} · ${processed}/${total} checked · ${estimated} estimated · ${skipped} skipped · ${failed} failed${current}${errorDetail}`
+    `${label} · ${processed}/${total} checked · ${estimated} ${mode} estimates · ${skipped} skipped · ${failed} failed${current}${errorDetail}`
   );
 }
 
@@ -3929,20 +5288,28 @@ function formatWorkflowResult(record, active) {
 function formatActiveWorkflowResult(job) {
   const startedAt = Date.parse(job.started_at || new Date().toISOString());
   const elapsed = formatElapsed(Date.now() - startedAt);
+  const jobId = job.job_id || activeJobId;
+  const canCancelStart = !jobId && running && (job.status === "starting" || job.status === "running");
+  const actionLabel = jobId ? "Stop" : "Cancel";
+  const status = job.status || "running";
+  const liveLabel = ["queued", "running", "starting", "cancelling"].includes(status) ? "Working" : formatJobStatus(status);
   return `
-    <div class="run-progress status-${escapeHtml(job.status || "running")}">
+    <div class="run-progress status-${escapeHtml(status)}">
       <div class="run-progress-header">
         <div class="run-progress-main">
           <span class="spinner"></span>
-          <strong>${escapeHtml(formatStepName(job.step || progressStep))} · ${escapeHtml(formatJobStatus(job.status || "running"))}</strong>
+          <strong>${escapeHtml(formatStepName(job.step || progressStep))}</strong>
         </div>
         <div class="run-progress-actions">
           <span class="subtle">${escapeHtml(elapsed)}</span>
-          <button class="button danger small" onclick="cancelActiveJob()" ${activeJobId ? "" : "hidden"}>Stop</button>
+          <button class="button danger small" onclick="cancelActiveJob()" ${jobId || canCancelStart ? "" : "hidden"}>${escapeHtml(actionLabel)}</button>
         </div>
       </div>
       <div class="progress-track"><div class="progress-bar"></div></div>
-      <div class="subtle">${escapeHtml(progressDetail(job))}</div>
+      <div class="subtle run-progress-detail">
+        <span class="run-progress-text">${escapeHtml(progressDetail(job))}</span>
+        <span class="run-progress-live">${escapeHtml(liveLabel)}</span>
+      </div>
     </div>
   `;
 }
@@ -4036,6 +5403,192 @@ function renderEasyMatchBox(payload) {
     );
   } else {
     setStepMessage("match_easy_originals", "No easy matches are ready for review.");
+  }
+}
+
+function renderBroadVisualBox(payload) {
+  const target = document.getElementById("broadVisualBox");
+  if (!target) return;
+  const broad = payload.broad_visual_match || {};
+  const latestRun = broad.latest_run || {};
+  const latestIndex = broad.latest_index_run || {};
+  const latestBenchmark = broad.latest_benchmark || {};
+  const active = (payload.active_jobs || []).find(job => ownerStep(job.step) === "broad_visual_match");
+  updateBroadReviewButton(latestBenchmark, latestRun);
+  const skippedIndex = Math.max(
+    0,
+    latestIndex.skipped_candidate_count === undefined || latestIndex.skipped_candidate_count === null
+      ? Number(latestIndex.scanned_count || 0)
+        - Number(latestIndex.reused_descriptor_count || 0)
+        - Number(latestIndex.indexed_descriptor_count || 0)
+        - Number(latestIndex.error_count || 0)
+      : Number(latestIndex.skipped_candidate_count || 0)
+  );
+  const totalIndexCandidates = Number(latestIndex.total_candidate_count || 0);
+  target.innerHTML = `
+    <div><span>Broad match database</span><strong>${broad.exists ? "ready" : "not created"} · ${escapeHtml(broad.path || "")}</strong></div>
+    <div><span>Stored candidate fingerprints</span><strong>${broad.descriptor_count || 0}</strong></div>
+    <div><span>Active job</span><strong>${active ? escapeHtml(`${formatStepName(active.step || "")} · ${active.status || "running"}`) : "none"}</strong></div>
+    <div><span>Latest fingerprint build</span><strong>${escapeHtml(formatBroadIndexSummary(latestIndex, skippedIndex))}</strong></div>
+    <div><span>Fingerprints checked</span><strong>${latestIndex.scanned_count || 0}${totalIndexCandidates ? ` / ${totalIndexCandidates}` : ""}</strong></div>
+    <div><span>New/rebuilt fingerprints</span><strong>${latestIndex.indexed_descriptor_count || 0}</strong></div>
+    <div><span>Already reused</span><strong>${latestIndex.reused_descriptor_count || 0}</strong></div>
+    <div><span>Not fingerprinted</span><strong>${skippedIndex}</strong></div>
+    <div><span>Speed</span><strong>${escapeHtml(formatBroadIndexThroughput(latestIndex, Boolean(active)))}</strong></div>
+    <div><span>Current item</span><strong>${escapeHtml(formatBroadCurrentItem(latestIndex))}</strong></div>
+    <div><span>Date coverage</span><strong>${escapeHtml(formatBroadDateCoverage(latestIndex))}</strong></div>
+    <div><span>Latest fingerprint errors</span><strong>${escapeHtml(formatBroadIndexErrors(broad.latest_index_errors || [], Number(latestIndex.error_count || 0)))}</strong></div>
+    <div><span>Latest accuracy benchmark</span><strong>${escapeHtml(formatBroadBenchmarkSummary(latestBenchmark))}</strong></div>
+    <div><span>Latest unresolved search</span><strong>${escapeHtml(formatBroadSearchSummary(latestRun))}</strong></div>
+    <div><span>Saved unresolved candidate rows</span><strong>${latestRun.result_count || 0}</strong></div>
+    <div><span>Errors</span><strong>${Number(latestIndex.error_count || 0) + Number(latestRun.error_count || 0) + Number(latestBenchmark.error_count || 0)}</strong></div>
+  `;
+}
+
+function updateBroadReviewButton(latestBenchmark, latestRun) {
+  const button = document.getElementById("broadReviewResultsButton");
+  if (!button) return;
+  const accuracyCount = Number(latestBenchmark.confirmed_count || 0);
+  const searchCount = Number(latestRun.matched_entries || 0);
+  const parts = [];
+  if (accuracyCount) parts.push(`${accuracyCount} accuracy`);
+  if (searchCount) parts.push(`${searchCount} search`);
+  button.textContent = parts.length
+    ? `4. Review results (${parts.join(", ")})`
+    : "4. Review results (0)";
+  button.title = parts.length
+    ? `Open Broad Visual Review: ${parts.join(", ")} entries available.`
+    : "Open Broad Visual Review. No accuracy benchmark or unresolved search entries are available yet.";
+  button.dataset.reviewMode = searchCount ? "search" : "benchmark";
+}
+
+function formatBroadRunState(active, latestRun) {
+  if (active) return `${active.status || "running"} active`;
+  if (!latestRun || !latestRun.run_id) return "idle";
+  return latestRun.status || "completed";
+}
+
+function formatBroadIndexSummary(latestIndex, skippedIndex) {
+  if (!latestIndex || !latestIndex.run_id) return "none yet";
+  const scope = latestIndex.roots || "selected folders";
+  const total = Number(latestIndex.total_candidate_count || 0);
+  const checked = Number(latestIndex.scanned_count || 0);
+  const progress = total ? `${checked}/${total}` : `${checked}`;
+  return `${latestIndex.status || "finished"} · ${scope} · ${progress} files checked (${skippedIndex} skipped)`;
+}
+
+function formatBroadIndexThroughput(latestIndex, active) {
+  if (!latestIndex || !latestIndex.run_id || !latestIndex.started_at) return "none yet";
+  const startedAt = Date.parse(latestIndex.started_at);
+  if (!Number.isFinite(startedAt)) return "unknown";
+  const finishedAt = latestIndex.finished_at ? Date.parse(latestIndex.finished_at) : 0;
+  const heartbeatAt = latestIndex.heartbeat_at ? Date.parse(latestIndex.heartbeat_at) : 0;
+  const endAt = active ? (heartbeatAt || Date.now()) : (finishedAt || heartbeatAt || Date.now());
+  const elapsedMs = Math.max(0, endAt - startedAt);
+  const elapsedSeconds = Math.max(1, elapsedMs / 1000);
+  const checked = Number(latestIndex.scanned_count || 0);
+  const total = Number(latestIndex.total_candidate_count || 0);
+  const rate = checked / elapsedSeconds;
+  const pieces = [`${formatElapsed(elapsedMs)} elapsed`];
+  if (checked) pieces.push(`${rate.toFixed(rate >= 10 ? 1 : 2)} files/sec`);
+  if (active && total > checked && rate > 0) {
+    pieces.push(`${formatElapsed(((total - checked) / rate) * 1000)} remaining`);
+  }
+  return pieces.join(" · ");
+}
+
+function formatBroadIndexErrors(errors, errorCount) {
+  const count = Number(errorCount || 0);
+  if (!count) return "none";
+  const first = Array.isArray(errors) && errors.length ? errors[0] : null;
+  if (!first) return `${count} errors`;
+  const name = first.filename || first.path || "file";
+  const phase = first.phase || "fingerprinting";
+  const more = count > 1 ? `; ${count - 1} more` : "";
+  return `${count} errors · ${phase} · ${name}${more}`;
+}
+
+function formatBroadCurrentItem(latestIndex) {
+  if (!latestIndex || !latestIndex.current_candidate_index) return "none";
+  const index = Number(latestIndex.current_candidate_index || 0);
+  const total = Number(latestIndex.total_candidate_count || 0);
+  const phase = latestIndex.current_phase || "working";
+  const name = latestIndex.current_candidate_name || "candidate";
+  const ext = latestIndex.current_candidate_extension || "";
+  const size = formatBytes(Number(latestIndex.current_candidate_byte_size || 0));
+  const date = latestIndex.current_candidate_date || "";
+  const parts = [`${phase}`, `file ${index}${total ? `/${total}` : ""}`];
+  if (date) parts.push(date);
+  if (ext) parts.push(ext);
+  if (size) parts.push(size);
+  parts.push(name);
+  return parts.join(" · ");
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "";
+  if (bytes >= 1000000000) return `${(bytes / 1000000000).toFixed(1)} GB`;
+  if (bytes >= 1000000) return `${(bytes / 1000000).toFixed(1)} MB`;
+  if (bytes >= 1000) return `${(bytes / 1000).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function formatBroadDateCoverage(latestIndex) {
+  if (!latestIndex || !latestIndex.date_coverage_json) return "none yet";
+  const payload = parseJsonObject(latestIndex.date_coverage_json);
+  const totalDates = Number(payload.total_date_count || 0);
+  if (!totalDates) return "none yet";
+  const completeDates = Number(payload.complete_date_count || 0);
+  const completeRange = payload.complete_start_date && payload.complete_end_date
+    ? `${payload.complete_start_date} to ${payload.complete_end_date}`
+    : "";
+  const current = payload.current_date
+    ? `${payload.current_date} ${payload.current_checked || 0}/${payload.current_total || 0}`
+    : "";
+  if (completeRange && current) return `${completeDates}/${totalDates} dates complete (${completeRange}); current ${current}`;
+  if (completeRange) return `${completeDates}/${totalDates} dates complete (${completeRange})`;
+  if (current) return `${completeDates}/${totalDates} dates complete; current ${current}`;
+  return `${completeDates}/${totalDates} dates complete`;
+}
+
+function formatBroadBenchmarkSummary(latestBenchmark) {
+  if (!latestBenchmark || !latestBenchmark.path) return "none yet";
+  const tested = Number(latestBenchmark.confirmed_count || 0);
+  const top1 = Number(latestBenchmark.top_1_count || 0);
+  const topN = Number(latestBenchmark.top_n_count || 0);
+  const misses = Number(latestBenchmark.miss_count || 0);
+  return `${tested} known originals tested · ${top1} top choice · ${topN} in top ${latestBenchmark.max_results || "N"} · ${misses} missed`;
+}
+
+function formatBroadSearchSummary(latestRun) {
+  if (!latestRun || !latestRun.run_id) return "none yet";
+  const scope = formatJsonScope(latestRun.target_scope_json || "");
+  return `${latestRun.target_count || 0} unresolved entries searched · ${latestRun.matched_entries || 0} entries have saved candidates${scope ? ` · ${scope}` : ""}`;
+}
+
+function formatJsonScope(value) {
+  if (!value) return "";
+  try {
+    const parsed = parseJsonObject(value);
+    const start = parsed.start_date || "";
+    const end = parsed.end_date || "";
+    if (start || end) return `${start || "start"} to ${end || "end"}`;
+    if ((parsed.entry_ids || []).length) return `${parsed.entry_ids.length} entry IDs`;
+    if (parsed.broad_search_needed_list) return "broad-search-needed list";
+  } catch (error) {
+    return "";
+  }
+  return "";
+}
+
+function parseJsonObject(value) {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    return {};
   }
 }
 
@@ -4297,28 +5850,66 @@ function pathLine(label, item) {
 async function chooseFolderInFinder(targetInputId = "indexRoots", mode = "append") {
   const trigger = activeButton();
   markButtonRunning(trigger, true);
-  document.getElementById("output").textContent = "Opening folder picker...";
   try {
-    const payload = await fetchJson("/api/choose-folder");
-    if (payload.path) {
-      if (mode === "replace") {
-        document.getElementById(targetInputId).value = payload.path;
-      } else {
-        appendSearchRoot(payload.path, targetInputId);
-      }
-      document.getElementById("output").textContent = `Added folder: ${payload.path}`;
-    } else {
-      document.getElementById("output").textContent = "Folder selection canceled.";
-    }
-  } catch (error) {
-    const message = `Folder picker failed: ${error.message}`;
-    document.getElementById("output").textContent = message;
-    if (targetInputId === "easyMatchIndexFolder") {
-      setStepMessage("match_easy_originals", message, "error");
-    }
+    await promptForFolderPath(targetInputId, mode);
   } finally {
     markButtonRunning(trigger, false);
   }
+}
+
+async function promptForFolderPath(targetInputId, mode) {
+  const promptText = "Paste the folder path here:";
+  const typedPath = window.prompt(promptText, "");
+  if (!typedPath) {
+    const message = "Folder selection canceled. You can also paste a folder path directly into the field.";
+    setFolderChooserMessage(targetInputId, message, "error");
+    if (targetInputId === "easyMatchIndexFolder") {
+      setStepMessage("match_easy_originals", message, "error");
+    }
+    return;
+  }
+  setFolderChooserMessage(targetInputId, "Checking folder path...", "running");
+  try {
+    const payload = await fetchJson("/api/validate-folder-path", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({path: typedPath})
+    });
+    if (mode === "replace") {
+      document.getElementById(targetInputId).value = payload.path;
+    } else {
+      appendSearchRoot(payload.path, targetInputId);
+    }
+    setFolderChooserMessage(targetInputId, `Added folder: ${payload.path}`, "ok");
+  } catch (validationError) {
+    const message = `Folder path rejected: ${validationError.message}`;
+    setFolderChooserMessage(targetInputId, message, "error");
+    if (targetInputId === "easyMatchIndexFolder") {
+      setStepMessage("match_easy_originals", message, "error");
+    }
+  }
+}
+
+function setFolderChooserMessage(targetInputId, message, state = "") {
+  const output = document.getElementById("output");
+  if (output) {
+    output.hidden = false;
+    output.textContent = message;
+  }
+  const targetId = targetInputId === "indexRoots"
+    ? "photoIndexMessage"
+    : targetInputId === "broadCandidateRoots"
+      ? "broadVisualMessage"
+    : targetInputId === "digikamXmpRoots"
+      ? "digikamPeopleMessage"
+      : "";
+  const target = targetId ? document.getElementById(targetId) : null;
+  if (!target) return;
+  target.hidden = false;
+  target.textContent = message;
+  target.classList.toggle("error", state === "error");
+  target.classList.toggle("ok", state === "ok");
+  target.classList.toggle("is-running", state === "running");
 }
 
 function appendSearchRoot(path, targetInputId = "indexRoots") {
@@ -4374,6 +5965,7 @@ async function sha256File(file) {
 
 async function runEasyMatch() {
   const limitToFolder = document.getElementById("limitEasyMatchToIndexFolder").checked;
+  const includeLowQualityMatches = document.getElementById("includeLowQualityMatches").checked;
   const folder = document.getElementById("easyMatchIndexFolder").value.trim();
   if (limitToFolder && !folder) {
     setStepMessage("match_easy_originals", "Choose an indexed folder before running filtered easy matches.", "fail");
@@ -4381,7 +5973,8 @@ async function runEasyMatch() {
   }
   await runStep("match_easy_originals", {
     limit_to_photo_index_folder: limitToFolder,
-    photo_index_folder: limitToFolder ? folder : ""
+    photo_index_folder: limitToFolder ? folder : "",
+    include_low_quality_matches: includeLowQualityMatches
   });
 }
 
@@ -4394,7 +5987,7 @@ async function buildPhotoIndex() {
     setStepMessage("build_photo_index", "Photo index replacement canceled.");
     return;
   }
-  if (!searchRoots.length) setStepMessage("build_photo_index", "Scanning Source Data...", "running");
+  if (!searchRoots.length) setStepMessage("build_photo_index", "Refreshing existing indexed folders...", "running");
   await runStep("build_photo_index", {
     search_roots: searchRoots,
     reset_photo_index: resetPhotoIndex,
@@ -4403,8 +5996,82 @@ async function buildPhotoIndex() {
 }
 
 async function refreshPhotoIndexMetadata() {
-  setStepMessage("refresh_photo_index_metadata", "Refreshing metadata for existing indexed folders...", "running");
-  await runStep("refresh_photo_index_metadata");
+  const searchRoots = parseDelimited("indexRoots");
+  const message = searchRoots.length
+    ? "Refreshing metadata for selected folder..."
+    : "Refreshing metadata for existing indexed folders...";
+  setStepMessage("refresh_photo_index_metadata", message, "running");
+  await runStep("refresh_photo_index_metadata", {search_roots: searchRoots});
+}
+
+async function buildBroadVisualIndex() {
+  const settings = broadVisualSettings();
+  if (settings.confirmed_only && settings.target_scope === "all_unresolved") {
+    setStepMessage("broad_visual_index", "Choose a date range, entry IDs, or list for a constrained confirmed-only index.", "error");
+    return;
+  }
+  await runStep("broad_visual_index", settings);
+}
+
+async function runBroadVisualMatch() {
+  const settings = broadVisualSettings();
+  if (settings.confirmed_only) {
+    setStepMessage("broad_visual_match", "Fingerprint already confirmed originals is for Build fingerprints plus Measure accuracy. Uncheck it before searching unresolved photos.", "error");
+    return;
+  }
+  if (settings.target_scope === "entry_ids" && !settings.entry_ids.length) {
+    setStepMessage("broad_visual_match", "Enter at least one entry ID.", "error");
+    return;
+  }
+  if (settings.target_scope === "date_range" && (!settings.start_date || !settings.end_date)) {
+    setStepMessage("broad_visual_match", "Enter both start and end dates.", "error");
+    return;
+  }
+  if (settings.target_scope === "broad_search_needed_list" && !settings.broad_search_needed_list) {
+    setStepMessage("broad_visual_match", "Enter a broad-search-needed list path.", "error");
+    return;
+  }
+  if (["folder_limited", "same_setting_folder_limited"].includes(settings.candidate_scope) && !settings.candidate_roots.length) {
+    setStepMessage("broad_visual_match", "Choose at least one candidate folder for folder-limited matching.", "error");
+    return;
+  }
+  if (settings.candidate_scope === "date_window_limited" && !settings.date_window_days) {
+    setStepMessage("broad_visual_match", "Set Candidate date window, +/- days. This is separate from Target start/end date; use 30 to 90 days, or choose Whole indexed library.", "error");
+    return;
+  }
+  await runStep("broad_visual_match", settings);
+}
+
+async function runBroadVisualBenchmark() {
+  const settings = broadVisualSettings();
+  await runStep("broad_visual_benchmark", settings);
+}
+
+function openBroadVisualReview() {
+  const button = document.getElementById("broadReviewResultsButton");
+  const mode = button?.dataset.reviewMode || "search";
+  window.location.assign(`/broad-review?mode=${encodeURIComponent(mode)}`);
+}
+
+function broadVisualSettings() {
+  const scope = document.getElementById("broadTargetScope")?.value || "all_unresolved";
+  return {
+    candidate_roots: parseDelimited("broadCandidateRoots"),
+    target_scope: scope,
+    entry_ids: scope === "entry_ids" ? parseDelimited("broadEntryIds") : [],
+    start_date: scope === "date_range" ? document.getElementById("broadStartDate").value.trim() : "",
+    end_date: scope === "date_range" ? document.getElementById("broadEndDate").value.trim() : "",
+    broad_search_needed_list: scope === "broad_search_needed_list" ? document.getElementById("broadNeededList").value.trim() : "",
+    candidate_scope: document.getElementById("broadCandidateScope").value,
+    max_results: Number(document.getElementById("broadMaxResults").value || "20"),
+    density: Number(document.getElementById("broadDensity").value || "9"),
+    date_window_days: Number(document.getElementById("broadDateWindowDays").value || "0"),
+    include_low_quality_candidates: Boolean(document.getElementById("broadIncludeLowQuality").checked),
+    confirmed_only: Boolean(document.getElementById("broadConfirmedOnly").checked),
+    resume_existing_run: Boolean(document.getElementById("broadResumeExisting").checked),
+    overwrite_existing_fingerprints: Boolean(document.getElementById("broadOverwriteFingerprints").checked),
+    dry_run: Boolean(document.getElementById("broadDryRun").checked)
+  };
 }
 
 function confirmPhotoIndexReplacement() {
@@ -4450,8 +6117,19 @@ function activePhotoIndexFolderForPicker() {
 function parseDelimited(id) {
   return document.getElementById(id).value
     .split(";")
-    .map(value => value.trim())
+    .map(value => stripWrappingQuotes(value))
     .filter(Boolean);
+}
+
+function stripWrappingQuotes(value) {
+  let stripped = String(value || "").trim();
+  while (stripped.length >= 2) {
+    const first = stripped[0];
+    const last = stripped[stripped.length - 1];
+    if ((first !== "'" && first !== '"') || first !== last) break;
+    stripped = stripped.slice(1, -1).trim();
+  }
+  return stripped;
 }
 
 function splitAttemptList(value) {
@@ -4485,12 +6163,15 @@ async function runStep(step, extra = {}) {
   startProgress(step);
   setStepMessage(step, "Starting...", "running");
   document.getElementById("output").textContent = `Starting ${step}...`;
+  startRequestController = new AbortController();
   try {
     const startedJob = await fetchJson("/api/run", {
       method: "POST",
       headers: {"content-type": "application/json"},
+      signal: startRequestController.signal,
       body: JSON.stringify(Object.assign({step: step}, extra || {}))
     });
+    startRequestController = null;
     const result = startedJob.job_id ? await waitForJob(startedJob.job_id) : startedJob;
     finishProgress(result);
     setStepMessage(
@@ -4498,15 +6179,17 @@ async function runStep(step, extra = {}) {
       result.status === "pass" ? stepCompletionMessage(step) : (result.error || "Task failed."),
       result.status === "pass" ? "" : "error"
     );
-    if (result.status === "pass" && step === "build_photo_index") {
-      document.getElementById("indexRoots").value = "";
-    }
     await loadStatus();
   } catch (error) {
+    const message = error.name === "AbortError"
+      ? "Start cancelled before a server job was created."
+      : error.message;
     stopProgress();
-    setStepMessage(step, error.message, "error");
-    document.getElementById("output").textContent = error.message;
+    updateProgress({step, status: "cancelled", started_at: new Date(progressStartedAt || Date.now()).toISOString(), error: message, outputs: []});
+    setStepMessage(step, message, error.name === "AbortError" ? "" : "error");
+    document.getElementById("output").textContent = message;
   } finally {
+    startRequestController = null;
     running = false;
     markButtonRunning(trigger, false);
     setButtons(false);
@@ -4535,6 +6218,10 @@ function setStepMessage(step, message, state = "") {
     build_photo_index: "photoIndexMessage",
     refresh_photo_index_metadata: "photoIndexMessage",
     match_easy_originals: "easyMatchMessage",
+    broad_visual_index: "broadVisualMessage",
+    broad_visual_match: "broadVisualMessage",
+    broad_visual_benchmark: "broadVisualMessage",
+    generate_derivatives: "workingCopyMessage",
     import_digikam_people: "digikamPeopleMessage"
   };
   const target = document.getElementById(targetIds[step] || "");
@@ -4547,6 +6234,10 @@ function stepCompletionMessage(step) {
   if (step === "build_photo_index") return "Photo index completed.";
   if (step === "refresh_photo_index_metadata") return "Photo index metadata refreshed.";
   if (step === "match_easy_originals") return "Match search completed. Refreshing results...";
+  if (step === "broad_visual_index") return "Broad visual descriptor index completed.";
+  if (step === "broad_visual_match") return "Broad visual match completed. Refreshing results...";
+  if (step === "broad_visual_benchmark") return "Broad visual benchmark exported.";
+  if (step === "generate_derivatives") return "Working photo copies completed.";
   if (step === "import_digikam_people") return "digiKam suggestions imported. Tag queue refreshed.";
   return "Task completed.";
 }
@@ -4558,7 +6249,8 @@ function startProgress(step) {
   manuallyExpandedSteps.add(ownerStep(step));
   updateProgress({step, status: "starting", started_at: new Date().toISOString(), outputs: []});
   progressTimer = setInterval(() => {
-    updateProgress({step: progressStep, status: "running", started_at: new Date(progressStartedAt).toISOString(), outputs: []});
+    if (activeJobId) return;
+    updateProgress({step: progressStep, status: "starting", started_at: new Date(progressStartedAt).toISOString(), outputs: []});
   }, 1000);
 }
 
@@ -4584,9 +6276,20 @@ function stopProgress() {
 }
 
 async function cancelActiveJob() {
-  if (!activeJobId) return;
   const stopButton = document.querySelector(".run-progress button");
   if (stopButton) stopButton.disabled = true;
+  if (!activeJobId) {
+    if (startRequestController) startRequestController.abort();
+    stopProgress();
+    const message = "Start cancelled before a server job was created.";
+    updateProgress({step: progressStep, status: "cancelled", started_at: new Date(progressStartedAt || Date.now()).toISOString(), error: message, outputs: []});
+    setStepMessage(progressStep, message);
+    document.getElementById("output").textContent = message;
+    running = false;
+    setButtons(false);
+    if (stopButton) stopButton.disabled = false;
+    return;
+  }
   try {
     const job = await fetchJson(`/api/job/${encodeURIComponent(activeJobId)}/cancel`, {method: "POST"});
     updateProgress(job);
@@ -4604,6 +6307,7 @@ function progressDetail(job) {
     const lines = latest.trim().split("\\n").filter(Boolean);
     return lines[lines.length - 1] || "Working...";
   }
+  if (job.status === "starting" && !job.job_id && !activeJobId) return "Waiting for the server to create a job...";
   if (job.current_command) return "Running command...";
   if (job.status === "queued") return "Waiting for the current task to finish.";
   if (job.status === "cancelling") return "Stopping...";
@@ -4664,6 +6368,26 @@ function sleep(milliseconds) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds));
 }
 
+function scheduleActiveStatusRefresh(payload) {
+  if (statusRefreshTimer) {
+    window.clearTimeout(statusRefreshTimer);
+    statusRefreshTimer = null;
+  }
+  const activeJobs = (payload.active_jobs || []).filter(job => ["queued", "running"].includes(job.status || "running"));
+  if (!activeJobs.length) return;
+  const steps = new Set(expandedStatusSteps());
+  for (const job of activeJobs) {
+    const owner = ownerStep(job.step);
+    if (owner) steps.add(owner);
+  }
+  statusRefreshTimer = window.setTimeout(function() {
+    statusRefreshTimer = null;
+    loadStatus(Array.from(steps)).catch(function(error) {
+      document.getElementById("output").textContent = error.message;
+    });
+  }, ACTIVE_STATUS_REFRESH_MS);
+}
+
 function activeButton() {
   return document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
 }
@@ -4697,12 +6421,15 @@ function escapeHtml(value) {
   }[char]));
 }
 
-applyInitialWorkflowExpansion();
-if (initialOwnerStep) {
-  loadStatus([initialOwnerStep]).catch(function(error) {
-    document.getElementById("output").textContent = error.message;
-  });
+for (const id of ["workingCopyStartDate", "workingCopyEndDate"]) {
+  const input = document.getElementById(id);
+  if (input) input.addEventListener("change", refreshWorkingCopyReadiness);
 }
+
+applyInitialWorkflowExpansion();
+loadStatus(initialOwnerStep ? [initialOwnerStep] : ["build_photo_index"]).catch(function(error) {
+  document.getElementById("output").textContent = error.message;
+});
 </script>
 </body>
 </html>

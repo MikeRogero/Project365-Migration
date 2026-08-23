@@ -224,6 +224,10 @@ def _collect_person_value(people: list[str], key: str, value: str) -> None:
             person = _person_from_tag_path(item)
             if person:
                 people.append(person)
+    if key in {"li"}:
+        person = _person_from_tag_path(value)
+        if person:
+            people.append(person)
 
 
 def _person_from_tag_path(value: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -64,6 +65,54 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(db_rows, [("diarium_derivative", "image/jpeg", 0)])
 
+    def test_generate_jpeg_derivative_records_associated_photo_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+            associated_path = base / "associated.jpg"
+            associated_path.write_bytes(_tiny_png())
+            _insert_associated_original(canonical_root, associated_path)
+
+            summary = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+
+            self.assertEqual(summary.generated_count, 2)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, role, transformation_json
+                    FROM media_assets
+                    WHERE role IN ('diarium_derivative', 'diarium_associated_derivative')
+                    ORDER BY role, id
+                    """
+                ).fetchall()
+            self.assertEqual(
+                [row[1] for row in rows],
+                ["diarium_associated_derivative", "diarium_derivative"],
+            )
+            self.assertEqual(
+                rows[1][0],
+                "project365:1998-04-12:diarium_derivative:jpeg_64_q80",
+            )
+            associated_transformation = json.loads(rows[0][2])
+            self.assertEqual(associated_transformation["source_role"], "associated")
+            self.assertEqual(associated_transformation["derivative_role"], "diarium_associated_derivative")
+
     def test_missing_review_crop_is_not_ready_for_derivative_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -88,6 +137,7 @@ class Project365MediaDerivativesTests(unittest.TestCase):
 
             self.assertEqual(summary.generated_count, 0)
             self.assertEqual(summary.not_ready_count, 1)
+            self.assertEqual(summary.not_ready_dates, ("1998-04-12",))
             with Path(summary.report_path).open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "not_ready_missing_crop")
@@ -129,6 +179,92 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             with Path(second_summary.report_path).open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "skipped")
+            readiness = derivatives.derivative_readiness_summary(
+                canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            self.assertEqual(readiness.current_count, 1)
+            self.assertEqual(readiness.needs_update_count, 0)
+
+    def test_date_range_limits_working_copy_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {
+                    "1998-04-12.png": _tiny_png(),
+                    "1998-04-13.png": _tiny_png(),
+                },
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+
+            summary = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+                start_date="1998-04-13",
+                end_date="1998-04-13",
+            )
+
+            self.assertEqual(summary.generated_count, 1)
+            with Path(summary.report_path).open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["entry_id"] for row in rows], ["project365:1998-04-13"])
+
+    def test_force_regenerates_current_working_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+            derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+
+            def fake_convert(
+                source_path: Path,
+                output_path: Path,
+                output_format: str,
+                long_edge: int,
+                quality: int,
+                crop: dict[str, object] | None,
+            ) -> None:
+                output_path.write_bytes(_tiny_png())
+
+            with mock.patch.object(derivatives, "_convert_image", side_effect=fake_convert) as convert:
+                summary = derivatives.generate_derivatives(
+                    canonical_root=canonical_root,
+                    output_format="jpeg",
+                    long_edge=64,
+                    quality=80,
+                    force=True,
+                )
+
+            self.assertEqual(summary.generated_count, 1)
+            self.assertEqual(summary.skipped_count, 0)
+            self.assertEqual(convert.call_count, 1)
 
     def test_changed_crop_regenerates_existing_derivative(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -382,6 +518,56 @@ def _set_project365_export_crop(canonical_root: Path) -> None:
             WHERE role = 'project365_export_png'
             """,
             (json.dumps(crop, sort_keys=True),),
+        )
+        connection.commit()
+
+
+def _insert_associated_original(canonical_root: Path, source_path: Path) -> None:
+    crop = {
+        "source": "external_original_associated_photo",
+        "source_path": str(source_path),
+        "associated_entry_date": "1998-04-13",
+        "associated_date_source": "manual",
+        "review_crop": {
+            "x": 0,
+            "y": 0,
+            "size": 1,
+            "candidate_width": 1,
+            "candidate_height": 1,
+            "source": "manual",
+        },
+        "original_is_read_only": True,
+    }
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        import_batch_id = connection.execute(
+            """
+            SELECT import_batch_id
+            FROM media_assets
+            WHERE entry_id = 'project365:1998-04-12'
+                AND role = 'project365_export_png'
+            """
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (
+                'associated-source', 'project365:1998-04-12',
+                'external_original_associated_photo', NULL, 'associated.jpg', ?,
+                ?, ?, 'image/jpeg', 'available', 'confirmed', 0, ?, ?,
+                '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z'
+            )
+            """,
+            (
+                str(source_path),
+                hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                source_path.stat().st_size,
+                json.dumps(crop, sort_keys=True),
+                import_batch_id,
+            ),
         )
         connection.commit()
 

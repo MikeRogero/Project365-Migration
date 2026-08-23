@@ -176,6 +176,42 @@ class Project365DigiKamPeopleImporterTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(people, [("Alex Example", "suggested", "digikam_xmp")])
 
+    def test_imports_people_from_working_copy_sidecar_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, ["1998-04-12"])
+            xmp_root = canonical_root / "media" / "diarium_derivatives" / "Project365_square_2560_q88" / "1998-04"
+            xmp_root.mkdir(parents=True)
+            sidecar = xmp_root / "project365_1998-04-12.jpg.xmp"
+            sidecar.write_text(
+                """<?xml version="1.0"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:subject>
+    <rdf:Bag xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:li>People|Alex Example</rdf:li>
+    </rdf:Bag>
+  </dc:subject>
+</x:xmpmeta>
+""",
+                encoding="utf-8",
+            )
+
+            summary = digikam.import_digikam_people(
+                canonical_root=canonical_root,
+                xmp_roots=[canonical_root / "media" / "diarium_derivatives" / "Project365_square_2560_q88"],
+                suggestions_csv=None,
+                report_path=canonical_root / "exports" / "verification_reports" / "digikam_report.csv",
+                queue_path=canonical_root / "exports" / "verification_reports" / "tag_queue.csv",
+            )
+
+            self.assertEqual(summary.applied_count, 1)
+            self.assertEqual(summary.error_count, 0)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                people = connection.execute(
+                    "SELECT canonical_name, diarium_tag, review_status, source FROM people"
+                ).fetchall()
+            self.assertEqual(people, [("Alex Example", "person:Alex Example", "suggested", "digikam_xmp")])
+
 
 def _import_sample(base: Path, dates: list[str]) -> Path:
     import_dir = base / "Import"

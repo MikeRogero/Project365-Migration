@@ -27,6 +27,7 @@ from project365_visual_ranker import visual_fieldnames
 
 
 ACCEPT_DECISIONS = {"use_external_original", "selected", "confirmed"}
+ASSOCIATED_PHOTO_DECISIONS = {"external_original_associated_photo", "associated_photo"}
 REJECT_DECISIONS = {"rejected"}
 FALLBACK_DECISIONS = {"keep_project365_export", "keep_fallback", "no_external_candidate", "fallback"}
 CANDIDATE_FILTER_EXPORT_EQUIVALENT = "export_equivalent"
@@ -35,6 +36,7 @@ REJECT_ALL_RANGE_STATE_FILENAME = "original_photo_reject_all_range_state.json"
 AUTO_EXPAND_RANGE_DAYS = (0, 1, 3, 5, 15)
 AUTO_EXPAND_MAX_RANGE_DAYS = 15
 MANUAL_SEARCH_REQUIRED_MESSAGE = "+/- 15 had no candidates - do manual search"
+LOW_QUALITY_ORIGINAL_MIN_AXIS_PX = 1000
 FILENAME_DATE_PATTERNS = [
     re.compile(r"(?<!\d)(20\d{2}|19\d{2})[-_](0[1-9]|1[0-2])[-_](0[1-9]|[12]\d|3[01])(?!\d)"),
     re.compile(r"(?<!\d)(20\d{2}|19\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"),
@@ -57,10 +59,11 @@ class ApplySummary:
     selected_count: int
     rejected_count: int
     fallback_count: int = 0
+    associated_count: int = 0
 
     @property
     def applied_count(self) -> int:
-        return self.selected_count + self.rejected_count + self.fallback_count
+        return self.selected_count + self.rejected_count + self.fallback_count + self.associated_count
 
 
 def main() -> int:
@@ -140,6 +143,11 @@ def main() -> int:
         "--replace-existing-queue",
         action="store_true",
         help="Clear existing search queue outputs before building the new queue.",
+    )
+    parser.add_argument(
+        "--include-low-quality-matches",
+        action="store_true",
+        help="Also search entries whose confirmed external original is below 1000 px on either axis.",
     )
     parser.add_argument(
         "--apply-reviewed",
@@ -255,6 +263,7 @@ def main() -> int:
         photo_index_folder=Path(args.photo_index_folder) if args.photo_index_folder else None,
         merge_existing_queue=args.merge_existing_queue,
         replace_existing_queue=args.replace_existing_queue,
+        include_low_quality_matches=args.include_low_quality_matches,
     )
     print("Project365 external original search: PASS")
     print(f"Search queue: {summary.search_queue_path}")
@@ -283,6 +292,7 @@ def build_external_original_search_queue(
     indexed_fallback_limit: int | None = None,
     photo_index_folder: Path | None = None,
     replace_existing_queue: bool = False,
+    include_low_quality_matches: bool = False,
 ) -> SearchSummary:
     if merge_existing_queue and replace_existing_queue:
         raise ValueError("Cannot merge and replace the existing search queue in the same run.")
@@ -308,7 +318,11 @@ def build_external_original_search_queue(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        exports = _load_unclear_exports(connection, review_queue_path)
+        exports = _load_unclear_exports(
+            connection,
+            review_queue_path,
+            include_low_quality_matches=include_low_quality_matches,
+        )
         rejected_candidates = _load_rejected_candidates(connection)
         pending_rejected_candidates = _load_pending_rejected_candidates(search_queue_path)
     finally:
@@ -425,6 +439,7 @@ def build_external_original_search_queue(
         scan_metadata_dates=scan_metadata_dates,
         merge_existing_queue=merge_existing_queue,
         replace_existing_queue=replace_existing_queue,
+        include_low_quality_matches=include_low_quality_matches,
         unclear_entry_count=len(exports),
         candidate_count=available_candidate_count,
         hidden_rejected_candidate_count=sum(
@@ -462,6 +477,7 @@ def _append_search_attempt(
     scan_metadata_dates: bool,
     merge_existing_queue: bool,
     replace_existing_queue: bool,
+    include_low_quality_matches: bool,
     unclear_entry_count: int,
     candidate_count: int,
     hidden_rejected_candidate_count: int,
@@ -495,6 +511,7 @@ def _append_search_attempt(
         "scan_metadata_dates": str(scan_metadata_dates).lower(),
         "merge_existing_queue": str(merge_existing_queue).lower(),
         "replace_existing_queue": str(replace_existing_queue).lower(),
+        "include_low_quality_matches": str(include_low_quality_matches).lower(),
         "unclear_entry_count": unclear_entry_count,
         "candidate_count": candidate_count,
         "hidden_rejected_candidate_count": hidden_rejected_candidate_count,
@@ -601,7 +618,7 @@ def _is_user_queue_row(row: dict[str, object]) -> bool:
     decision = str(row.get("review_decision", "")).strip().lower()
     evidence = str(row.get("evidence", "")).strip().lower()
     return (
-        decision in ACCEPT_DECISIONS | REJECT_DECISIONS | FALLBACK_DECISIONS
+        decision in ACCEPT_DECISIONS | ASSOCIATED_PHOTO_DECISIONS | REJECT_DECISIONS | FALLBACK_DECISIONS
         or "manual_link" in evidence
         or "manual_drop_copy" in evidence
     )
@@ -812,6 +829,12 @@ def apply_reviewed_external_references(
         and row.get("candidate_path", "").strip()
     ]
     selected_entry_ids = {row.get("entry_id", "").strip() for row in selected_rows}
+    associated_rows = [
+        row
+        for row in rows
+        if row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+        and row.get("candidate_path", "").strip()
+    ]
     rejected_rows = [
         row
         for row in rows
@@ -833,6 +856,10 @@ def apply_reviewed_external_references(
         for row in selected_rows:
             _upsert_external_decision(connection, row, "external_original_reference", "available", "confirmed")
             selected_count += 1
+        associated_count = 0
+        for row in associated_rows:
+            _upsert_external_decision(connection, row, "external_original_associated_photo", "available", "confirmed")
+            associated_count += 1
         rejected_count = 0
         for row in rejected_rows:
             _upsert_external_decision(connection, row, "external_original_rejected", "rejected", "rejected")
@@ -848,6 +875,7 @@ def apply_reviewed_external_references(
         selected_count=selected_count,
         rejected_count=rejected_count,
         fallback_count=fallback_count,
+        associated_count=associated_count,
     )
 
 
@@ -1323,6 +1351,67 @@ def _completed_external_entry_ids(connection: sqlite3.Connection) -> set[str]:
     }
 
 
+def _confirmed_external_original_rows_by_entry(
+    connection: sqlite3.Connection,
+) -> dict[str, list[sqlite3.Row]]:
+    rows = connection.execute(
+        """
+        SELECT entry_id, storage_path, transformation_json
+        FROM media_assets
+        WHERE role = 'external_original_reference'
+            AND review_status = 'confirmed'
+        """
+    ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["entry_id"]), []).append(row)
+    return grouped
+
+
+def _fallback_confirmed_entry_ids(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT entry_id
+            FROM media_assets
+            WHERE role = 'external_original_fallback'
+                AND review_status = 'confirmed'
+            """
+        ).fetchall()
+    }
+
+
+def _confirmed_original_rows_are_low_quality(rows: list[sqlite3.Row]) -> bool:
+    if not rows:
+        return False
+    return all(_confirmed_original_row_is_low_quality(row) for row in rows)
+
+
+def _confirmed_original_row_is_low_quality(row: sqlite3.Row) -> bool:
+    transformation = _parse_json_object(str(row["transformation_json"] or ""))
+    if transformation.get("original_low_quality") is True:
+        return True
+    dimensions = _dimensions_from_transformation(transformation)
+    if dimensions is None:
+        dimensions = _image_dimensions_tuple(Path(str(row["storage_path"] or "")))
+    return _dimensions_are_low_quality(dimensions)
+
+
+def _dimensions_from_transformation(transformation: dict[str, object]) -> tuple[int, int] | None:
+    dimensions = transformation.get("original_dimensions")
+    if not isinstance(dimensions, dict):
+        return None
+    try:
+        width = int(dimensions["width"])
+        height = int(dimensions["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
 def _rows_by_entry(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
     grouped: dict[str, list[dict[str, str]]] = {}
     for row in rows:
@@ -1435,17 +1524,55 @@ def _upsert_external_decision(
     if export_media is None:
         raise ValueError(f"Unknown Project365 media asset: {row['project365_media_asset_id']}")
     sha256 = _sha256_file(source_path)
+    decision_id = _external_decision_id(row["entry_id"], sha256, role)
+    existing_reference = None
+    if role == "external_original_reference":
+        existing_reference = connection.execute(
+            """
+            SELECT id, transformation_json
+            FROM media_assets
+            WHERE entry_id = ?
+                AND role = 'external_original_reference'
+                AND review_status = 'confirmed'
+                AND id = ?
+            """,
+            (row["entry_id"], decision_id),
+        ).fetchone()
     now = dt.datetime.now(dt.UTC).isoformat()
-    source_name = "external_original_reference" if role == "external_original_reference" else "external_original_rejection"
+    source_name_by_role = {
+        "external_original_reference": "external_original_reference",
+        "external_original_associated_photo": "external_original_associated_photo",
+        "external_original_rejected": "external_original_rejection",
+    }
+    source_name = source_name_by_role.get(role, role)
+    review_crop = _review_crop_from_row(row)
+    if review_crop is None and existing_reference is not None:
+        existing_transformation = _parse_json_object(str(existing_reference["transformation_json"] or ""))
+        existing_crop = existing_transformation.get("review_crop")
+        if isinstance(existing_crop, dict):
+            review_crop = existing_crop
     transformation = {
         "source": source_name,
         "source_path": str(source_path),
         "evidence": row.get("evidence", ""),
         "review_decision": row.get("review_decision", ""),
         "review_notes": row.get("review_notes", ""),
-        "review_crop": _review_crop_from_row(row),
+        "review_crop": review_crop,
         "original_is_read_only": True,
     }
+    associated_date = row.get("associated_entry_date", "").strip()
+    if role == "external_original_associated_photo":
+        transformation["associated_entry_date"] = associated_date or row.get("entry_date", "")
+        transformation["associated_date_source"] = row.get("associated_date_source", "manual").strip() or "manual"
+    if role == "external_original_reference":
+        dimensions = _image_dimensions_tuple(source_path)
+        if dimensions is not None:
+            width, height = dimensions
+            transformation["original_dimensions"] = {"width": width, "height": height}
+            transformation["original_low_quality"] = _dimensions_are_low_quality(dimensions)
+            if transformation["original_low_quality"]:
+                transformation["low_quality_reason"] = "dimension_below_1000px"
+                transformation["better_deal_search_eligible"] = True
     connection.execute(
         """
         INSERT INTO media_assets (
@@ -1480,7 +1607,7 @@ def _upsert_external_decision(
             updated_at = excluded.updated_at
         """,
         (
-            _external_decision_id(row["entry_id"], sha256, role),
+            decision_id,
             row["entry_id"],
             role,
             source_path.name,
@@ -1501,11 +1628,20 @@ def _upsert_external_decision(
             """
             DELETE FROM media_assets
             WHERE entry_id = ?
+                AND role = 'external_original_reference'
+                AND id != ?
+            """,
+            (row["entry_id"], decision_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM media_assets
+            WHERE entry_id = ?
                 AND role = 'external_original_rejected'
             """,
             (row["entry_id"],),
         )
-    else:
+    elif role == "external_original_rejected":
         connection.execute(
             """
             DELETE FROM media_assets
@@ -1592,8 +1728,11 @@ def _upsert_fallback_decision(
 def _load_unclear_exports(
     connection: sqlite3.Connection,
     review_queue_path: Path,
+    include_low_quality_matches: bool = False,
 ) -> list[dict[str, object]]:
-    exports = [
+    fallback_entry_ids = _fallback_confirmed_entry_ids(connection)
+    confirmed_originals_by_entry = _confirmed_external_original_rows_by_entry(connection)
+    all_exports = [
         dict(row)
         for row in connection.execute(
             """
@@ -1605,24 +1744,23 @@ def _load_unclear_exports(
             JOIN media_assets
                 ON media_assets.entry_id = entries.id
                 AND media_assets.role = 'project365_export_png'
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM media_assets AS external_refs
-                WHERE external_refs.entry_id = entries.id
-                AND external_refs.role = 'external_original_reference'
-                AND external_refs.review_status = 'confirmed'
-            )
-            AND NOT EXISTS (
-                SELECT 1
-                FROM media_assets AS fallback_refs
-                WHERE fallback_refs.entry_id = entries.id
-                AND fallback_refs.role = 'external_original_fallback'
-                AND fallback_refs.review_status = 'confirmed'
-            )
             ORDER BY entries.entry_date, entries.id
             """
         )
     ]
+    exports: list[dict[str, object]] = []
+    for export in all_exports:
+        entry_id = str(export["entry_id"])
+        if entry_id in fallback_entry_ids:
+            continue
+        confirmed_rows = confirmed_originals_by_entry.get(entry_id, [])
+        if not confirmed_rows:
+            exports.append(export)
+            continue
+        if include_low_quality_matches and _confirmed_original_rows_are_low_quality(confirmed_rows):
+            export["current_match_status"] = "low_quality_match"
+            export["current_decision"] = "better_deal_search"
+            exports.append(export)
     review_rows = _review_rows_by_entry(review_queue_path)
     if not review_rows:
         return exports
@@ -1630,6 +1768,11 @@ def _load_unclear_exports(
     unclear = []
     for export in exports:
         rows = review_rows.get(str(export["entry_id"]), [])
+        if str(export.get("current_decision", "")) == "better_deal_search":
+            export["current_match_status"] = str(export.get("current_match_status") or "low_quality_match")
+            export["current_decision"] = "better_deal_search"
+            unclear.append(export)
+            continue
         if not rows or not _has_clear_match(rows):
             export["current_match_status"] = ";".join(sorted({row["match_status"] for row in rows})) if rows else ""
             export["current_decision"] = ";".join(sorted({row["decision"] for row in rows})) if rows else ""
@@ -2540,6 +2683,8 @@ def _search_queue_fieldnames() -> list[str]:
         "candidate_filter_reason",
         "review_decision",
         "review_notes",
+        "associated_entry_date",
+        "associated_date_source",
         *_review_crop_fieldnames(),
     ]
 
@@ -2669,6 +2814,7 @@ def _search_attempt_fieldnames() -> list[str]:
         "scan_metadata_dates",
         "merge_existing_queue",
         "replace_existing_queue",
+        "include_low_quality_matches",
         "unclear_entry_count",
         "candidate_count",
         "hidden_rejected_candidate_count",
@@ -2677,6 +2823,100 @@ def _search_attempt_fieldnames() -> list[str]:
         "group_report_path",
         "batch_plan_path",
     ]
+
+
+def _parse_json_object(value: str) -> dict[str, object]:
+    try:
+        payload = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _image_dimensions_tuple(path: Path | None) -> tuple[int, int] | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        payload = path.read_bytes()[:128 * 1024]
+    except OSError:
+        return None
+    try:
+        dimensions = _parse_image_dimensions(payload)
+    except (OSError, ValueError, struct.error):
+        return None
+    if dimensions is None:
+        return None
+    width, height = dimensions
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _dimensions_are_low_quality(dimensions: tuple[int, int] | None) -> bool:
+    if dimensions is None:
+        return False
+    width, height = dimensions
+    return width < LOW_QUALITY_ORIGINAL_MIN_AXIS_PX or height < LOW_QUALITY_ORIGINAL_MIN_AXIS_PX
+
+
+def _parse_image_dimensions(payload: bytes) -> tuple[int, int] | None:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n") and len(payload) >= 24:
+        return struct.unpack(">II", payload[16:24])
+    if payload.startswith((b"GIF87a", b"GIF89a")) and len(payload) >= 10:
+        return struct.unpack("<HH", payload[6:10])
+    if payload.startswith(b"8BPS") and len(payload) >= 26:
+        height = struct.unpack(">I", payload[14:18])[0]
+        width = struct.unpack(">I", payload[18:22])[0]
+        return width, height
+    if payload.startswith(b"BM") and len(payload) >= 26:
+        width = abs(struct.unpack_from("<i", payload, 18)[0])
+        height = abs(struct.unpack_from("<i", payload, 22)[0])
+        return width, height
+    if payload.startswith(b"\xff\xd8"):
+        return _parse_jpeg_dimensions(payload)
+    return None
+
+
+def _parse_jpeg_dimensions(payload: bytes) -> tuple[int, int] | None:
+    offset = 2
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    while offset + 3 < len(payload):
+        if payload[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(payload) and payload[offset] == 0xFF:
+            offset += 1
+        if offset >= len(payload):
+            return None
+        marker = payload[offset]
+        offset += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(payload):
+            return None
+        segment_length = struct.unpack(">H", payload[offset : offset + 2])[0]
+        if segment_length < 2 or offset + segment_length > len(payload):
+            return None
+        if marker in sof_markers and segment_length >= 7:
+            height = struct.unpack(">H", payload[offset + 3 : offset + 5])[0]
+            width = struct.unpack(">H", payload[offset + 5 : offset + 7])[0]
+            return width, height
+        offset += segment_length
+    return None
 
 
 def _sha256_file(path: Path) -> str:

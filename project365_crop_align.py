@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -121,14 +122,36 @@ def load_image(path: Path) -> ImagePixels:
     if path.suffix.lower() == ".bmp":
         return _read_bmp(path)
     with tempfile.TemporaryDirectory() as temp_dir:
-        bmp_path = Path(temp_dir) / "image.bmp"
-        subprocess.run(
-            ["sips", "-s", "format", "bmp", str(path), "--out", str(bmp_path)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return _read_bmp(bmp_path)
+        errors = []
+        for converter in (_convert_to_bmp_with_sips, _convert_to_bmp_with_magick):
+            bmp_path = Path(temp_dir) / f"{converter.__name__}.bmp"
+            try:
+                converter(path, bmp_path)
+                return _read_bmp(bmp_path)
+            except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError, ValueError) as exc:
+                errors.append(f"{converter.__name__}: {exc}")
+        raise ValueError(f"Cannot load image for crop estimation: {path}; {'; '.join(errors)}")
+
+
+def _convert_to_bmp_with_sips(source_path: Path, output_path: Path) -> None:
+    subprocess.run(
+        ["sips", "-s", "format", "bmp", str(source_path), "--out", str(output_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _convert_to_bmp_with_magick(source_path: Path, output_path: Path) -> None:
+    magick_path = shutil.which("magick")
+    if not magick_path:
+        raise RuntimeError("ImageMagick is not installed")
+    subprocess.run(
+        [magick_path, str(source_path), "-auto-orient", "-type", "TrueColor", f"BMP3:{output_path}"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _read_bmp(path: Path) -> ImagePixels:

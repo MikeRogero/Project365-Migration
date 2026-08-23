@@ -27,6 +27,7 @@ from project365_original_matcher import IMAGE_EXTENSIONS
 from project365_photo_library_index import default_index_db, query_index_candidates
 from project365_original_reference_pipeline import (
     ACCEPT_DECISIONS,
+    ASSOCIATED_PHOTO_DECISIONS,
     FALLBACK_DECISIONS,
     HIDDEN_CANDIDATE_FILTER_REASONS,
     MANUAL_SEARCH_REQUIRED_MESSAGE,
@@ -61,6 +62,7 @@ EXPAND_DATE_RANGE_DAYS = {1, 3, 5, 15, 30}
 MAX_MANUAL_INDEX_DATE_SEARCH_DAYS = 366
 SEARCH_RANGE_EVIDENCE_RE = re.compile(r"(?:manual_range|auto_range|date_within)_(\d+)_days")
 BUTTON_RANGE_EVIDENCE_RE = re.compile(r"(?:manual_range|auto_range)_(\d+)_days")
+APPLY_DECISIONS_CONFIRM_TOKEN = "apply-reviewed-decisions"
 
 
 @dataclass(frozen=True)
@@ -230,8 +232,8 @@ class PickerState:
     def summary(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
         entry_count = 0
-        pending = {"accepted": 0, "rejected": 0}
-        pending_entries = {"accepted": 0, "rejected": 0}
+        pending = {"accepted": 0, "rejected": 0, "associated": 0}
+        pending_entries = {"accepted": 0, "rejected": 0, "associated": 0}
         affected_entry_ids = set(self._decision_overrides) | set(self._added_candidate_rows) | set(
             self._replacement_candidate_rows
         )
@@ -247,18 +249,26 @@ class PickerState:
                     row.get("review_decision", "").strip().lower() in REJECT_DECISIONS
                     for row in entry_rows
                 )
+                associated_count = sum(
+                    row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+                    for row in entry_rows
+                )
             else:
                 status = record["status"]
                 accepted_count = int(record.get("accepted_count", 0))
                 rejected_count = int(record.get("rejected_count", 0))
+                associated_count = int(record.get("associated_count", 0))
             status_counts[status] = status_counts.get(status, 0) + 1
             entry_count += 1
             pending["accepted"] += accepted_count
             pending["rejected"] += rejected_count
+            pending["associated"] += associated_count
             if accepted_count:
                 pending_entries["accepted"] += 1
             if rejected_count:
                 pending_entries["rejected"] += 1
+            if associated_count:
+                pending_entries["associated"] += 1
         return {
             "entry_count": entry_count,
             "status_counts": status_counts,
@@ -342,7 +352,7 @@ class PickerState:
         affected_entry_ids = set(self._decision_overrides) | set(self._added_candidate_rows) | set(
             self._replacement_candidate_rows
         )
-        reverse_entry_order = status == "accepted_not_applied"
+        reverse_entry_order = status in {"accepted_not_applied", "rejected"}
         for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
             entry_id = str(record.get("entry_id", ""))
             if entry_id in affected_entry_ids:
@@ -427,7 +437,7 @@ class PickerState:
         return self._database_crop_entry_detail(entry_id)
 
     def crop_entries(self, crop_filter: str = "missing") -> list[dict[str, Any]]:
-        if crop_filter not in {"all", "missing", "with_crop"}:
+        if crop_filter not in {"all", "missing", "with_crop", "estimated", "confirmed"}:
             raise ValueError("Unsupported crop filter")
         entries: list[dict[str, Any]] = []
         queued_entry_ids: set[str] = set()
@@ -500,8 +510,23 @@ class PickerState:
             "visual_error": row.get("visual_error", ""),
             "review_decision": row.get("review_decision", ""),
             "review_notes": row.get("review_notes", ""),
+            "associated_entry_date": row.get("associated_entry_date", ""),
+            "associated_date_source": row.get("associated_date_source", ""),
             "selected": row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS,
+            "associated": row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS,
         }
+
+    def associated_date_choices(self, entry_id: str, candidate_path: str) -> dict[str, Any]:
+        rows = self._entry_rows(entry_id)
+        for row in rows:
+            if row.get("candidate_path") == candidate_path:
+                return {
+                    "entry_id": entry_id,
+                    "candidate_path": candidate_path,
+                    "default_date": row.get("entry_date", ""),
+                    "choices": _associated_date_choices_from_row(row),
+                }
+        raise ValueError("Unknown candidate")
 
     def candidate_facts(self, tokens: list[str]) -> dict[str, dict[str, Any]]:
         facts: dict[str, dict[str, Any]] = {}
@@ -536,6 +561,7 @@ class PickerState:
         source_state: str,
     ) -> dict[str, Any]:
         has_crop = _candidate_has_review_crop(candidate)
+        crop_source = str(candidate.get("review_crop_source", "")).strip().lower()
         return {
             "entry_id": entry.get("entry_id", ""),
             "entry_date": entry.get("entry_date", ""),
@@ -550,8 +576,9 @@ class PickerState:
             "candidate_dimensions": candidate.get("dimensions", ""),
             "candidate_token": candidate.get("token", ""),
             "crop_has_crop": has_crop,
+            "crop_source": crop_source,
             "crop_source_state": source_state,
-            "crop_status": "with crop" if has_crop else "without crop",
+            "crop_status": _crop_status_label(has_crop, crop_source),
         }
 
     def _database_crop_entries(self, exclude_entry_ids: set[str] | None = None) -> list[dict[str, Any]]:
@@ -1006,9 +1033,11 @@ class PickerState:
         notes: str,
         crop: dict[str, Any] | None = None,
         include_candidates: bool = True,
+        associated_entry_date: str = "",
+        associated_date_source: str = "manual",
     ) -> dict[str, Any]:
         normalized_decision = decision.strip().lower()
-        if normalized_decision not in {"use_external_original", "rejected", "clear", *FALLBACK_DECISIONS}:
+        if normalized_decision not in {"use_external_original", "rejected", "clear", *ASSOCIATED_PHOTO_DECISIONS, *FALLBACK_DECISIONS}:
             raise ValueError("Unsupported decision")
         with self._lock:
             rows = self._entry_rows(entry_id)
@@ -1037,6 +1066,10 @@ class PickerState:
                     found_candidate = True
                     row["review_decision"] = normalized_decision
                     row["review_notes"] = notes
+                    if normalized_decision in ASSOCIATED_PHOTO_DECISIONS:
+                        associated_date = _normalized_associated_entry_date(associated_entry_date)
+                        row["associated_entry_date"] = associated_date or row.get("entry_date", "")
+                        row["associated_date_source"] = associated_date_source.strip() or "manual"
                     if normalized_decision == "use_external_original" and crop is not None:
                         _set_review_crop(row, crop, source="manual")
                 elif normalized_decision == "use_external_original" and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS:
@@ -1369,6 +1402,16 @@ class PickerState:
         candidate_path: str,
         crop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        estimated_crop = self._estimated_crop_for_candidate(entry_id, candidate_path, crop)
+        detail = self.save_crop(entry_id, str(Path(candidate_path)), estimated_crop, source="estimated")
+        return {"entry": detail, "crop": estimated_crop}
+
+    def _estimated_crop_for_candidate(
+        self,
+        entry_id: str,
+        candidate_path: str,
+        crop: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         reference_path = self._source_media.get(entry_id)
         if reference_path is None or not reference_path.exists():
             raise ValueError("Missing Project365 target image")
@@ -1387,10 +1430,9 @@ class PickerState:
         estimated_crop["rotation_degrees"] = rotation_degrees
         if fill_color:
             estimated_crop["fill_color"] = fill_color
-        detail = self.save_crop(entry_id, str(candidate), estimated_crop, source="estimated")
-        return {"entry": detail, "crop": estimated_crop}
+        return estimated_crop
 
-    def start_crop_estimate_batch(self) -> dict[str, Any]:
+    def start_crop_estimate_batch(self, apply_estimates: bool = False) -> dict[str, Any]:
         targets = [
             {
                 "entry_id": entry["entry_id"],
@@ -1414,6 +1456,7 @@ class PickerState:
             "started_at": "",
             "finished_at": "",
             "errors": [],
+            "apply_estimates": bool(apply_estimates),
             "message": "",
         }
         with self._job_lock:
@@ -1428,7 +1471,7 @@ class PickerState:
             return self.crop_estimate_job(job_id) or dict(job)
         thread = threading.Thread(
             target=self._run_crop_estimate_batch,
-            args=(job_id, targets),
+            args=(job_id, targets, bool(apply_estimates)),
             daemon=True,
         )
         thread.start()
@@ -1577,6 +1620,55 @@ class PickerState:
             "selected_count": apply_summary.selected_count,
             "rejected_count": apply_summary.rejected_count,
             "fallback_count": apply_summary.fallback_count,
+            "associated_count": apply_summary.associated_count,
+            "applied_count": apply_summary.applied_count,
+            "remaining_queue_rows": prune_summary["queue_rows"],
+            "remaining_entries": prune_summary["entry_count"],
+            "removed_completed_entries": prune_summary["removed_completed_entries"],
+            "removed_rejected_candidates": prune_summary["removed_rejected_candidates"],
+        }
+
+    def commit_entry_decision(self, entry_id: str) -> dict[str, Any]:
+        with self._lock:
+            fieldnames, rows = self._read_rows_with_fieldnames()
+            entry_rows = [dict(row) for row in rows if row.get("entry_id") == entry_id]
+            if not entry_rows:
+                raise ValueError("Unknown entry")
+            if not any(
+                row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                for row in entry_rows
+            ):
+                raise ValueError("No linked original is pending for this target")
+            temp_path = self.config.queue_path.with_suffix(f".{entry_id.replace(':', '_')}.commit.csv")
+            with temp_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(entry_rows)
+            try:
+                apply_summary = apply_reviewed_external_references(
+                    canonical_root=self.config.canonical_root,
+                    reviewed_csv=temp_path,
+                )
+            finally:
+                temp_path.unlink(missing_ok=True)
+            self._decision_overrides.pop(entry_id, None)
+            self._added_candidate_rows.pop(entry_id, None)
+            self._replacement_candidate_rows.pop(entry_id, None)
+            self._persist_decision_overrides()
+            prune_summary = prune_applied_review_queue(
+                canonical_root=self.config.canonical_root,
+                queue_path=self.config.queue_path,
+                report_dir=self.config.queue_path.parent,
+            )
+            self._entry_rows_cache = {}
+            self._queue_shards.invalidate()
+        self._source_media = self._load_source_media()
+        self._refresh_image_paths()
+        return {
+            "selected_count": apply_summary.selected_count,
+            "rejected_count": apply_summary.rejected_count,
+            "fallback_count": apply_summary.fallback_count,
+            "associated_count": apply_summary.associated_count,
             "applied_count": apply_summary.applied_count,
             "remaining_queue_rows": prune_summary["queue_rows"],
             "remaining_entries": prune_summary["entry_count"],
@@ -1921,12 +2013,8 @@ class PickerState:
     def _current_search_range_days(self, entry_id: str, rows: list[dict[str, str]]) -> int:
         range_days = 0
         for row in rows:
-            for match in SEARCH_RANGE_EVIDENCE_RE.finditer(str(row.get("evidence", ""))):
+            for match in BUTTON_RANGE_EVIDENCE_RE.finditer(str(row.get("evidence", ""))):
                 range_days = max(range_days, int(match.group(1)))
-            try:
-                range_days = max(range_days, int(str(row.get("date_distance", "")).strip()))
-            except ValueError:
-                pass
         record = load_reject_all_range_state(self.config.queue_path.parent).get(entry_id, {})
         try:
             range_days = max(range_days, int(str(record.get("last_search_range_days", "")).strip()))
@@ -1983,6 +2071,7 @@ class PickerState:
         self,
         job_id: str,
         targets: list[dict[str, str]],
+        apply_estimates: bool,
     ) -> None:
         self._update_crop_estimate_job(job_id, status="running", started_at=dt.datetime.now(dt.UTC).isoformat())
         try:
@@ -1994,7 +2083,9 @@ class PickerState:
                     if self._crop_candidate_has_review_crop(entry_id, candidate_path):
                         self._increment_crop_estimate_job(job_id, "skipped_count")
                     else:
-                        self.suggest_crop_for_candidate(entry_id, candidate_path)
+                        estimated_crop = self._estimated_crop_for_candidate(entry_id, candidate_path)
+                        if apply_estimates:
+                            self.save_crop(entry_id, candidate_path, estimated_crop, source="estimated")
                         self._increment_crop_estimate_job(job_id, "estimated_count")
                 except Exception as exc:  # noqa: BLE001 - batch should continue and report per-file errors.
                     self._append_crop_estimate_error(job_id, entry_id, candidate_path, str(exc))
@@ -2124,6 +2215,9 @@ class PickerState:
         token = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:24]
         self._image_paths[token] = path
         return token
+
+    def image_token_for_path(self, path: Path | None) -> str:
+        return self._image_token(path)
 
     def _refresh_image_paths(self) -> None:
         self._image_paths = {}
@@ -2309,7 +2403,13 @@ class PickerState:
         temporary.replace(path)
 
     def _store_entry_overrides(self, entry_id: str, rows: list[dict[str, str]]) -> None:
-        fields = ["review_decision", "review_notes", *_review_crop_fieldnames()]
+        fields = [
+            "review_decision",
+            "review_notes",
+            "associated_entry_date",
+            "associated_date_source",
+            *_review_crop_fieldnames(),
+        ]
         self._decision_overrides[entry_id] = {
             _decision_row_key(row): {field: row.get(field, "") for field in fields}
             for row in rows
@@ -2407,6 +2507,8 @@ class PickerState:
             "candidate_filter_reason",
             "review_decision",
             "review_notes",
+            "associated_entry_date",
+            "associated_date_source",
             *_review_crop_fieldnames(),
             *visual_fieldnames(),
         ):
@@ -2479,6 +2581,7 @@ class PickerState:
     def _pending_decision_counts(self) -> dict[str, int]:
         accepted = 0
         rejected = 0
+        associated = 0
         for _entry_id, rows in self._iter_entry_groups():
             for row in rows:
                 decision = row.get("review_decision", "").strip().lower()
@@ -2486,7 +2589,9 @@ class PickerState:
                     accepted += 1
                 elif decision in REJECT_DECISIONS:
                     rejected += 1
-        return {"accepted": accepted, "rejected": rejected}
+                elif decision in ASSOCIATED_PHOTO_DECISIONS:
+                    associated += 1
+        return {"accepted": accepted, "rejected": rejected, "associated": associated}
 
     def _read_rows_with_fieldnames(self) -> tuple[list[str], list[dict[str, str]]]:
         if not self.config.queue_path.exists():
@@ -2502,7 +2607,7 @@ class PickerState:
                 rows.extend(dict(row) for row in replacement_rows)
         for added_rows in self._added_candidate_rows.values():
             rows.extend(dict(row) for row in added_rows)
-        for field in ("review_decision", "review_notes"):
+        for field in ("review_decision", "review_notes", "associated_entry_date", "associated_date_source"):
             if field not in fieldnames:
                 fieldnames.append(field)
                 for row in rows:
@@ -2679,8 +2784,19 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         notes=str(payload.get("notes", "")),
                         crop=payload.get("crop") if isinstance(payload.get("crop"), dict) else None,
                         include_candidates=False,
+                        associated_entry_date=str(payload.get("associated_entry_date", "")),
+                        associated_date_source=str(payload.get("associated_date_source", "manual")),
                     )
                     self._send_json(detail)
+                    return
+                if parsed.path == "/api/associated-date-choices":
+                    payload = self._read_json()
+                    self._send_json(
+                        state.associated_date_choices(
+                            entry_id=str(payload.get("entry_id", "")),
+                            candidate_path=str(payload.get("candidate_path", "")),
+                        )
+                    )
                     return
                 if parsed.path == "/api/reject-all":
                     payload = self._read_json()
@@ -2732,7 +2848,12 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json(result)
                     return
                 if parsed.path == "/api/crop-estimate-batch":
-                    self._send_json(state.start_crop_estimate_batch())
+                    payload = self._read_json()
+                    self._send_json(
+                        state.start_crop_estimate_batch(
+                            apply_estimates=bool(payload.get("apply_estimates"))
+                        )
+                    )
                     return
                 if parsed.path == "/api/crawl":
                     payload = self._read_json()
@@ -2796,7 +2917,15 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json(detail)
                     return
                 if parsed.path == "/api/apply-decisions":
+                    payload = self._read_json()
+                    if payload.get("confirm_apply_decisions") != APPLY_DECISIONS_CONFIRM_TOKEN:
+                        self._send_error(HTTPStatus.BAD_REQUEST, "Apply decisions requires explicit confirmation.")
+                        return
                     self._send_json(state.apply_decisions())
+                    return
+                if parsed.path == "/api/commit-entry":
+                    payload = self._read_json()
+                    self._send_json(state.commit_entry_decision(str(payload.get("entry_id", ""))))
                     return
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -2952,6 +3081,10 @@ def _queue_shard_entry_summary(
         row.get("review_decision", "").strip().lower() in REJECT_DECISIONS
         for row in candidate_rows
     )
+    associated_count = sum(
+        row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+        for row in candidate_rows
+    )
     fallback_count = sum(
         row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
         for row in rows
@@ -2964,6 +3097,7 @@ def _queue_shard_entry_summary(
         "selected_count": accepted_count,
         "accepted_count": accepted_count,
         "rejected_count": rejected_count,
+        "associated_count": associated_count,
         "fallback_count": fallback_count,
         "current_match_status": first.get("current_match_status", ""),
         "current_decision": first.get("current_decision", ""),
@@ -3050,6 +3184,65 @@ def _manual_index_search_dates(start_date: str, end_date: str) -> list[str]:
             f"Date search range cannot exceed {MAX_MANUAL_INDEX_DATE_SEARCH_DAYS} days."
         )
     return [(start + dt.timedelta(days=offset)).isoformat() for offset in range(date_count)]
+
+
+def _associated_date_choices_from_row(row: dict[str, str]) -> list[dict[str, str]]:
+    choices: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_choice(date_text: str, source: str) -> None:
+        normalized = _normalized_associated_entry_date(date_text)
+        normalized_source = source.strip().lower() or "manual"
+        key = (normalized_source, normalized)
+        if not normalized or key in seen:
+            return
+        seen.add(key)
+        choices.append({"date": normalized, "source": normalized_source})
+
+    capture_source = _associated_capture_source(row.get("capture_timestamp_source", ""))
+    add_choice(row.get("capture_timestamp", ""), capture_source)
+    return choices
+
+
+def _normalized_associated_entry_date(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized_timestamp = _normalized_associated_entry_timestamp(text)
+    if normalized_timestamp:
+        return normalized_timestamp
+    text = text[:10]
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError:
+        return ""
+    return parsed.isoformat()
+
+
+def _normalized_associated_entry_timestamp(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", text):
+        return ""
+    if len(text) == 16 and text[10] == "T":
+        text = f"{text}:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return ""
+    if parsed.microsecond:
+        return parsed.isoformat(timespec="microseconds")
+    return parsed.isoformat(timespec="seconds")
+
+
+def _associated_capture_source(source: str) -> str:
+    normalized = source.strip().lower()
+    if normalized == "filename_timestamp":
+        return "filename_timestamp"
+    if normalized:
+        return "capture"
+    return "capture"
 
 
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, str, int, int, str]:
@@ -3171,7 +3364,9 @@ def _choose_photo_dialog() -> dict[str, str]:
 
 
 def _choose_folder_dialog() -> dict[str, str]:
-    script = 'POSIX path of (choose folder with prompt "Choose the photo folder to scan")'
+    script = (
+        'POSIX path of (choose folder with prompt "Choose the photo folder to scan")'
+    )
     result = subprocess.run(
         ["osascript", "-e", script],
         text=True,
@@ -3193,20 +3388,44 @@ def _choose_folder_dialog() -> dict[str, str]:
 def _image_dimensions(path: Path | None) -> str:
     if path is None or not path.exists():
         return ""
+    dimensions: tuple[int, int] | None = None
     try:
         payload = path.read_bytes()[:128 * 1024]
     except OSError:
-        return ""
-    try:
-        dimensions = _parse_image_dimensions(payload)
-    except (OSError, ValueError, struct.error):
-        return ""
+        payload = b""
+    if payload:
+        try:
+            dimensions = _parse_image_dimensions(payload)
+        except (OSError, ValueError, struct.error):
+            dimensions = None
+    if not dimensions:
+        dimensions = _sips_image_dimensions(path)
     if not dimensions:
         return ""
     width, height = dimensions
     if width <= 0 or height <= 0:
         return ""
     return f"{width} x {height}"
+
+
+def _sips_image_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            ["sips", "--getProperty", "pixelWidth", "--getProperty", "pixelHeight", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    width_match = re.search(r"pixelWidth:\s*(\d+)", result.stdout)
+    height_match = re.search(r"pixelHeight:\s*(\d+)", result.stdout)
+    if not width_match or not height_match:
+        return None
+    return int(width_match.group(1)), int(height_match.group(1))
 
 
 def _has_embedded_geolocation(path: Path | None) -> bool:
@@ -3385,6 +3604,8 @@ def _queue_fieldnames_with_required_fields(
         "candidate_filter_reason",
         "review_decision",
         "review_notes",
+        "associated_entry_date",
+        "associated_date_source",
         *_review_crop_fieldnames(),
         *visual_fieldnames(),
     ]
@@ -3424,13 +3645,28 @@ def _candidate_has_review_crop(candidate: dict[str, Any]) -> bool:
 
 
 def _crop_filter_matches(entry: dict[str, Any], crop_filter: str) -> bool:
+    crop_source = str(entry.get("crop_source", "")).strip().lower()
     if crop_filter == "all":
         return True
     if crop_filter == "missing":
         return not bool(entry.get("crop_has_crop"))
     if crop_filter == "with_crop":
         return bool(entry.get("crop_has_crop"))
+    if crop_filter == "estimated":
+        return bool(entry.get("crop_has_crop")) and crop_source == "estimated"
+    if crop_filter == "confirmed":
+        return bool(entry.get("crop_has_crop")) and crop_source != "estimated"
     return False
+
+
+def _crop_status_label(has_crop: bool, crop_source: str) -> str:
+    if not has_crop:
+        return "without crop"
+    if crop_source == "estimated":
+        return "saved estimate"
+    if crop_source == "manual":
+        return "user saved"
+    return "saved crop"
 
 
 def _clear_review_crop(row: dict[str, str]) -> None:
@@ -3790,6 +4026,16 @@ button {
 .badge.rejected {
   color: var(--reject);
 }
+.entry-commit {
+  grid-column: 3;
+  justify-self: start;
+  height: 28px;
+  padding: 0 9px;
+}
+.entry-commit[aria-hidden="true"] {
+  visibility: hidden;
+  pointer-events: none;
+}
 .main {
   min-width: 0;
   min-height: 0;
@@ -3802,14 +4048,14 @@ button {
   background: rgba(255, 255, 255, 0.88);
   backdrop-filter: blur(8px);
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: flex-start;
   gap: 12px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 .main-header > div:first-child {
   min-width: 180px;
-  flex: 1 1 240px;
+  flex: 0 1 auto;
 }
 .control-panel-link {
   display: inline-flex;
@@ -3845,8 +4091,8 @@ button {
 .actions {
   display: flex;
   gap: 8px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex-wrap: nowrap;
+  justify-content: flex-start;
   min-width: 0;
   flex: 1 1 420px;
 }
@@ -3893,6 +4139,26 @@ textarea:focus-visible {
   background: #13594f;
   border-color: #13594f;
 }
+.action-button.flagged:not(:disabled) {
+  background: #fff7ed;
+  border-color: #c2410c;
+  color: #9a3412;
+  font-weight: 650;
+}
+.action-button.flagged:not(:disabled):hover {
+  background: #ffedd5;
+  border-color: #9a3412;
+}
+.action-button.linked:not(:disabled) {
+  background: #7f1d1d;
+  border-color: #7f1d1d;
+  color: #fff;
+  font-weight: 700;
+}
+.action-button.linked:not(:disabled):hover {
+  background: #651616;
+  border-color: #651616;
+}
 .workspace {
   min-height: 0;
   overflow: auto;
@@ -3906,7 +4172,7 @@ textarea:focus-visible {
   top: 0;
   align-self: start;
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 .source-frame,
 .candidate-card {
@@ -4002,10 +4268,8 @@ textarea:focus-visible {
 }
 .source-pane .date-range-controls {
   background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 10px;
-  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
 }
 .date-range-controls .action-button.used-range {
   background: #e5f4f0;
@@ -4101,9 +4365,76 @@ textarea:focus-visible {
 }
 .candidate-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   padding: 10px;
+}
+.associated-date-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 120px) minmax(0, 98px) auto;
+  gap: 8px;
+  align-items: center;
+}
+.associated-date-panel[hidden] {
+  display: none;
+}
+.associated-date-panel input {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 1;
+}
+.associated-date-panel input[type="date"] {
+  font-size: 11px;
+}
+.associated-date-panel [data-action="save-flag"] {
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+.associated-date-choices {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+}
+.associated-date-choice {
+  min-height: 42px;
+  width: 100%;
+  justify-content: stretch;
+  gap: 10px;
+  line-height: 1.2;
+  white-space: normal;
+}
+.associated-date-choice strong,
+.associated-date-choice span {
+  display: block;
+  min-width: 0;
+}
+.associated-date-choice strong {
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+.associated-date-choice span {
+  flex: 1 1 auto;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.associated-date-choice:hover span {
+  color: inherit;
+}
+.associated-date-choice.is-selected:not(:disabled) {
+  border-color: var(--accent);
+  background: #ecfdf5;
+  color: var(--accent);
 }
 .empty {
   padding: 18px;
@@ -4116,21 +4447,21 @@ textarea:focus-visible {
   max-width: 560px;
 }
 .photo-drop-target {
-  min-height: 86px;
+  min-height: 56px;
   border: 2px dashed var(--line-strong);
   border-radius: 8px;
   background: #fff;
   display: grid;
   place-content: center;
-  gap: 5px;
-  padding: 14px;
+  gap: 2px;
+  padding: 8px 12px;
   text-align: center;
   color: var(--ink);
   transition: background-color 120ms ease, border-color 120ms ease;
 }
 .photo-drop-target span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 .photo-drop-target.active {
   border-color: var(--accent);
@@ -4139,22 +4470,37 @@ textarea:focus-visible {
 .photo-drop-target.disabled {
   opacity: 0.6;
 }
-textarea {
-  width: 100%;
-  min-height: 54px;
-  resize: vertical;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 7px;
-}
-.crawl-panel {
+.search-panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 12px;
+  padding: 8px 10px;
   display: grid;
   gap: 8px;
   box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+.search-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.search-panel-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+.search-panel-body {
+  display: grid;
+  gap: 10px;
+}
+.search-panel-body[hidden] {
+  display: none;
+}
+.crawl-panel {
+  background: transparent;
+  display: grid;
+  gap: 8px;
 }
 .crawl-panel label {
   color: var(--muted);
@@ -4204,6 +4550,10 @@ textarea {
   .app {
     grid-template-columns: 1fr;
     grid-template-rows: 260px minmax(0, 1fr);
+  }
+  .main-header,
+  .actions {
+    flex-wrap: wrap;
   }
   .sidebar {
     border-right: 0;
@@ -4276,46 +4626,53 @@ textarea {
         <div id="entrySubhead" class="summary"></div>
       </div>
       <div class="actions">
-        <button id="applyDecisionsButton" class="action-button primary" title="Apply reviewed selections, rejections, and fallbacks to the database">Apply decisions <span id="acceptedDecisionCount" class="decision-count">0 accepted</span><span id="rejectedDecisionCount" class="decision-count">0 rejected</span></button>
+        <button id="applyDecisionsButton" class="action-button primary" title="Apply reviewed selections, linked originals, rejections, fallbacks, and associated-photo flags to the database">Apply decisions <span id="acceptedDecisionCount" class="decision-count">0 accepted</span><span id="associatedDecisionCount" class="decision-count">0 flagged</span><span id="rejectedDecisionCount" class="decision-count">0 rejected</span></button>
         <button id="fallbackButton" class="icon-button" title="Use the photo already stored in the Project365 entry instead of an external original">Use Project365 photo</button>
         <button id="rejectAllButton" class="icon-button" title="Reject every candidate currently available for this target photo">Reject all</button>
-        <button id="estimateCropBatchButton" class="icon-button" title="Estimate missing crop locations for linked originals">Estimate crop locations</button>
         <button id="clearButton" class="icon-button" title="Reset all pending selections, rejections, and notes for this entry">Reset decisions</button>
       </div>
     </div>
     <div class="workspace">
       <section class="source-pane">
-        <div class="crawl-panel">
-          <label>Search folders</label>
-          <div class="folder-row">
-            <input id="crawlRoots" placeholder="Choose folders or paste paths">
-            <button id="chooseFolder" class="action-button">Choose folder</button>
-            <button id="choosePhoto" class="action-button" title="Link an original photo without copying it">Choose photo</button>
+        <div class="search-panel">
+          <div class="search-panel-header">
+            <div class="search-panel-title">Search</div>
+            <button id="searchPanelToggle" class="action-button" type="button" aria-expanded="false" aria-controls="searchPanelBody">Expand</button>
           </div>
-          <div class="search-actions">
-            <button id="crawlCurrent" class="action-button primary" title="Search the currently open entry">Current</button>
-            <button id="crawlSelected" class="action-button" title="Search checked entries">Selected</button>
-            <button id="crawlVisible" class="action-button" title="Search every entry in the current filter">Visible list</button>
-          </div>
-          <div id="crawlStatus" class="crawl-status">Use the date-range buttons to search the existing index. Add a folder only for a targeted search.</div>
-        </div>
-        <div class="date-range-controls" role="group" aria-label="Expand candidate date range">
-          <button id="defaultDateRange" class="action-button" type="button">Default</button>
-          <button class="action-button" type="button" data-range-days="1">±1 day</button>
-          <button class="action-button" type="button" data-range-days="3">±3 days</button>
-          <button class="action-button" type="button" data-range-days="5">±5 days</button>
-          <button class="action-button" type="button" data-range-days="15">±15 days</button>
-          <button class="action-button" type="button" data-range-days="30">±30 days</button>
-          <div class="manual-date-search">
-            <input id="indexDateStart" type="date" aria-label="Index search start date">
-            <input id="indexDateEnd" type="date" aria-label="Index search end date">
-            <div class="index-search-options">
-              <label class="index-search-toggle"><input id="indexSearchWholeIndex" type="checkbox"> Whole index</label>
-              <label class="index-search-toggle"><input id="indexSearchFilenameOnly" type="checkbox"> file name only</label>
+          <div class="crawl-panel">
+            <div id="searchPanelBody" class="search-panel-body" hidden>
+              <label>Search folders</label>
+              <div class="folder-row">
+                <input id="crawlRoots" placeholder="Choose folders or paste paths">
+                <button id="chooseFolder" class="action-button">Choose folder</button>
+                <button id="choosePhoto" class="action-button" title="Link an original photo without copying it">Choose photo</button>
+              </div>
+              <div class="search-actions">
+                <button id="crawlCurrent" class="action-button primary" title="Search the currently open entry">Current</button>
+                <button id="crawlSelected" class="action-button" title="Search checked entries">Selected</button>
+                <button id="crawlVisible" class="action-button" title="Search every entry in the current filter">Visible list</button>
+              </div>
             </div>
-            <button id="searchIndexDateRange" class="action-button" type="button" title="Add indexed photos from the entered date range">Add dates</button>
+            <div id="crawlStatus" class="crawl-status">Use the date-range buttons to search the existing index. Add a folder only for a targeted search.</div>
           </div>
-          <div id="indexSearchScope" class="index-search-scope"></div>
+          <div class="date-range-controls" role="group" aria-label="Expand candidate date range">
+            <button id="defaultDateRange" class="action-button" type="button">Default</button>
+            <button class="action-button" type="button" data-range-days="1">±1 day</button>
+            <button class="action-button" type="button" data-range-days="3">±3 days</button>
+            <button class="action-button" type="button" data-range-days="5">±5 days</button>
+            <button class="action-button" type="button" data-range-days="15">±15 days</button>
+            <button class="action-button" type="button" data-range-days="30">±30 days</button>
+            <div class="manual-date-search">
+              <input id="indexDateStart" type="date" aria-label="Index search start date">
+              <input id="indexDateEnd" type="date" aria-label="Index search end date">
+              <div class="index-search-options">
+                <label class="index-search-toggle"><input id="indexSearchWholeIndex" type="checkbox"> Whole index</label>
+                <label class="index-search-toggle"><input id="indexSearchFilenameOnly" type="checkbox"> file name only</label>
+              </div>
+              <button id="searchIndexDateRange" class="action-button" type="button" title="Add indexed photos from the entered date range">Add dates</button>
+            </div>
+            <div id="indexSearchScope" class="index-search-scope"></div>
+          </div>
         </div>
         <div id="photoDropTarget" class="photo-drop-target" aria-label="Drop an original photo for the current entry">
           <strong>Drop original photo here</strong>
@@ -4381,6 +4738,7 @@ const state = {
   entryRequestId: 0,
   entryDetailCache: new Map(),
   entryDetailRequests: new Map(),
+  suppressedCommittedEntryIds: new Set(),
   candidateImageObserver: null,
   candidateRenderLimit: 40,
   candidateRenderObserver: null,
@@ -4464,10 +4822,18 @@ async function loadSummary() {
     `${summary.entry_count} entries · ${counts.needs_review || 0} review · ${counts.selected || 0} selected · ${counts.search_needed || 0} need broader search`;
   const acceptedFiles = pending.accepted || 0;
   const acceptedEntries = pendingEntries.accepted ?? acceptedFiles;
+  const associatedFiles = pending.associated || 0;
+  const associatedEntries = pendingEntries.associated ?? associatedFiles;
+  const rejectedFiles = pending.rejected || 0;
   document.getElementById("acceptedDecisionCount").textContent = acceptedFiles === acceptedEntries
     ? `${acceptedEntries} accepted entries`
     : `${acceptedEntries} accepted entries (${acceptedFiles} files)`;
-  document.getElementById("rejectedDecisionCount").textContent = `${pending.rejected || 0} rejected`;
+  document.getElementById("associatedDecisionCount").textContent = associatedFiles === associatedEntries
+    ? `${associatedEntries} flagged`
+    : `${associatedEntries} flagged (${associatedFiles} files)`;
+  document.getElementById("rejectedDecisionCount").textContent = `${rejectedFiles} rejected`;
+  document.getElementById("applyDecisionsButton").title =
+    `Apply ${acceptedEntries} linked, ${associatedEntries} flagged, ${rejectedFiles} rejected, and any fallback decisions to the database`;
 }
 
 async function loadBatches() {
@@ -4508,7 +4874,7 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
   for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
   for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
   const payload = await fetchJson(`/api/entries?${params.toString()}`);
-  state.entries = payload.entries;
+  state.entries = payload.entries.filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id));
   state.entryOffset = state.entries.length;
   state.entryHasMore = Boolean(payload.has_more);
   renderEntries();
@@ -4551,7 +4917,7 @@ async function loadMoreEntries() {
     for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
     for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
     const payload = await fetchJson(`/api/entries?${params.toString()}`);
-    state.entries = state.entries.concat(payload.entries || []);
+    state.entries = state.entries.concat((payload.entries || []).filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id)));
     state.entryOffset = state.entries.length;
     state.entryHasMore = Boolean(payload.has_more);
     renderEntries();
@@ -4577,34 +4943,72 @@ async function maybeLoadMoreEntriesNearEnd() {
 function renderEntries() {
   const list = document.getElementById("entryList");
   list.innerHTML = "";
-  state.entries.forEach((entry, index) => {
-    const item = document.createElement("div");
-    item.className = `entry-item ${entry.entry_id === state.selectedEntryId ? "active" : ""}`;
-    const thumb = entry.source_token
-      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
-      : `<div class="entry-thumb"></div>`;
-    item.innerHTML = `
-      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
-      ${thumb}
-      <button class="entry-button" type="button" aria-label="Open ${escapeHtml(entry.entry_date)}">
-        <div class="entry-row">
+	  state.entries.forEach((entry, index) => {
+	    const item = document.createElement("div");
+	    item.className = `entry-item ${entry.entry_id === state.selectedEntryId ? "active" : ""}`;
+	    item.dataset.entryId = entry.entry_id;
+	    const thumb = entry.source_token
+	      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
+	      : `<div class="entry-thumb"></div>`;
+	    const hasPendingLink = Number(entry.selected_count || 0) > 0;
+	    item.innerHTML = `
+	      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
+	      ${thumb}
+	      <button class="entry-button" type="button" aria-label="Open ${escapeHtml(entry.entry_date)}">
+	        <div class="entry-row">
           <span class="entry-date">${escapeHtml(entry.entry_date)}</span>
           <span class="badge ${entry.status}">${escapeHtml(statusLabel(entry.status))}</span>
-        </div>
-        <div class="summary">${entry.candidate_count} candidates</div>
-      </button>
-    `;
+	        </div>
+	        <div class="summary">${entry.candidate_count} candidates</div>
+	      </button>
+	      <button class="action-button primary entry-commit" type="button" data-action="commit-entry" title="Commit this target's linked original to the database" ${hasPendingLink ? "" : 'disabled aria-hidden="true" tabindex="-1"'}>Commit</button>
+	    `;
     const checkbox = item.querySelector(".entry-check");
     checkbox.onchange = event => toggleEntrySelection(entry.entry_id, index, event.shiftKey, checkbox.checked);
     checkbox.onclick = event => event.stopPropagation();
     const button = item.querySelector(".entry-button");
     button.onclick = () => loadEntry(entry.entry_id);
-    list.appendChild(item);
-  });
+    const commitButton = item.querySelector('[data-action="commit-entry"]');
+    if (commitButton) {
+      commitButton.onclick = event => {
+        event.stopPropagation();
+        commitEntryDecision(entry.entry_id, event.currentTarget);
+      };
+    }
+	    list.appendChild(item);
+	  });
   renderSelectionSummary();
   renderEntryPaging();
   updateNavigationState();
-}
+	}
+
+	function entryListItem(entryId) {
+	  return [...document.querySelectorAll(".entry-item")].find(item => item.dataset.entryId === String(entryId)) || null;
+	}
+
+	function setEntryCommitButtonState(button, selectedCount) {
+	  if (!button) return;
+	  const hasPendingLink = Number(selectedCount || 0) > 0;
+	  button.disabled = !hasPendingLink;
+	  button.setAttribute("aria-hidden", hasPendingLink ? "false" : "true");
+	  button.tabIndex = hasPendingLink ? 0 : -1;
+	}
+
+	function applyEntryListState(entry) {
+	  const item = entryListItem(entry?.entry_id);
+	  if (!item) return;
+	  item.className = `entry-item ${entry.entry_id === state.selectedEntryId ? "active" : ""}`;
+	  const checkbox = item.querySelector(".entry-check");
+	  if (checkbox) checkbox.checked = state.selectedEntryIds.has(entry.entry_id);
+	  const badge = item.querySelector(".badge");
+	  if (badge) {
+	    badge.className = `badge ${entry.status}`;
+	    badge.textContent = statusLabel(entry.status);
+	  }
+	  const summary = item.querySelector(".summary");
+	  if (summary) summary.textContent = `${entry.candidate_count} candidates`;
+	  setEntryCommitButtonState(item.querySelector('[data-action="commit-entry"]'), entry.selected_count);
+	}
 
 function renderEntryPaging() {
   const panel = document.getElementById("entryPaging");
@@ -4648,6 +5052,28 @@ function resetCandidateScroll() {
   if (workspace) workspace.scrollTo({top: 0, left: 0});
   const candidatePane = document.querySelector(".candidate-pane");
   if (candidatePane) candidatePane.scrollTop = 0;
+}
+
+function capturePickerScroll() {
+  const workspace = document.querySelector(".workspace");
+  const candidatePane = document.querySelector(".candidate-pane");
+  return {
+    windowX: window.scrollX,
+    windowY: window.scrollY,
+    workspaceLeft: workspace ? workspace.scrollLeft : 0,
+    workspaceTop: workspace ? workspace.scrollTop : 0,
+    candidatePaneLeft: candidatePane ? candidatePane.scrollLeft : 0,
+    candidatePaneTop: candidatePane ? candidatePane.scrollTop : 0
+  };
+}
+
+function restorePickerScroll(snapshot) {
+  if (!snapshot) return;
+  const workspace = document.querySelector(".workspace");
+  const candidatePane = document.querySelector(".candidate-pane");
+  if (workspace) workspace.scrollTo({left: snapshot.workspaceLeft, top: snapshot.workspaceTop});
+  if (candidatePane) candidatePane.scrollTo({left: snapshot.candidatePaneLeft, top: snapshot.candidatePaneTop});
+  window.scrollTo(snapshot.windowX, snapshot.windowY);
 }
 
 async function fetchEntryDetail(entryId, forceRefresh = false) {
@@ -4739,13 +5165,14 @@ function renderEntryDetail() {
 function renderCandidateGrid() {
   const entry = state.currentEntry;
   const grid = document.getElementById("candidateGrid");
-  if (!entry || !entry.candidates.length) {
+  const candidates = Array.isArray(entry?.candidates) ? entry.candidates : [];
+  if (!entry || !candidates.length) {
     return;
   }
-  renderCandidateEvidenceFilter(entry.candidates);
-  const visibleCandidates = filteredAndSortedCandidates(entry.candidates);
+  renderCandidateEvidenceFilter(candidates);
+  const visibleCandidates = filteredAndSortedCandidates(candidates);
   const renderedCandidates = visibleCandidates.slice(0, state.candidateRenderLimit);
-  const folderCount = candidateFolderGroups(entry.candidates).length;
+  const folderCount = candidateFolderGroups(candidates).length;
   const folderFilter = document.getElementById("candidateFolderFilter").value;
   const folderText = folderFilter
     ? " · folder filtered"
@@ -4754,7 +5181,7 @@ function renderCandidateGrid() {
       : "";
   const locationText = document.getElementById("candidateLocationOnly").checked ? " · location only" : "";
   document.getElementById("candidateSummary").textContent =
-    `Showing ${visibleCandidates.length} of ${entry.candidates.length} candidates${folderText}${locationText}`;
+    `Showing ${visibleCandidates.length} of ${candidates.length} candidates${folderText}${locationText}`;
   if (state.candidateImageObserver) state.candidateImageObserver.disconnect();
   grid.innerHTML = "";
   if (!visibleCandidates.length) {
@@ -4764,7 +5191,7 @@ function renderCandidateGrid() {
   for (const candidate of renderedCandidates) {
     const card = document.createElement("article");
     card.className = `candidate-card ${candidate.selected ? "selected" : ""}`;
-    const notesId = `notes-${candidate.token}`;
+    card.dataset.candidateToken = candidate.token;
     card.innerHTML = `
       <img class="candidate-image" data-src="/image/${candidate.token}?max=640" decoding="async" alt="">
       <div class="candidate-meta">
@@ -4782,14 +5209,22 @@ function renderCandidateGrid() {
       </div>
       <div class="candidate-actions">
         <button class="action-button primary" data-action="select">Select</button>
-        <button class="action-button" data-action="reject">Reject</button>
-      </div>
-      <div class="candidate-meta">
-        <textarea id="${notesId}" placeholder="Notes">${escapeHtml(candidate.review_notes || "")}</textarea>
+        <button class="action-button ${candidate.associated ? "flagged" : ""}" data-action="flag" title="${escapeHtml(flagButtonTitle(candidate))}">${escapeHtml(flagButtonLabel(candidate))}</button>
+        <button class="action-button ${candidate.selected ? "linked" : ""}" data-action="link" aria-pressed="${candidate.selected ? "true" : "false"}" title="Matches the origional to the target, but does NOT refresh the page">${candidate.selected ? "Linked" : "Link"}</button>
+        <div class="associated-date-panel" data-associated-panel hidden>
+          <div class="associated-date-choices" data-associated-choices></div>
+          <input type="date" data-associated-date aria-label="Associated date">
+          <input type="time" step="1" data-associated-time aria-label="Associated time">
+          <button class="action-button" data-action="save-flag">Save manual time</button>
+        </div>
       </div>
     `;
-    card.querySelector('[data-action="select"]').onclick = () => saveDecision(candidate, "use_external_original", notesId);
-    card.querySelector('[data-action="reject"]').onclick = () => saveDecision(candidate, "rejected", notesId);
+    card.querySelector('[data-action="select"]').onclick = () => saveDecision(candidate, "use_external_original", card);
+    card.querySelector('[data-action="link"]').onclick = () => saveDecision(candidate, "use_external_original", card, {advance: false});
+    card.querySelector('[data-action="flag"]').onclick = () => showAssociatedDatePanel(candidate, card);
+    card.querySelector('[data-action="save-flag"]').onclick = () => saveAssociatedPhotoFlag(candidate, card);
+    card.querySelector('[data-associated-date]').oninput = () => clearAssociatedDateChoiceSelection(card);
+    card.querySelector('[data-associated-time]').oninput = () => clearAssociatedDateChoiceSelection(card);
     grid.appendChild(card);
   }
   if (renderedCandidates.length < visibleCandidates.length) {
@@ -4803,6 +5238,34 @@ function renderCandidateGrid() {
   fetchCandidateFacts(candidateFactPrefetchCandidates(visibleCandidates, renderedCandidates)).catch(error => {
     document.getElementById("crawlStatus").textContent = `Candidate details unavailable: ${error.message}`;
   });
+}
+
+function flagButtonLabel(candidate) {
+  return candidate.associated ? "Flagged" : "Flag";
+}
+
+function flagButtonTitle(candidate) {
+  if (!candidate.associated) return "Flag as an associated photo";
+  const date = candidate.associated_entry_date || "saved date";
+  const source = associatedDateSourceLabel(candidate.associated_date_source || "manual");
+  return `Associated photo flag saved for ${date} from ${source}. Click to change the date.`;
+}
+
+function applyFlagButtonState(button, candidate) {
+  if (!button) return;
+  button.classList.toggle("flagged", Boolean(candidate.associated));
+  button.textContent = flagButtonLabel(candidate);
+  button.title = flagButtonTitle(candidate);
+}
+
+function applyLinkButtonState(card, candidate) {
+  if (!card) return;
+  card.classList.toggle("selected", Boolean(candidate.selected));
+  const button = card.querySelector('[data-action="link"]');
+  if (!button) return;
+  button.classList.toggle("linked", Boolean(candidate.selected));
+  button.setAttribute("aria-pressed", candidate.selected ? "true" : "false");
+  button.textContent = candidate.selected ? "Linked" : "Link";
 }
 
 function observeCandidateRenderSentinel(sentinel) {
@@ -5251,7 +5714,6 @@ function candidateMatchesFolder(candidate, folderFilter) {
 function prepareCandidateTimestampGroups(candidates, sortMode) {
   for (const candidate of candidates) {
     delete candidate._timestampGroupKey;
-    delete candidate._timestampGroupSelected;
     delete candidate._timestampGroupDateDistance;
     delete candidate._timestampGroupCaptureTime;
     delete candidate._timestampGroupVisualRank;
@@ -5266,13 +5728,11 @@ function prepareCandidateTimestampGroups(candidates, sortMode) {
     groups.get(key).push(candidate);
   }
   for (const [key, group] of groups) {
-    const selected = group.some(candidate => candidate.selected);
     const dateDistance = Math.min(...group.map(candidate => candidateDateDistance(candidate)));
     const visualRank = Math.min(...group.map(candidate => candidateVisualRank(candidate)));
     const visualScore = Math.min(...group.map(candidate => numericCandidateValue(candidate.visual_score, Number.POSITIVE_INFINITY)));
     for (const candidate of group) {
       candidate._timestampGroupKey = key;
-      candidate._timestampGroupSelected = selected;
       candidate._timestampGroupDateDistance = dateDistance;
       candidate._timestampGroupCaptureTime = key;
       candidate._timestampGroupVisualRank = visualRank;
@@ -5318,14 +5778,12 @@ function compareTimestampGroups(left, right, sortMode) {
   if (sortMode === "capture_time") {
     const leftCaptureTime = timestampGroupCaptureTime(left);
     const rightCaptureTime = timestampGroupCaptureTime(right);
-    return Number(Boolean(timestampGroupSelected(right))) - Number(Boolean(timestampGroupSelected(left)))
-      || timestampGroupDateDistance(left) - timestampGroupDateDistance(right)
+    return timestampGroupDateDistance(left) - timestampGroupDateDistance(right)
       || Number(!leftCaptureTime) - Number(!rightCaptureTime)
       || leftCaptureTime.localeCompare(rightCaptureTime);
   }
   if (sortMode === "visual") {
-    return Number(Boolean(timestampGroupSelected(right))) - Number(Boolean(timestampGroupSelected(left)))
-      || timestampGroupVisualRank(left) - timestampGroupVisualRank(right)
+    return timestampGroupVisualRank(left) - timestampGroupVisualRank(right)
       || timestampGroupVisualScore(left) - timestampGroupVisualScore(right);
   }
   return 0;
@@ -5333,7 +5791,6 @@ function compareTimestampGroups(left, right, sortMode) {
 
 function compareWithinTimestampGroup(left, right) {
   return candidatePixelCount(right) - candidatePixelCount(left)
-    || Number(Boolean(right.selected)) - Number(Boolean(left.selected))
     || candidateVisualRank(left) - candidateVisualRank(right)
     || numericCandidateValue(left.visual_score, Number.POSITIVE_INFINITY) - numericCandidateValue(right.visual_score, Number.POSITIVE_INFINITY)
     || candidateQualityRank(left) - candidateQualityRank(right)
@@ -5366,10 +5823,6 @@ function candidateFilenameCaptureTimestamp(candidate) {
     return `${separated[1]}-${separated[2]}-${separated[3]}T${separated[4]}:${separated[5]}:${separated[6]}`;
   }
   return "";
-}
-
-function timestampGroupSelected(candidate) {
-  return candidate._timestampGroupSelected ?? candidate.selected;
 }
 
 function timestampGroupDateDistance(candidate) {
@@ -5447,14 +5900,19 @@ function formatVisualRank(candidate) {
   return "";
 }
 
-async function saveDecision(candidate, decision, notesId) {
-  const notes = document.getElementById(notesId).value;
+async function saveDecision(candidate, decision, card, options = {}) {
+  if (!state.currentEntry) return;
+  const notes = "";
   const currentEntryId = state.currentEntry.entry_id;
+  const currentEntryBeforeSave = state.currentEntry;
   const nextEntryId = nextEntryIdAfterCurrent();
-  const card = document.getElementById(notesId).closest(".candidate-card");
   const buttons = [...card.querySelectorAll("button")];
   buttons.forEach(button => { button.disabled = true; });
-  document.getElementById("crawlStatus").textContent = decision === "rejected" ? "Saving rejection..." : "Saving selection...";
+  const isLink = decision === "use_external_original" && options.advance === false;
+  const linkScrollState = isLink ? capturePickerScroll() : null;
+  document.getElementById("crawlStatus").textContent = isLink
+    ? "Linking original..."
+    : decision === "rejected" ? "Saving rejection..." : "Saving selection...";
   try {
     const updatedEntry = await fetchJson("/api/decision", {
       method: "POST",
@@ -5470,8 +5928,9 @@ async function saveDecision(candidate, decision, notesId) {
     if (entrySummary) {
       entrySummary.status = updatedEntry.status;
       entrySummary.candidate_count = updatedEntry.candidate_count;
+      entrySummary.selected_count = updatedEntry.selected_count;
     }
-    const shouldAdvance = shouldAdvanceAfterDecision(decision, updatedEntry);
+    const shouldAdvance = options.advance !== false && shouldAdvanceAfterDecision(decision, updatedEntry);
     state.entryDetailCache.delete(currentEntryId);
     if (shouldAdvance) {
       const index = state.entries.findIndex(entry => entry.entry_id === currentEntryId);
@@ -5481,15 +5940,247 @@ async function saveDecision(candidate, decision, notesId) {
       if (nextEntryId) await loadEntry(nextEntryId);
       else await loadEntries();
     } else {
-      state.currentEntry.candidates = state.currentEntry.candidates.filter(item => item.path !== candidate.path);
+      const currentCandidates = Array.isArray(currentEntryBeforeSave.candidates)
+        ? currentEntryBeforeSave.candidates
+        : [];
+      state.currentEntry = {
+        ...currentEntryBeforeSave,
+        ...updatedEntry,
+        candidates: Array.isArray(updatedEntry.candidates) ? updatedEntry.candidates : currentCandidates,
+        candidate_total: currentEntryBeforeSave.candidate_total ?? updatedEntry.candidate_count
+      };
+      if (decision === "rejected") {
+        state.currentEntry.candidates = state.currentEntry.candidates.filter(item => item.path !== candidate.path);
+      } else if (decision === "use_external_original") {
+        for (const item of state.currentEntry.candidates) {
+          item.selected = item.path === candidate.path;
+          if (item.path === candidate.path) {
+            item.review_decision = decision;
+            item.review_notes = notes;
+          }
+        }
+      }
       state.currentEntry.candidate_count = updatedEntry.candidate_count;
       state.currentEntry.candidate_total = updatedEntry.candidate_count;
       state.currentEntry.status = updatedEntry.status;
+      state.currentEntry.selected_count = updatedEntry.selected_count;
       state.entryDetailCache.set(currentEntryId, state.currentEntry);
-      renderEntries();
-      renderEntryDetail();
-      document.getElementById("crawlStatus").textContent = "Rejected.";
+      if (isLink) {
+        applyEntryListState(entrySummary || state.currentEntry);
+	        for (const item of state.currentEntry.candidates) {
+	          const itemCard = item.path === candidate.path
+	            ? card
+	            : [...document.querySelectorAll(".candidate-card")].find(candidateCard => candidateCard.dataset.candidateToken === item.token);
+	          applyLinkButtonState(itemCard, item);
+	        }
+        buttons.forEach(button => { button.disabled = false; });
+        document.getElementById("entrySubhead").textContent =
+          `${state.currentEntry.candidate_count} candidates · ${statusLabel(state.currentEntry.status)}`;
+        restorePickerScroll(linkScrollState);
+      } else {
+        renderEntries();
+        renderEntryDetail();
+      }
+      document.getElementById("crawlStatus").textContent = isLink ? "Linked. Commit when ready." : "Rejected.";
     }
+    scheduleSummaryRefresh();
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+    buttons.forEach(button => { button.disabled = false; });
+    if (isLink) restorePickerScroll(linkScrollState);
+  }
+}
+
+async function showAssociatedDatePanel(candidate, card) {
+  const panel = card.querySelector("[data-associated-panel]");
+  const choicesTarget = card.querySelector("[data-associated-choices]");
+  const existingDate = candidate.associated_entry_date || "";
+  panel.hidden = false;
+  setAssociatedManualInputs(card, existingDate || state.currentEntry?.entry_date || "");
+  choicesTarget.innerHTML = `<div class="summary">Loading date choices...</div>`;
+  document.getElementById("crawlStatus").textContent = "Loading date choices.";
+  try {
+    const payload = await fetchJson("/api/associated-date-choices", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        entry_id: state.currentEntry.entry_id,
+        candidate_path: candidate.path
+      })
+    });
+    const choices = associatedCaptureDateChoices(payload.choices || []);
+    renderAssociatedDateChoices(choicesTarget, choices, candidate, card);
+    const firstChoice = choices[0];
+    setAssociatedManualInputs(card, existingDate || firstChoice?.date || payload.default_date || state.currentEntry.entry_date);
+    choicesTarget.dataset.loaded = "1";
+    if (firstChoice) {
+      setAssociatedDateChoiceSelection(card, firstChoice.source, firstChoice.date);
+      await saveAssociatedPhotoFlagWithDate(candidate, card, firstChoice.date, firstChoice.source);
+    } else {
+      clearAssociatedDateChoiceSelection(card);
+      document.getElementById("crawlStatus").textContent = "No Date captured found. Use the manual date and time.";
+    }
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+    choicesTarget.innerHTML = `<div class="summary">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function associatedCaptureDateChoices(choices) {
+  const seenDates = new Set();
+  return (choices || []).filter(choice => {
+    const source = String(choice.source || "").trim().toLowerCase();
+    const date = String(choice.date || "").trim();
+    if (!(source === "capture" || source === "filename_timestamp") || !date || seenDates.has(date)) return false;
+    seenDates.add(date);
+    return true;
+  }).slice(0, 1);
+}
+
+function renderAssociatedDateChoices(target, choices, candidate, card) {
+  target.innerHTML = "";
+  if (!choices.length) {
+    target.innerHTML = `<div class="summary">No source dates found. Use the manual date below.</div>`;
+    return;
+  }
+  for (const choice of choices) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "action-button associated-date-choice";
+    button.dataset.associatedSource = choice.source;
+    button.dataset.associatedDate = choice.date;
+    button.setAttribute("aria-pressed", "false");
+    button.innerHTML = `<strong>${escapeHtml(associatedDateSourceLabel(choice.source))}</strong><span>${escapeHtml(formatAssociatedDateValue(choice.date))}</span>`;
+    button.onclick = () => {
+      setAssociatedManualInputs(card, choice.date);
+      setAssociatedDateChoiceSelection(card, choice.source, choice.date);
+      saveAssociatedPhotoFlagWithDate(candidate, card, choice.date, choice.source);
+    };
+    target.appendChild(button);
+  }
+}
+
+function associatedDateSourceLabel(source) {
+  const labels = {
+    capture: "Date captured",
+    filename_timestamp: "Date captured",
+    manual: "Manual date"
+  };
+  return labels[String(source || "").trim().toLowerCase()] || String(source || "Date source").replaceAll("_", " ");
+}
+
+function associatedDateInputValue(value) {
+  const text = String(value || "").trim();
+  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(text)) return text;
+  const match = text.match(/^(\\d{4}-\\d{2}-\\d{2})[T ](\\d{2}:\\d{2}(?::\\d{2})?)/);
+  if (match) return match[1];
+  return "";
+}
+
+function associatedTimeInputValue(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^\\d{4}-\\d{2}-\\d{2}[T ](\\d{2}:\\d{2}(?::\\d{2})?)/);
+  if (!match) return "00:00:00";
+  return match[1].length === 5 ? `${match[1]}:00` : match[1];
+}
+
+function setAssociatedManualInputs(card, value) {
+  card.querySelector("[data-associated-date]").value = associatedDateInputValue(value);
+  card.querySelector("[data-associated-time]").value = associatedTimeInputValue(value);
+}
+
+function normalizeAssociatedManualValue(dateValue, timeValue) {
+  const dateText = String(dateValue || "").trim();
+  let timeText = String(timeValue || "").trim();
+  if (/^\\d{2}:\\d{2}$/.test(timeText)) timeText = `${timeText}:00`;
+  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(dateText) || !/^\\d{2}:\\d{2}:\\d{2}$/.test(timeText)) return "";
+  return `${dateText}T${timeText}`;
+}
+
+function setAssociatedDateChoiceSelection(card, source, date) {
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  const normalizedDate = String(date || "").trim();
+  card.querySelectorAll(".associated-date-choice").forEach(button => {
+    const selected = button.dataset.associatedSource === normalizedSource && button.dataset.associatedDate === normalizedDate;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+  });
+}
+
+function clearAssociatedDateChoiceSelection(card) {
+  card.querySelectorAll(".associated-date-choice").forEach(button => {
+    button.classList.remove("is-selected");
+    button.setAttribute("aria-pressed", "false");
+  });
+}
+
+function syncAssociatedDateChoiceSelection(card, candidate) {
+  const source = candidate.associated_date_source || "";
+  const date = candidate.associated_entry_date || "";
+  if (source === "manual") clearAssociatedDateChoiceSelection(card);
+  else setAssociatedDateChoiceSelection(card, source, date);
+}
+
+function formatAssociatedDateValue(value) {
+  const text = String(value || "").trim();
+  return text.replace("T", " ");
+}
+
+async function saveAssociatedPhotoFlag(candidate, card) {
+  const dateInput = card.querySelector("[data-associated-date]");
+  const timeInput = card.querySelector("[data-associated-time]");
+  const associatedDate = normalizeAssociatedManualValue(dateInput.value || state.currentEntry?.entry_date || "", timeInput.value || "");
+  if (!associatedDate) {
+    document.getElementById("crawlStatus").textContent = "Choose a valid associated date and time.";
+    return;
+  }
+  await saveAssociatedPhotoFlagWithDate(candidate, card, associatedDate, "manual");
+}
+
+async function saveAssociatedPhotoFlagWithDate(candidate, card, associatedDate, source) {
+  await saveDecisionWithExtra(candidate, "external_original_associated_photo", card, {
+    associated_entry_date: associatedDate,
+    associated_date_source: source || "manual"
+  });
+}
+
+async function saveDecisionWithExtra(candidate, decision, card, extra) {
+  const notes = "";
+  const currentEntryId = state.currentEntry.entry_id;
+  const buttons = [...card.querySelectorAll("button")];
+  buttons.forEach(button => { button.disabled = true; });
+  document.getElementById("crawlStatus").textContent = "Saving flag.";
+  try {
+    const updatedEntry = await fetchJson("/api/decision", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify(Object.assign({
+        entry_id: currentEntryId,
+        candidate_path: candidate.path,
+        decision,
+        notes
+      }, extra || {}))
+    });
+    Object.assign(candidate, {
+      review_decision: decision,
+      review_notes: notes,
+      associated: decision === "external_original_associated_photo",
+      associated_entry_date: extra?.associated_entry_date || "",
+      associated_date_source: extra?.associated_date_source || "manual"
+    });
+    const entrySummary = state.entries.find(entry => entry.entry_id === currentEntryId);
+    if (entrySummary) {
+      entrySummary.status = updatedEntry.status;
+      entrySummary.candidate_count = updatedEntry.candidate_count;
+    }
+    state.currentEntry.status = updatedEntry.status;
+    state.currentEntry.candidate_count = updatedEntry.candidate_count;
+    state.currentEntry.candidate_total = updatedEntry.candidate_count;
+    state.entryDetailCache.set(currentEntryId, state.currentEntry);
+    buttons.forEach(button => { button.disabled = false; });
+    applyFlagButtonState(card.querySelector('[data-action="flag"]'), candidate);
+    syncAssociatedDateChoiceSelection(card, candidate);
+    document.getElementById("crawlStatus").textContent = "";
     scheduleSummaryRefresh();
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
@@ -5534,8 +6225,47 @@ function shouldAdvanceAfterDecision(decision, updatedEntry) {
   return false;
 }
 
+function entryMatchesStatusFilter(entry, status) {
+  return status === "all"
+    || entry.status === status
+    || (status === "accepted_not_applied" && entry.status === "selected")
+    || (status === "needs_action" && ["needs_review", "search_needed"].includes(entry.status));
+}
+
+async function commitEntryDecision(entryId, button = null) {
+  const entry = state.entries.find(item => item.entry_id === entryId);
+  const committedEntryDate = entry?.entry_date || state.currentEntry?.entry_date || "";
+  if (button) button.disabled = true;
+  if (state.summaryRefreshTimer) clearTimeout(state.summaryRefreshTimer);
+  state.summaryRefreshTimer = null;
+  document.getElementById("crawlStatus").textContent = "Committing linked original.";
+  const nextEntryId = entryId === state.selectedEntryId ? nextEntryIdAfterCurrent() : state.selectedEntryId;
+  state.entryDetailCache.delete(entryId);
+  try {
+    const result = await fetchJson("/api/commit-entry", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({entry_id: entryId})
+    });
+    document.getElementById("crawlStatus").textContent =
+      `Committed ${result.selected_count || 0} linked original. ${result.remaining_entries || 0} entries remain.`;
+    state.suppressedCommittedEntryIds.add(entryId);
+    state.selectedEntryIds.delete(entryId);
+    state.entries = state.entries.filter(entry => entry.entry_id !== entryId);
+    if (state.selectedEntryId === entryId) state.selectedEntryId = nextEntryId || null;
+    renderEntries();
+    await loadSummary();
+    await loadBatches();
+    await loadEntries(nextEntryId, true, committedEntryDate);
+  } catch (error) {
+    state.suppressedCommittedEntryIds.delete(entryId);
+    document.getElementById("crawlStatus").textContent = error.message;
+    if (button) button.disabled = false;
+  }
+}
+
 async function applyDecisions() {
-  if (!confirm("Apply selected originals, rejected candidates, and fallback decisions to the database?")) return;
+  if (!confirm("Apply selected originals, linked originals, flagged associated photos, rejected candidates, and fallback decisions to the database?")) return;
   const button = document.getElementById("applyDecisionsButton");
   button.disabled = true;
   if (state.summaryRefreshTimer) clearTimeout(state.summaryRefreshTimer);
@@ -5546,10 +6276,10 @@ async function applyDecisions() {
     const result = await fetchJson("/api/apply-decisions", {
       method: "POST",
       headers: {"content-type": "application/json"},
-      body: JSON.stringify({})
+      body: JSON.stringify({confirm_apply_decisions: "apply-reviewed-decisions"})
     });
     document.getElementById("crawlStatus").textContent =
-      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback. ${result.remaining_entries || 0} entries remain.`;
+      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.associated_count || 0} flagged, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback. ${result.remaining_entries || 0} entries remain.`;
     await loadSummary();
     await loadBatches();
     state.entryDetailCache.clear();
@@ -5559,59 +6289,6 @@ async function applyDecisions() {
   } finally {
     button.disabled = false;
   }
-}
-
-async function startCropEstimateBatch() {
-  if (state.cropEstimateJobId) return;
-  const button = document.getElementById("estimateCropBatchButton");
-  button.disabled = true;
-  document.getElementById("crawlStatus").textContent = "Starting crop-location estimates.";
-  try {
-    const job = await fetchJson("/api/crop-estimate-batch", {
-      method: "POST",
-      headers: {"content-type": "application/json"},
-      body: JSON.stringify({})
-    });
-    state.cropEstimateJobId = job.id;
-    renderCropEstimateBatchJob(job);
-    pollCropEstimateBatch(job.id);
-  } catch (error) {
-    state.cropEstimateJobId = "";
-    document.getElementById("crawlStatus").textContent = error.message;
-    button.disabled = false;
-  }
-}
-
-async function pollCropEstimateBatch(jobId) {
-  try {
-    const job = await fetchJson(`/api/crop-estimate-batch/${encodeURIComponent(jobId)}`);
-    renderCropEstimateBatchJob(job);
-    if (job.status === "queued" || job.status === "running") {
-      setTimeout(() => pollCropEstimateBatch(jobId), 1200);
-      return;
-    }
-    state.cropEstimateJobId = "";
-    await loadSummary();
-    await loadBatches();
-  } catch (error) {
-    state.cropEstimateJobId = "";
-    document.getElementById("crawlStatus").textContent = error.message;
-    document.getElementById("estimateCropBatchButton").disabled = false;
-  }
-}
-
-function renderCropEstimateBatchJob(job) {
-  const button = document.getElementById("estimateCropBatchButton");
-  const running = job.status === "queued" || job.status === "running";
-  button.disabled = running;
-  const processed = Number(job.processed_count || 0);
-  const total = Number(job.target_count || 0);
-  const estimated = Number(job.estimated_count || 0);
-  const skipped = Number(job.skipped_count || 0);
-  const failed = Number(job.failed_count || 0);
-  const current = job.current_entry_id ? ` · ${job.current_entry_id}` : "";
-  document.getElementById("crawlStatus").textContent =
-    `${job.status} · ${processed}/${total} checked · ${estimated} estimated · ${skipped} skipped · ${failed} failed${current}`;
 }
 
 async function expandDefaultDateRange() {
@@ -5752,6 +6429,7 @@ async function rejectAllCandidates() {
   if (!state.currentEntry || !state.currentEntry.candidates.length) return;
   const button = document.getElementById("rejectAllButton");
   const currentEntryId = state.currentEntry.entry_id;
+  const nextEntryId = nextEntryIdAfterCurrent();
   const candidateCount = Number(state.currentEntry.candidate_total || state.currentEntry.candidate_count || 0);
   button.disabled = true;
   document.getElementById("crawlStatus").textContent = `Rejecting ${candidateCount} candidates.`;
@@ -5766,10 +6444,35 @@ async function rejectAllCandidates() {
       })
     });
     const updatedEntry = result.entry;
+    const entrySummary = state.entries.find(entry => entry.entry_id === currentEntryId);
+    if (entrySummary) {
+      entrySummary.status = updatedEntry.status;
+      entrySummary.candidate_count = updatedEntry.candidate_count;
+      entrySummary.selected_count = updatedEntry.selected_count;
+    }
     state.currentEntry = updatedEntry;
+    state.entryDetailCache.delete(currentEntryId);
     document.getElementById("crawlStatus").textContent = `Rejected ${result.rejected_count || 0} candidates.`;
     await loadSummary();
-    await loadEntries(shouldAdvanceAfterDecision("rejected", updatedEntry) ? nextEntryIdAfterCurrent() : currentEntryId);
+    await loadBatches();
+    const filter = document.getElementById("filter").value;
+    if (entryMatchesStatusFilter(updatedEntry, filter)) {
+      state.entryDetailCache.set(currentEntryId, updatedEntry);
+      renderEntries();
+      renderEntryDetail();
+    } else {
+      const index = state.entries.findIndex(entry => entry.entry_id === currentEntryId);
+      if (index >= 0) state.entries.splice(index, 1);
+      renderEntries();
+      if (nextEntryId && state.entries.some(entry => entry.entry_id === nextEntryId)) {
+        await loadEntry(nextEntryId);
+      } else if (state.entries.length) {
+        const targetIndex = index >= 0 ? Math.min(index, state.entries.length - 1) : 0;
+        await loadEntry(state.entries[targetIndex].entry_id);
+      } else {
+        await loadEntries("", true, updatedEntry.entry_date || "");
+      }
+    }
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
   } finally {
@@ -5787,13 +6490,16 @@ document.getElementById("candidateSort").onchange = renderCandidateGrid;
 document.getElementById("candidateLocationOnly").onchange = renderCandidateGrid;
 document.getElementById("chooseFolder").onclick = chooseFolder;
 document.getElementById("choosePhoto").onclick = choosePhoto;
+document.getElementById("searchPanelToggle").onclick = () => {
+  const button = document.getElementById("searchPanelToggle");
+  setSearchPanelExpanded(button.getAttribute("aria-expanded") !== "true");
+};
 document.getElementById("crawlCurrent").onclick = () => startCrawl("current");
 document.getElementById("crawlSelected").onclick = () => startCrawl("selected");
 document.getElementById("crawlVisible").onclick = () => startCrawl("visible");
 document.getElementById("selectVisible").onclick = selectVisibleEntries;
 document.getElementById("clearSelection").onclick = clearSelectedEntries;
 document.getElementById("applyDecisionsButton").onclick = applyDecisions;
-document.getElementById("estimateCropBatchButton").onclick = startCropEstimateBatch;
 document.getElementById("rejectAllButton").onclick = rejectAllCandidates;
 document.getElementById("defaultDateRange").onclick = expandDefaultDateRange;
 document.querySelectorAll("[data-range-days]").forEach(button => {
@@ -5907,14 +6613,14 @@ function changeBatchFilter() {
 }
 
 function changeStatusFilter() {
-  if (document.getElementById("filter").value === "all") {
-    document.getElementById("batchFilter").value = "";
-    state.batchEntryIds = [];
-    state.batchEntryDates = [];
-    state.selectedEntryIds.clear();
-    state.lastCheckedIndex = null;
-    clearUrlEntryScope("all");
-  }
+  const status = document.getElementById("filter").value;
+  document.getElementById("batchFilter").value = "";
+  state.batchEntryIds = [];
+  state.batchEntryDates = [];
+  state.selectedEntryIds.clear();
+  state.lastCheckedIndex = null;
+  state.initialBatchId = "";
+  clearUrlEntryScope(status);
   loadEntries();
 }
 
@@ -5981,6 +6687,14 @@ function renderBatchSummary() {
   }
   target.textContent =
     `${batch.batch_id}: ${batch.start_date} to ${batch.end_date} · ${batch.entry_count || "0"} entries · ${batch.candidate_count || "0"} candidates · ${batchStatusLabel(batch)}`;
+}
+
+function setSearchPanelExpanded(expanded) {
+  const button = document.getElementById("searchPanelToggle");
+  const body = document.getElementById("searchPanelBody");
+  body.hidden = !expanded;
+  button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  button.textContent = expanded ? "Collapse" : "Expand";
 }
 
 function crawlRoots() {
@@ -6497,6 +7211,16 @@ button.subtle-danger:hover {
   font-size: 16px;
   line-height: 1;
 }
+.minimal-crop-control {
+  min-height: 34px;
+  padding: 6px 9px;
+  color: var(--subtle);
+  font-size: 12px;
+  font-weight: 600;
+}
+.minimal-crop-control:not(:disabled) {
+  color: var(--text);
+}
 .crop-size-control,
 .crop-rotation-control {
   display: flex;
@@ -6682,6 +7406,18 @@ button.subtle-danger:hover {
   border-radius: 5px;
   background: #fff;
 }
+.color-sample-control {
+  min-height: 34px;
+  padding: 6px 9px;
+  color: var(--subtle);
+  font-size: 12px;
+  font-weight: 600;
+}
+.color-sample-control.is-active {
+  border-color: var(--accent);
+  background: #eff6ff;
+  color: var(--accent);
+}
 .crop-box::before,
 .crop-box::after {
   content: "";
@@ -6788,9 +7524,10 @@ button.subtle-danger:hover {
 	      <label>
 	        Crop list
 	        <select id="cropFilter">
-	          <option value="missing">Without crop</option>
+	          <option value="missing">No saved crop data</option>
+	          <option value="estimated">Saved estimates</option>
+	          <option value="confirmed">User saved crops</option>
 	          <option value="all">All linked originals</option>
-	          <option value="with_crop">With crop</option>
 	        </select>
 	      </label>
 	    </div>
@@ -6810,6 +7547,9 @@ button.subtle-danger:hover {
             Fill
             <input id="cropFillColor" type="color" value="#000000">
           </label>
+          <button id="fillColorSampleButton" class="color-sample-control" type="button" title="Sample a 3x3 average fill color from the actual original image pixels" disabled>Sample</button>
+          <button id="minimalFitButton" class="minimal-crop-control" type="button" title="Shrink the crop around its current center until it fits inside the original photo" disabled>Minimal fit</button>
+          <button id="minimalMoveButton" class="minimal-crop-control" type="button" title="Move the crop the shortest distance that fits it inside the original photo without resizing" disabled>Minimal move</button>
           <button id="rotateQuarterTurnButton" class="icon-control" type="button" title="Rotate 90 degrees clockwise" aria-label="Rotate 90 degrees clockwise">↻</button>
           <label class="crop-size-control">
             Crop size
@@ -6872,6 +7612,7 @@ const state = {
   selectedCandidate: null,
   cropDraft: null,
   cropDrag: null,
+  fillColorSampling: false,
   pendingCropCommits: {pending_count: 0},
   openYears: new Set(),
   openMonths: new Set()
@@ -6892,7 +7633,7 @@ async function loadEntries(preferredEntryId = "") {
   updatePendingCropCommitControl();
   const missingCount = state.entries.filter(entry => !entry.crop_has_crop).length;
   document.getElementById("summary").textContent =
-    `${state.entries.length} linked original${state.entries.length === 1 ? "" : "s"} · ${missingCount} without crop.`;
+    cropSummaryText(cropFilter, state.entries, missingCount);
   if (!state.entries.length) {
     state.selectedEntryId = "";
     state.currentEntry = null;
@@ -6912,12 +7653,21 @@ async function loadEntries(preferredEntryId = "") {
   await loadEntry(state.selectedEntryId);
 }
 
+function cropSummaryText(cropFilter, entries, missingCount) {
+  const countText = `${entries.length} linked original${entries.length === 1 ? "" : "s"}`;
+  if (cropFilter === "missing") return `${countText} without saved crop data.`;
+  if (cropFilter === "estimated") return `${countText} with saved estimate crop data.`;
+  if (cropFilter === "confirmed") return `${countText} with user saved crop data.`;
+  return `${countText} · ${missingCount} without saved crop data.`;
+}
+
 async function loadEntry(entryId) {
   state.selectedEntryId = entryId;
   window.localStorage.setItem("project365CropLastEntryId", entryId);
   state.currentEntry = await fetchJson(`/api/crop-entry/${encodeURIComponent(entryId)}`);
   state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.selected) || null;
   state.cropDraft = initialCropForCandidate(state.selectedCandidate);
+  state.fillColorSampling = false;
   rememberOpenGroups(state.currentEntry);
   renderEntries();
   renderCropEditor();
@@ -7052,7 +7802,9 @@ function renderEmpty() {
   originalImage.style.width = "";
   originalImage.style.height = "";
   document.getElementById("cropBox").hidden = true;
+  state.fillColorSampling = false;
   updateCropRotationControl();
+  updateFillColorControl();
   clearCropPreview();
   document.getElementById("cropStatus").textContent = "";
   document.getElementById("cropListHint").hidden = false;
@@ -7177,12 +7929,133 @@ function clampCrop(crop, options = {}) {
 
 function cropExtendsBeyondImage(crop) {
   if (!crop) return false;
+  return cropSourceCorners(crop).some(point => !pointIsInsideImage(point, crop));
+}
+
+function cropSourceCorners(crop) {
   const centerX = crop.candidate_width / 2;
   const centerY = crop.candidate_height / 2;
-  return cropCorners(crop).some(point => {
-    const unrotated = rotatePoint(point, centerX, centerY, -normalizeRotationDegrees(crop.rotation_degrees));
-    return !pointIsInsideImage(unrotated, crop);
-  });
+  return cropCorners(crop).map(point => (
+    rotatePoint(point, centerX, centerY, -normalizeRotationDegrees(crop.rotation_degrees))
+  ));
+}
+
+function minimalFitSizeForCrop(crop) {
+  if (!crop) return 0;
+  const cropCenter = {
+    x: crop.x + crop.size / 2,
+    y: crop.y + crop.size / 2
+  };
+  const imageCenterX = crop.candidate_width / 2;
+  const imageCenterY = crop.candidate_height / 2;
+  const sourceCenter = rotatePoint(
+    cropCenter,
+    imageCenterX,
+    imageCenterY,
+    -normalizeRotationDegrees(crop.rotation_degrees)
+  );
+  const nearestEdgeDistance = Math.min(
+    sourceCenter.x,
+    crop.candidate_width - sourceCenter.x,
+    sourceCenter.y,
+    crop.candidate_height - sourceCenter.y
+  );
+  if (nearestEdgeDistance <= 0) return 0;
+  const radians = normalizeRotationDegrees(crop.rotation_degrees) * Math.PI / 180;
+  const halfSizeExpansion = Math.abs(Math.cos(radians)) + Math.abs(Math.sin(radians));
+  const maximumSize = Math.floor((nearestEdgeDistance * 2) / Math.max(halfSizeExpansion, 0.0001) + 0.0001);
+  const currentParity = Math.abs(Math.round(crop.size)) % 2;
+  const parityMatchedSize = maximumSize % 2 === currentParity ? maximumSize : maximumSize - 1;
+  return Math.max(0, parityMatchedSize);
+}
+
+function minimalFitCrop(crop) {
+  if (!crop) return null;
+  const size = minimalFitSizeForCrop(crop);
+  if (size < 1 || size >= crop.size) return null;
+  const centerX = crop.x + crop.size / 2;
+  const centerY = crop.y + crop.size / 2;
+  return clampCrop({
+    ...crop,
+    x: centerX - size / 2,
+    y: centerY - size / 2,
+    size
+  }, {allowOverflow: true, freePosition: true});
+}
+
+function minimalMoveCrop(crop) {
+  if (!crop) return null;
+  const sourceBounds = boundsForPoints(cropSourceCorners(crop));
+  const interval = {
+    left: -sourceBounds.left,
+    right: crop.candidate_width - sourceBounds.right,
+    top: -sourceBounds.top,
+    bottom: crop.candidate_height - sourceBounds.bottom
+  };
+  if (interval.left > interval.right || interval.top > interval.bottom) return null;
+  const move = closestIntegerCropMove(interval, normalizeRotationDegrees(crop.rotation_degrees));
+  if (!move || (move.dx === 0 && move.dy === 0)) return null;
+  const moved = clampCrop({
+    ...crop,
+    x: crop.x + move.dx,
+    y: crop.y + move.dy
+  }, {allowOverflow: true, freePosition: true});
+  return cropExtendsBeyondImage(moved) ? null : moved;
+}
+
+function closestIntegerCropMove(sourceInterval, rotationDegrees) {
+  const corners = [
+    {x: sourceInterval.left, y: sourceInterval.top},
+    {x: sourceInterval.right, y: sourceInterval.top},
+    {x: sourceInterval.right, y: sourceInterval.bottom},
+    {x: sourceInterval.left, y: sourceInterval.bottom}
+  ].map(point => rotateVector(point, rotationDegrees));
+  const moveBounds = boundsForPoints(corners);
+  const minDx = Math.ceil(moveBounds.left - 0.0001);
+  const maxDx = Math.floor(moveBounds.right + 0.0001);
+  const cos = Math.cos(rotationDegrees * Math.PI / 180);
+  const sin = Math.sin(rotationDegrees * Math.PI / 180);
+  let best = null;
+  for (let dx = minDx; dx <= maxDx; dx += 1) {
+    let minDy = -Infinity;
+    let maxDy = Infinity;
+    const xValueWithoutDy = dx * cos;
+    const yValueWithoutDy = -dx * sin;
+    if (!intersectLinearInterval(sourceInterval.left, sourceInterval.right, xValueWithoutDy, sin, value => { minDy = Math.max(minDy, value.min); maxDy = Math.min(maxDy, value.max); })) continue;
+    if (!intersectLinearInterval(sourceInterval.top, sourceInterval.bottom, yValueWithoutDy, cos, value => { minDy = Math.max(minDy, value.min); maxDy = Math.min(maxDy, value.max); })) continue;
+    if (minDy > maxDy) continue;
+    const dy = nearestIntegerInInterval(minDy, maxDy);
+    if (dy === null) continue;
+    const distanceSquared = dx * dx + dy * dy;
+    if (!best || distanceSquared < best.distanceSquared) best = {dx, dy, distanceSquared};
+  }
+  return best;
+}
+
+function intersectLinearInterval(minAllowed, maxAllowed, base, coefficient, apply) {
+  const epsilon = 0.000001;
+  if (Math.abs(coefficient) < epsilon) return base >= minAllowed - epsilon && base <= maxAllowed + epsilon;
+  const values = [(minAllowed - base) / coefficient, (maxAllowed - base) / coefficient];
+  apply({min: Math.min(...values), max: Math.max(...values)});
+  return true;
+}
+
+function nearestIntegerInInterval(minValue, maxValue) {
+  const minInteger = Math.ceil(minValue - 0.0001);
+  const maxInteger = Math.floor(maxValue + 0.0001);
+  if (minInteger > maxInteger) return null;
+  if (minInteger <= 0 && maxInteger >= 0) return 0;
+  return Math.abs(minInteger) < Math.abs(maxInteger) ? minInteger : maxInteger;
+}
+
+function rotateVector(vector, degrees) {
+  const radians = degrees * Math.PI / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  return {
+    x: vector.x * cos - vector.y * sin,
+    y: vector.x * sin + vector.y * cos
+  };
 }
 
 function cropCorners(crop) {
@@ -7218,6 +8091,43 @@ function rotatePoint(point, centerX, centerY, degrees) {
   };
 }
 
+function imagePointFromPointer(event) {
+  const image = document.getElementById("originalImage");
+  const crop = state.cropDraft;
+  if (!crop || !image.naturalWidth || !image.naturalHeight) return null;
+  const stageRect = image.parentElement.getBoundingClientRect();
+  const stagePoint = {
+    x: event.clientX - stageRect.left,
+    y: event.clientY - stageRect.top
+  };
+  const displayWidth = parseFloat(image.style.width) || image.clientWidth;
+  const displayHeight = parseFloat(image.style.height) || image.clientHeight;
+  const originX = parseFloat(image.style.left) || 0;
+  const originY = parseFloat(image.style.top) || 0;
+  if (!displayWidth || !displayHeight) return null;
+  const unrotated = rotatePoint(
+    stagePoint,
+    originX + displayWidth / 2,
+    originY + displayHeight / 2,
+    -normalizeRotationDegrees(crop.rotation_degrees)
+  );
+  const imageX = (unrotated.x - originX) / displayWidth * image.naturalWidth;
+  const imageY = (unrotated.y - originY) / displayHeight * image.naturalHeight;
+  const epsilon = 0.01;
+  if (
+    imageX < -epsilon
+    || imageY < -epsilon
+    || imageX > image.naturalWidth + epsilon
+    || imageY > image.naturalHeight + epsilon
+  ) {
+    return null;
+  }
+  return {
+    x: Math.max(0, Math.min(image.naturalWidth - 1, imageX)),
+    y: Math.max(0, Math.min(image.naturalHeight - 1, imageY))
+  };
+}
+
 function pointIsInsideImage(point, crop) {
   const epsilon = 0.01;
   return point.x >= -epsilon
@@ -7244,6 +8154,10 @@ function defaultFillColor() {
 function normalizeFillColor(value) {
   const text = String(value || "").trim();
   return /^#[0-9a-fA-F]{6}$/.test(text) ? text.toLowerCase() : "";
+}
+
+function colorToHex(red, green, blue) {
+  return `#${[red, green, blue].map(value => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0")).join("")}`;
 }
 
 function normalizeRotationDegrees(value) {
@@ -7401,21 +8315,125 @@ function updateFillColorControl() {
   const input = document.getElementById("cropFillColor");
   const indicator = document.getElementById("cropFillIndicator");
   const sizeFrame = document.getElementById("cropSizeSliderFrame");
+  const sampleButton = document.getElementById("fillColorSampleButton");
+  const minimalFitButton = document.getElementById("minimalFitButton");
+  const minimalMoveButton = document.getElementById("minimalMoveButton");
   if (!state.cropDraft) {
+    state.fillColorSampling = false;
     control.classList.remove("active");
     indicator.classList.remove("active");
     sizeFrame.classList.remove("fill-active");
     sizeFrame.title = "";
     input.disabled = true;
+    sampleButton.disabled = true;
+    sampleButton.classList.remove("is-active");
+    minimalFitButton.disabled = true;
+    minimalMoveButton.disabled = true;
     return;
   }
   const hasFill = cropExtendsBeyondImage(state.cropDraft);
+  const image = document.getElementById("originalImage");
+  if (!image.naturalWidth || !image.naturalHeight) state.fillColorSampling = false;
   input.disabled = false;
   input.value = normalizeFillColor(state.cropDraft.fill_color) || defaultFillColor();
+  sampleButton.disabled = !image.naturalWidth || !image.naturalHeight;
+  sampleButton.classList.toggle("is-active", state.fillColorSampling);
+  minimalFitButton.disabled = !hasFill;
+  minimalMoveButton.disabled = !hasFill;
   control.classList.toggle("active", hasFill);
   indicator.classList.toggle("active", hasFill);
   sizeFrame.classList.toggle("fill-active", hasFill);
   sizeFrame.title = hasFill ? "Crop includes fill outside the original image." : "";
+}
+
+function minimalFitCurrentCrop() {
+  if (!state.cropDraft || !cropExtendsBeyondImage(state.cropDraft)) return;
+  const fitted = minimalFitCrop(state.cropDraft);
+  if (!fitted) {
+    document.getElementById("cropStatus").textContent = "Crop cannot fit without moving its center.";
+    return;
+  }
+  state.cropDraft = fitted;
+  updateCropSizeControl();
+  positionCropBox();
+  document.getElementById("cropStatus").textContent = "Crop resized to fit inside the original photo.";
+}
+
+function minimalMoveCurrentCrop() {
+  if (!state.cropDraft || !cropExtendsBeyondImage(state.cropDraft)) return;
+  const moved = minimalMoveCrop(state.cropDraft);
+  if (!moved) {
+    document.getElementById("cropStatus").textContent = "Crop cannot fit at this size; use Minimal fit or reduce the crop size.";
+    return;
+  }
+  state.cropDraft = moved;
+  positionCropBox();
+  document.getElementById("cropStatus").textContent = "Crop moved to fit inside the original photo.";
+}
+
+function toggleFillColorSampler() {
+  if (!state.cropDraft) return;
+  const image = document.getElementById("originalImage");
+  if (!image.naturalWidth || !image.naturalHeight) return;
+  state.fillColorSampling = !state.fillColorSampling;
+  updateFillColorControl();
+  document.getElementById("cropStatus").textContent = state.fillColorSampling
+    ? "Click the original photo to sample a 3x3 average fill color."
+    : "Fill color sampler canceled.";
+}
+
+function sampleFillColorFromPointer(event) {
+  if (!state.fillColorSampling || !state.cropDraft) return false;
+  event.preventDefault();
+  const point = imagePointFromPointer(event);
+  if (!point) {
+    document.getElementById("cropStatus").textContent = "Click directly on the original photo to sample its color.";
+    return true;
+  }
+  const color = sampledImageColor(point);
+  state.fillColorSampling = false;
+  if (!color) {
+    document.getElementById("cropStatus").textContent = "Could not read the selected image color.";
+    updateFillColorControl();
+    return true;
+  }
+  state.cropDraft.fill_color = color;
+  updateFillColorControl();
+  updateCropPreview();
+  document.getElementById("cropStatus").textContent = `Fill color sampled from original pixels: ${color}.`;
+  return true;
+}
+
+function sampledImageColor(point) {
+  const image = document.getElementById("originalImage");
+  if (!image.naturalWidth || !image.naturalHeight) return "";
+  const centerX = Math.round(point.x);
+  const centerY = Math.round(point.y);
+  const left = Math.max(0, centerX - 1);
+  const top = Math.max(0, centerY - 1);
+  const right = Math.min(image.naturalWidth - 1, centerX + 1);
+  const bottom = Math.min(image.naturalHeight - 1, centerY + 1);
+  const width = right - left + 1;
+  const height = bottom - top + 1;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", {willReadFrequently: true});
+  context.drawImage(image, left, top, width, height, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height).data;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let alpha = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    const weight = pixels[index + 3] / 255;
+    red += pixels[index] * weight;
+    green += pixels[index + 1] * weight;
+    blue += pixels[index + 2] * weight;
+    alpha += weight;
+  }
+  if (alpha <= 0) return "";
+  return colorToHex(red / alpha, green / alpha, blue / alpha);
 }
 
 async function estimateCropForCurrentCandidate() {
@@ -7467,7 +8485,8 @@ async function saveCropForCurrentCandidate() {
     state.cropDraft = savedCropForCandidate(state.selectedCandidate) || state.cropDraft;
     renderCropEditor();
     document.getElementById("cropStatus").textContent = "Crop offsets staged.";
-    await loadEntries(document.getElementById("cropFilter").value === "missing" ? nextEntryId : state.currentEntry.entry_id);
+    const cropFilter = document.getElementById("cropFilter").value;
+    await loadEntries(["missing", "estimated"].includes(cropFilter) ? nextEntryId : state.currentEntry.entry_id);
   } catch (error) {
     document.getElementById("cropStatus").textContent = error.message;
   } finally {
@@ -7571,7 +8590,7 @@ function cropLabel(candidate) {
 
 function savedCropSourceLabel(candidate) {
   const source = String(candidate?.review_crop_source || "").trim().toLowerCase();
-  if (source === "estimated") return "Batch estimate";
+  if (source === "estimated") return "Saved estimate";
   if (source === "manual") return "Manual crop";
   return "Saved crop";
 }
@@ -7630,14 +8649,21 @@ function escapeHtml(value) {
 document.getElementById("cropSizeSlider").oninput = event => resizeCropDraft(event.target.value);
 document.getElementById("cropRotationSlider").oninput = event => fineRotateCropDraft(event.target.value);
 document.getElementById("rotateQuarterTurnButton").onclick = rotateCropDraftByQuarterTurn;
+document.getElementById("fillColorSampleButton").onclick = toggleFillColorSampler;
+document.getElementById("minimalFitButton").onclick = minimalFitCurrentCrop;
+document.getElementById("minimalMoveButton").onclick = minimalMoveCurrentCrop;
 document.getElementById("cropFilter").onchange = () => loadEntries();
 document.getElementById("suggestCropButton").onclick = estimateCropForCurrentCandidate;
 document.getElementById("resetCropButton").onclick = resetCropForCurrentCandidate;
 document.getElementById("rejectOriginalButton").onclick = rejectOriginalForCurrentCrop;
 document.getElementById("saveCropButton").onclick = saveCropForCurrentCandidate;
 document.getElementById("commitCropButton").onclick = commitStagedCrops;
+document.getElementById("originalImage").onpointerdown = event => {
+  sampleFillColorFromPointer(event);
+};
 document.getElementById("cropBox").onpointerdown = event => {
   if (!state.cropDraft) return;
+  if (sampleFillColorFromPointer(event)) return;
   event.preventDefault();
   const image = document.getElementById("originalImage");
   const scale = Math.min(

@@ -96,7 +96,64 @@ class Project365DiariumExporterTests(unittest.TestCase):
             self.assertEqual(rows[0]["text_present"], "true")
             self.assertEqual(rows[1]["text_present"], "false")
 
-    def test_generate_dayone_package_requires_available_square_derivatives(self) -> None:
+    def test_generate_dayone_package_exports_associated_derivatives_after_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            output_dir = canonical_root / "exports" / "diarium_import_batches"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _insert_derivative(
+                canonical_root=canonical_root,
+                entry_id="project365:1998-04-12",
+                policy=diarium_exporter.DEFAULT_DERIVATIVE_POLICY,
+                payload=_jpeg_with_dimensions(width=12, height=12),
+            )
+            _insert_associated_derivative(
+                canonical_root=canonical_root,
+                entry_id="project365:1998-04-12",
+                policy=diarium_exporter.DEFAULT_DERIVATIVE_POLICY,
+                payload=_jpeg_with_dimensions(width=7, height=7),
+                associated_entry_date="1998-04-13",
+            )
+
+            summary = diarium_exporter.generate_diarium_dayone_package(
+                canonical_root=canonical_root,
+                output_dir=output_dir,
+                package_name="pilot.zip",
+                start_date="1998-04-01",
+                end_date="1998-04-30",
+                limit=20,
+            )
+
+            self.assertEqual(summary.entry_count, 1)
+            self.assertEqual(summary.media_count, 2)
+            with zipfile.ZipFile(summary.package_path) as archive:
+                payload = json.loads(archive.read("Journal.json").decode("utf-8"))
+                photo_names = [name for name in archive.namelist() if name.startswith("photos/")]
+            self.assertEqual(len(photo_names), 2)
+            photos = payload["entries"][0]["photos"]
+            self.assertEqual([photo["orderInEntry"] for photo in photos], [0, 1])
+            self.assertEqual((photos[0]["width"], photos[0]["height"]), (12, 12))
+            self.assertEqual((photos[1]["width"], photos[1]["height"]), (7, 7))
+
+            with Path(summary.manifest_path).open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["media_role"] for row in rows], ["diarium_derivative", "diarium_associated_derivative"])
+            self.assertEqual([row["photo_order"] for row in rows], ["0", "1"])
+            self.assertEqual(rows[1]["source_media_asset_id"], "associated-source")
+            self.assertEqual(rows[1]["source_media_role"], "associated")
+            self.assertEqual(rows[1]["associated_entry_date"], "1998-04-13")
+
+    def test_generate_dayone_package_requires_at_least_one_available_square_derivative(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             import_dir = base / "Import"
@@ -112,7 +169,7 @@ class Project365DiariumExporterTests(unittest.TestCase):
                 canonical_root=canonical_root,
             )
 
-            with self.assertRaisesRegex(ValueError, "Missing available square derivatives"):
+            with self.assertRaisesRegex(ValueError, "No exportable Project365 entries"):
                 diarium_exporter.generate_diarium_dayone_package(
                     canonical_root=canonical_root,
                     output_dir=output_dir,
@@ -121,6 +178,47 @@ class Project365DiariumExporterTests(unittest.TestCase):
                     end_date="1998-04-30",
                     limit=20,
                 )
+
+    def test_generate_dayone_package_skips_entries_without_available_derivatives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            output_dir = canonical_root / "exports" / "diarium_import_batches"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {
+                    "1998-04-12.png": _tiny_png(),
+                    "1998-04-13.png": _tiny_png(),
+                },
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _insert_derivative(
+                canonical_root=canonical_root,
+                entry_id="project365:1998-04-12",
+                policy=diarium_exporter.DEFAULT_DERIVATIVE_POLICY,
+                payload=_jpeg_with_dimensions(width=12, height=12),
+            )
+
+            summary = diarium_exporter.generate_diarium_dayone_package(
+                canonical_root=canonical_root,
+                output_dir=output_dir,
+                package_name="pilot.zip",
+                start_date="1998-04-01",
+                end_date="1998-04-30",
+                limit=20,
+            )
+
+            self.assertEqual(summary.entry_count, 1)
+            self.assertEqual(summary.skipped_entry_count, 1)
+            self.assertEqual(summary.skipped_entry_dates, ("1998-04-13",))
+            with zipfile.ZipFile(summary.package_path) as archive:
+                payload = json.loads(archive.read("Journal.json").decode("utf-8"))
+            self.assertEqual(len(payload["entries"]), 1)
 
     def test_generate_dayone_package_rejects_non_square_derivative(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -177,7 +275,7 @@ class Project365DiariumExporterTests(unittest.TestCase):
                 transformation={},
             )
 
-            with self.assertRaisesRegex(ValueError, "Missing derivative crop metadata"):
+            with self.assertRaisesRegex(ValueError, "No exportable Project365 entries"):
                 diarium_exporter.generate_diarium_dayone_package(
                     canonical_root=canonical_root,
                     output_dir=output_dir,
@@ -301,6 +399,97 @@ def _insert_derivative(
                 hashlib.sha256(payload).hexdigest(),
                 len(payload),
                 json.dumps(transformation, sort_keys=True),
+                import_batch_id,
+            ),
+        )
+
+
+def _insert_associated_derivative(
+    canonical_root: Path,
+    entry_id: str,
+    policy: str,
+    payload: bytes,
+    associated_entry_date: str,
+) -> None:
+    source_path = canonical_root / "media" / "associated_sources" / "associated.jpg"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(payload)
+    derivative_path = canonical_root / "media" / "diarium_derivatives" / policy / "associated.jpg"
+    derivative_path.parent.mkdir(parents=True, exist_ok=True)
+    derivative_path.write_bytes(payload)
+    source_transformation = {
+        "source": "external_original_associated_photo",
+        "associated_entry_date": associated_entry_date,
+        "associated_date_source": "manual",
+        "original_is_read_only": True,
+    }
+    derivative_transformation = {
+        "source_media_asset_id": "associated-source",
+        "source_role": "associated",
+        "derivative_role": "diarium_associated_derivative",
+        "crop": {
+            "x": 0,
+            "y": 0,
+            "size": 1,
+            "candidate_width": 1,
+            "candidate_height": 1,
+            "source": "manual",
+            "unit": "source_pixels",
+            "shape": "square",
+        },
+    }
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        source_file_id, import_batch_id = connection.execute(
+            """
+            SELECT source_file_id, import_batch_id
+            FROM media_assets
+            WHERE entry_id = ? AND selected_default = 1
+            """,
+            (entry_id,),
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'external_original_associated_photo', ?, ?, ?, ?, ?,
+                    'image/jpeg', 'available', 'confirmed', 0, ?, ?,
+                    '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')
+            """,
+            (
+                "associated-source",
+                entry_id,
+                source_file_id,
+                source_path.name,
+                str(source_path),
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+                json.dumps(source_transformation, sort_keys=True),
+                import_batch_id,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'diarium_associated_derivative', ?, ?, ?, ?, ?,
+                    'image/jpeg', 'available', 'unreviewed', 0, ?, ?,
+                    '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')
+            """,
+            (
+                f"associated-source:diarium_associated_derivative:{policy}",
+                entry_id,
+                source_file_id,
+                derivative_path.name,
+                str(derivative_path),
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+                json.dumps(derivative_transformation, sort_keys=True),
                 import_batch_id,
             ),
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -30,6 +31,7 @@ class Project365TagEnrichmentTests(unittest.TestCase):
                 import_dir=import_dir,
                 canonical_root=canonical_root,
             )
+            _insert_derivative(canonical_root, "project365:1998-04-12")
             review_csv = base / "tag_review.csv"
             review_csv.write_text(
                 "\n".join(
@@ -127,6 +129,71 @@ def _write_zip(path: Path, members: dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name, payload in members.items():
             archive.writestr(name, payload)
+
+
+def _insert_derivative(canonical_root: Path, entry_id: str) -> None:
+    policy = diarium_exporter.DEFAULT_DERIVATIVE_POLICY
+    payload = _jpeg_with_dimensions(12, 12)
+    filename = f"{entry_id.replace(':', '_')}.jpg"
+    derivative_path = canonical_root / "media" / "diarium_derivatives" / policy / filename
+    derivative_path.parent.mkdir(parents=True, exist_ok=True)
+    derivative_path.write_bytes(payload)
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        source_file_id, import_batch_id = connection.execute(
+            """
+            SELECT source_file_id, import_batch_id
+            FROM media_assets
+            WHERE entry_id = ? AND selected_default = 1
+            """,
+            (entry_id,),
+        ).fetchone()
+        transformation = {
+            "crop": {
+                "x": 0,
+                "y": 0,
+                "size": 1,
+                "candidate_width": 1,
+                "candidate_height": 1,
+                "source": "manual",
+                "unit": "source_pixels",
+                "shape": "square",
+            }
+        }
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'diarium_derivative', ?, ?, ?, ?, ?, 'image/jpeg',
+                    'available', 'unreviewed', 0, ?, ?, '2026-08-17T00:00:00Z',
+                    '2026-08-17T00:00:00Z')
+            """,
+            (
+                f"{entry_id}:diarium_derivative:{policy}",
+                entry_id,
+                source_file_id,
+                derivative_path.name,
+                str(derivative_path),
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+                json.dumps(transformation, sort_keys=True),
+                import_batch_id,
+            ),
+        )
+
+
+def _jpeg_with_dimensions(width: int, height: int) -> bytes:
+    sof = (
+        b"\xff\xc0"
+        + (17).to_bytes(2, "big")
+        + b"\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00"
+    )
+    return b"\xff\xd8" + sof + b"\xff\xd9"
 
 
 def _tiny_png() -> bytes:

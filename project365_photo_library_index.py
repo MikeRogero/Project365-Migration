@@ -108,6 +108,11 @@ def main() -> int:
         help="Clear existing indexed rows before scanning.",
     )
     parser.add_argument(
+        "--prune-contained-roots",
+        action="store_true",
+        help="Relabel indexed rows from child roots to indexed parent roots without rescanning files.",
+    )
+    parser.add_argument(
         "--entry-date",
         action="append",
         default=[],
@@ -135,6 +140,13 @@ def main() -> int:
         if queue_path.exists():
             enriched = enrich_candidate_queue(index_db, queue_path)
             print(f"Picker candidates updated with capture time: {enriched}")
+    if args.prune_contained_roots:
+        prune_summary = prune_contained_index_roots(index_db)
+        print("Project365 photo-library contained-root pruning: PASS")
+        print(f"Index DB: {index_db}")
+        print(f"Roots before: {prune_summary['roots_before']}")
+        print(f"Roots after: {prune_summary['roots_after']}")
+        print(f"Rows relabeled: {prune_summary['rows_relabelled']}")
     for entry_date in args.entry_date:
         for candidate in query_index_candidates(index_db, {entry_date}).get(entry_date, []):
             print(candidate["candidate_path"])
@@ -153,18 +165,22 @@ def build_photo_library_index(
     reset: bool = False,
     progress_every: int = 0,
 ) -> IndexSummary:
+    index_roots = _canonical_index_roots(index_roots)
     for root in index_roots:
         if not root.exists():
             raise FileNotFoundError(f"Missing index root: {root}")
     index_db.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(index_db)
+    connection = sqlite3.connect(index_db, timeout=60)
     try:
         _initialize_schema(connection)
+        connection.execute("PRAGMA busy_timeout = 60000")
         started_at = dt.datetime.now(dt.UTC).isoformat()
         if reset:
             _reset_index(connection)
+        else:
+            _relabel_indexed_child_roots(connection, index_roots)
         file_count_before = _indexed_file_count(connection)
-        indexed_snapshot = {} if reset else _indexed_file_snapshot(connection)
+        indexed_snapshot = {} if reset else _indexed_file_snapshot(connection, index_roots)
         scanned = 0
         indexed = 0
         skipped = 0
@@ -240,6 +256,27 @@ def build_photo_library_index(
         connection.close()
 
 
+def prune_contained_index_roots(index_db: Path) -> dict[str, int]:
+    if not index_db.exists():
+        return {"roots_before": 0, "roots_after": 0, "rows_relabelled": 0}
+    connection = sqlite3.connect(index_db, timeout=60)
+    try:
+        _initialize_schema(connection)
+        connection.execute("PRAGMA busy_timeout = 60000")
+        roots_before = _indexed_roots(connection)
+        canonical_roots = _canonical_index_roots([Path(root) for root in roots_before])
+        rows_relabelled = _relabel_indexed_child_roots(connection, canonical_roots)
+        connection.commit()
+        roots_after = _indexed_roots(connection)
+        return {
+            "roots_before": len(roots_before),
+            "roots_after": len(roots_after),
+            "rows_relabelled": rows_relabelled,
+        }
+    finally:
+        connection.close()
+
+
 def query_index_candidates(
     index_db: Path,
     target_dates: set[str],
@@ -258,8 +295,9 @@ def query_index_candidates(
     if include_filesystem_dates and not filename_dates_only:
         date_sources.append("filesystem_date")
     source_placeholders = ", ".join("?" for _ in date_sources)
-    connection = sqlite3.connect(index_db)
+    connection = sqlite3.connect(index_db, timeout=60)
     try:
+        connection.execute("PRAGMA busy_timeout = 60000")
         connection.row_factory = sqlite3.Row
         _initialize_schema(connection)
         candidates_by_date: dict[str, list[dict[str, object]]] = {}
@@ -352,6 +390,49 @@ def query_index_candidates(
 def _folder_path_prefix(folder_root: Path) -> str:
     resolved = str(folder_root.expanduser().resolve())
     return resolved if resolved.endswith(os.sep) else f"{resolved}{os.sep}"
+
+
+def _canonical_index_roots(index_roots: list[Path]) -> list[Path]:
+    roots: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for root in index_roots:
+        stored_root = root.expanduser()
+        resolved = stored_root.resolve()
+        root_text = str(resolved)
+        if root_text in seen:
+            continue
+        seen.add(root_text)
+        roots.append((stored_root, root_text))
+    redundant: set[str] = set()
+    root_texts = [resolved for _, resolved in roots]
+    for root_text in root_texts:
+        for possible_parent in root_texts:
+            if root_text != possible_parent and _path_is_within(root_text, possible_parent):
+                redundant.add(root_text)
+                break
+    return [stored_root for stored_root, resolved in roots if resolved not in redundant]
+
+
+def _path_is_within(path_text: str, parent_text: str) -> bool:
+    parent_prefix = parent_text if parent_text.endswith(os.sep) else f"{parent_text}{os.sep}"
+    return path_text.startswith(parent_prefix)
+
+
+def _relabel_indexed_child_roots(connection: sqlite3.Connection, index_roots: list[Path]) -> int:
+    root_pairs = [(str(root), str(root.resolve())) for root in index_roots]
+    if not root_pairs:
+        return 0
+    updates: list[tuple[str, str]] = []
+    for path_text, root_text in connection.execute("SELECT path, root FROM photo_library_files"):
+        path_text = str(path_text)
+        root_text = str(root_text or "")
+        for stored_root, resolved_root in root_pairs:
+            if root_text != stored_root and _path_is_within(path_text, resolved_root):
+                updates.append((stored_root, path_text))
+                break
+    if updates:
+        connection.executemany("UPDATE photo_library_files SET root = ? WHERE path = ?", updates)
+    return len(updates)
 
 
 def _candidate_date_tiers(target_date: str) -> list[list[str]]:
@@ -449,16 +530,50 @@ def _indexed_file_count(connection: sqlite3.Connection) -> int:
     return int(connection.execute("SELECT COUNT(*) FROM photo_library_files").fetchone()[0])
 
 
-def _indexed_file_snapshot(connection: sqlite3.Connection) -> dict[str, tuple[str, str, str]]:
-    return {
-        str(path): (str(mtime or ""), str(metadata_version or ""), str(sha256 or ""))
-        for path, mtime, metadata_version, sha256 in connection.execute(
+def _indexed_roots(connection: sqlite3.Connection) -> list[str]:
+    return [
+        str(row[0])
+        for row in connection.execute(
             """
-            SELECT path, filesystem_mtime_utc, metadata_version, sha256
+            SELECT root
             FROM photo_library_files
+            WHERE root != ''
+            GROUP BY root
+            ORDER BY root
             """
         )
-    }
+        if str(row[0]).strip()
+    ]
+
+
+def _indexed_file_snapshot(
+    connection: sqlite3.Connection,
+    index_roots: list[Path] | None = None,
+) -> dict[str, tuple[str, str, str]]:
+    root_prefixes = []
+    for root in index_roots or []:
+        root_text = str(root.resolve())
+        root_prefixes.append(root_text if root_text.endswith(os.sep) else f"{root_text}{os.sep}")
+    query = """
+        SELECT path, filesystem_mtime_utc, metadata_version, sha256
+        FROM photo_library_files
+    """
+    params: list[str] = []
+    if root_prefixes:
+        clauses = []
+        for prefix in root_prefixes:
+            clauses.append("path LIKE ? ESCAPE '\\'")
+            params.append(f"{_sqlite_like_escape(prefix)}%")
+        query += " WHERE " + " OR ".join(clauses)
+    snapshot: dict[str, tuple[str, str, str]] = {}
+    for path, mtime, metadata_version, sha256 in connection.execute(query, params):
+        path_text = str(path)
+        snapshot[path_text] = (str(mtime or ""), str(metadata_version or ""), str(sha256 or ""))
+    return snapshot
+
+
+def _sqlite_like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _can_skip_indexed_file(snapshot: tuple[str, str, str] | None, filesystem_mtime_utc: str) -> bool:
@@ -683,8 +798,9 @@ def enrich_candidate_queue(index_db: Path, queue_path: Path) -> int:
         }
     )
     metadata: dict[str, tuple[str, str]] = {}
-    connection = sqlite3.connect(index_db)
+    connection = sqlite3.connect(index_db, timeout=60)
     try:
+        connection.execute("PRAGMA busy_timeout = 60000")
         for start in range(0, len(candidate_paths), 500):
             chunk = candidate_paths[start : start + 500]
             placeholders = ", ".join("?" for _ in chunk)

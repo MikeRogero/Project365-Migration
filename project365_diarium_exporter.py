@@ -23,6 +23,7 @@ from project365_tag_enrichment import load_exportable_diarium_tags
 
 NAMESPACE = uuid.UUID("c4d9f898-190f-4c0c-b87e-000000a36500")
 DEFAULT_TIME_ZONE = "Asia/Taipei"
+EXPORTABLE_SOURCE_APPS = ("project365", "project365_enrichment")
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class DiariumExportSummary:
     manifest_path: str
     entry_count: int
     media_count: int
+    skipped_entry_count: int = 0
+    skipped_entry_dates: tuple[str, ...] = ()
 
 
 def main() -> int:
@@ -95,6 +98,9 @@ def main() -> int:
     print(f"Manifest: {summary.manifest_path}")
     print(f"Entries: {summary.entry_count}")
     print(f"Media assets: {summary.media_count}")
+    print(f"Skipped entries: {summary.skipped_entry_count}")
+    if summary.skipped_entry_dates:
+        print(f"Skipped dates: {', '.join(summary.skipped_entry_dates)}")
     return 0
 
 
@@ -123,30 +129,30 @@ def generate_diarium_dayone_package(
     package_path = output_dir / package_name
     manifest_path = output_dir / f"{Path(package_name).stem}_manifest.csv"
 
-    rows = _load_entries(db_path, start_date, end_date, limit, derivative_policy)
-    if not rows:
+    entries = _load_entries(db_path, start_date, end_date, limit, derivative_policy)
+    if not entries:
         raise ValueError("No canonical entries matched the requested date range")
-    missing_derivatives = [row["entry_id"] for row in rows if not row["storage_path"]]
-    if missing_derivatives:
-        preview = ", ".join(missing_derivatives[:10])
-        suffix = "" if len(missing_derivatives) <= 10 else f", and {len(missing_derivatives) - 10} more"
-        raise ValueError(f"Missing available square derivatives for Project365 entries: {preview}{suffix}")
-    missing_crop_metadata = [
-        row["entry_id"]
-        for row in rows
-        if not _has_derivative_crop_metadata(row.get("media_transformation_json"))
-    ]
-    if missing_crop_metadata:
-        preview = ", ".join(missing_crop_metadata[:10])
-        suffix = "" if len(missing_crop_metadata) <= 10 else f", and {len(missing_crop_metadata) - 10} more"
-        raise ValueError(f"Missing derivative crop metadata for Project365 entries: {preview}{suffix}")
+
+    exportable_entries = []
+    skipped_dates = []
+    for entry in entries:
+        skip_reason = _entry_skip_reason(entry)
+        if skip_reason:
+            skipped_dates.append(str(entry["entry_date"]))
+            continue
+        exportable_entries.append(entry)
+    if not exportable_entries:
+        preview = ", ".join(skipped_dates[:10])
+        suffix = "" if len(skipped_dates) <= 10 else f", and {len(skipped_dates) - 10} more"
+        raise ValueError(f"No exportable Project365 entries in requested range; skipped dates: {preview}{suffix}")
+
     tags_by_entry = load_exportable_diarium_tags(
         db_path,
-        [row["entry_id"] for row in rows],
+        [entry["entry_id"] for entry in exportable_entries],
     )
     locations_by_entry = load_exportable_locations(
         db_path,
-        [row["entry_id"] for row in rows],
+        [entry["entry_id"] for entry in exportable_entries],
     )
 
     entries_json: list[dict[str, object]] = []
@@ -154,22 +160,22 @@ def generate_diarium_dayone_package(
     media_count = 0
     zip_payloads: dict[str, bytes] = {}
 
-    for row in rows:
-        entry_id = row["entry_id"]
-        entry_date = row["entry_date"]
+    for entry in exportable_entries:
+        entry_id = entry["entry_id"]
+        entry_date = entry["entry_date"]
         creation_date = _creation_date_utc(entry_date, time_zone)
         entry_uuid = str(uuid.uuid5(NAMESPACE, entry_id)).upper()
-        text = row["original_text"] or ""
+        text = entry["original_text"] or ""
         tags = tags_by_entry.get(entry_id, ["source:project365"])
         photos: list[dict[str, object]] = []
 
-        if row["storage_path"]:
-            media_payload = Path(row["storage_path"]).read_bytes()
+        for order, media in enumerate(entry["media"]):
+            media_payload = Path(media["storage_path"]).read_bytes()
             media_md5 = hashlib.md5(media_payload).hexdigest()
-            media_ext = _dayone_extension(row["mime_type"], row["storage_path"])
+            media_ext = _dayone_extension(media["mime_type"], media["storage_path"])
             media_type = _dayone_photo_type(media_ext)
             media_identifier = uuid.uuid5(
-                NAMESPACE, f"{entry_id}:{row['media_asset_id']}:0"
+                NAMESPACE, f"{entry_id}:{media['media_asset_id']}:{order}"
             ).hex.upper()
             photo_zip_name = f"photos/{media_md5}.{media_ext}"
             zip_payloads[photo_zip_name] = media_payload
@@ -182,7 +188,7 @@ def generate_diarium_dayone_package(
                     "type": media_type,
                     "identifier": media_identifier,
                     "md5": media_md5,
-                    "orderInEntry": 0,
+                    "orderInEntry": order,
                     "fileSize": len(media_payload),
                     "width": width,
                     "height": height,
@@ -190,6 +196,23 @@ def generate_diarium_dayone_package(
                 }
             )
             media_count += 1
+            manifest_rows.append(
+                {
+                    "entry_id": entry_id,
+                    "entry_date": entry_date,
+                    "creation_date_utc": creation_date,
+                    "dayone_uuid": entry_uuid,
+                    "photo_order": order,
+                    "media_asset_id": media["media_asset_id"] or "",
+                    "media_role": media["media_role"] or "",
+                    "media_sha256": media["media_sha256"] or "",
+                    "source_media_asset_id": media["source_media_asset_id"] or "",
+                    "source_media_role": media["source_media_role"] or "",
+                    "associated_entry_date": media["associated_entry_date"] or "",
+                    "photo_zip_path": photo_zip_name,
+                    "text_present": str(entry["original_text"] is not None).lower(),
+                }
+            )
 
         entry_json: dict[str, object] = {
             "uuid": entry_uuid,
@@ -203,20 +226,6 @@ def generate_diarium_dayone_package(
         if photos:
             entry_json["photos"] = photos
         entries_json.append(entry_json)
-
-        manifest_rows.append(
-            {
-                "entry_id": entry_id,
-                "entry_date": entry_date,
-                "creation_date_utc": creation_date,
-                "dayone_uuid": entry_uuid,
-                "media_asset_id": row["media_asset_id"] or "",
-                "media_role": row["media_role"] or "",
-                "media_sha256": row["media_sha256"] or "",
-                "photo_zip_path": photo_zip_name if row["storage_path"] else "",
-                "text_present": str(row["original_text"] is not None).lower(),
-            }
-        )
 
     dayone_payload = {
         "metadata": {"version": "1.0"},
@@ -236,9 +245,13 @@ def generate_diarium_dayone_package(
             "entry_date",
             "creation_date_utc",
             "dayone_uuid",
+            "photo_order",
             "media_asset_id",
             "media_role",
             "media_sha256",
+            "source_media_asset_id",
+            "source_media_role",
+            "associated_entry_date",
             "photo_zip_path",
             "text_present",
         ]
@@ -251,7 +264,23 @@ def generate_diarium_dayone_package(
         manifest_path=str(manifest_path),
         entry_count=len(entries_json),
         media_count=media_count,
+        skipped_entry_count=len(skipped_dates),
+        skipped_entry_dates=tuple(skipped_dates),
     )
+
+
+def _entry_skip_reason(entry: dict[str, object]) -> str:
+    media_rows = entry.get("media", [])
+    if not isinstance(media_rows, list):
+        return "missing available square derivative"
+    if not any(media.get("media_role") == "diarium_derivative" for media in media_rows):
+        return "missing available square derivative"
+    if any(
+        not _has_derivative_crop_metadata(media.get("media_transformation_json"))
+        for media in media_rows
+    ):
+        return "missing derivative crop metadata"
+    return ""
 
 
 def _load_entries(
@@ -264,34 +293,95 @@ def _load_entries(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT
-                entries.id AS entry_id,
-                entries.entry_date,
-                entries.original_text,
-                preferred_media.id AS media_asset_id,
-                preferred_media.role AS media_role,
-                preferred_media.storage_path AS storage_path,
-                preferred_media.sha256 AS media_sha256,
-                preferred_media.mime_type AS mime_type,
-                preferred_media.transformation_json AS media_transformation_json
-            FROM entries
-            LEFT JOIN media_assets AS preferred_media
-                ON preferred_media.entry_id = entries.id
-                AND preferred_media.role = 'diarium_derivative'
-                AND preferred_media.id = entries.id || ':diarium_derivative:' || ?
-                AND preferred_media.status = 'available'
-            WHERE entries.source_app = 'project365'
-                AND entries.entry_date BETWEEN ? AND ?
-            ORDER BY entries.entry_date, entries.id
-            LIMIT ?
-            """,
-            (derivative_policy, start_date, end_date, limit),
-        )
-        return [dict(row) for row in rows]
+        entry_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT
+                    entries.id AS entry_id,
+                    entries.entry_date,
+                    entries.original_text
+                FROM entries
+                WHERE entries.source_app IN ('project365', 'project365_enrichment')
+                    AND entries.entry_date BETWEEN ? AND ?
+                ORDER BY entries.entry_date, entries.id
+                LIMIT ?
+                """,
+                (start_date, end_date, limit),
+            ).fetchall()
+        ]
+        if not entry_rows:
+            return []
+        media_by_entry = _load_entry_media(connection, [row["entry_id"] for row in entry_rows], derivative_policy)
+        return [
+            {
+                **entry,
+                "media": media_by_entry.get(str(entry["entry_id"]), []),
+            }
+            for entry in entry_rows
+        ]
     finally:
         connection.close()
+
+
+def _load_entry_media(
+    connection: sqlite3.Connection,
+    entry_ids: list[str],
+    derivative_policy: str,
+) -> dict[str, list[dict[str, object]]]:
+    placeholders = ",".join("?" for _ in entry_ids)
+    rows = connection.execute(
+        f"""
+            WITH derivative_rows AS (
+                SELECT
+                    media_assets.entry_id,
+                    media_assets.id AS media_asset_id,
+                    media_assets.role AS media_role,
+                    media_assets.storage_path,
+                    media_assets.sha256 AS media_sha256,
+                    media_assets.mime_type,
+                    media_assets.transformation_json AS media_transformation_json,
+                    json_extract(media_assets.transformation_json, '$.source_media_asset_id') AS source_media_asset_id,
+                    json_extract(media_assets.transformation_json, '$.source_role') AS source_media_role,
+                    '' AS associated_entry_date,
+                    0 AS media_order
+                FROM media_assets
+                WHERE media_assets.entry_id IN ({placeholders})
+                    AND media_assets.role = 'diarium_derivative'
+                    AND media_assets.id = media_assets.entry_id || ':diarium_derivative:' || ?
+                    AND media_assets.status = 'available'
+                UNION ALL
+                SELECT
+                    media_assets.entry_id,
+                    media_assets.id AS media_asset_id,
+                    media_assets.role AS media_role,
+                    media_assets.storage_path,
+                    media_assets.sha256 AS media_sha256,
+                    media_assets.mime_type,
+                    media_assets.transformation_json AS media_transformation_json,
+                    json_extract(media_assets.transformation_json, '$.source_media_asset_id') AS source_media_asset_id,
+                    json_extract(media_assets.transformation_json, '$.source_role') AS source_media_role,
+                    COALESCE(json_extract(source_media.transformation_json, '$.associated_entry_date'), '') AS associated_entry_date,
+                    1 AS media_order
+                FROM media_assets
+                LEFT JOIN media_assets AS source_media
+                    ON source_media.id = json_extract(media_assets.transformation_json, '$.source_media_asset_id')
+                WHERE media_assets.entry_id IN ({placeholders})
+                    AND media_assets.role = 'diarium_associated_derivative'
+                    AND media_assets.id LIKE '%:diarium_associated_derivative:' || ?
+                    AND media_assets.status = 'available'
+            )
+            SELECT
+                *
+            FROM derivative_rows
+            ORDER BY entry_id, media_order, associated_entry_date, media_asset_id
+            """,
+        [*entry_ids, derivative_policy, *entry_ids, derivative_policy],
+    ).fetchall()
+    media_by_entry: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        media_by_entry.setdefault(str(row["entry_id"]), []).append(dict(row))
+    return media_by_entry
 
 
 def _creation_date_utc(entry_date: str, time_zone: str) -> str:

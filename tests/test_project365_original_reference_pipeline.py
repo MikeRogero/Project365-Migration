@@ -19,6 +19,89 @@ import project365_original_reference_pipeline as pipeline
 
 
 class Project365OriginalReferencePipelineTests(unittest.TestCase):
+    def test_associated_photo_persists_additively_and_survives_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            primary = source_root / "1998-04-12 primary.png"
+            associated = source_root / "1998-04-12 associated.jpg"
+            rejected = source_root / "1998-04-12 rejected.jpg"
+            primary.write_bytes(_tiny_png())
+            associated.write_bytes(_jpeg_with_dimensions(2, 2))
+            rejected.write_bytes(_jpeg_with_dimensions(3, 3))
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            queue_path = Path(summary.search_queue_path)
+            with queue_path.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+                fieldnames = list(rows[0].keys())
+            by_name = {Path(row["candidate_path"]).name: row for row in rows}
+            by_name[primary.name]["review_decision"] = "use_external_original"
+            by_name[associated.name]["review_decision"] = "external_original_associated_photo"
+            by_name[associated.name]["associated_entry_date"] = "1998-04-13"
+            by_name[associated.name]["associated_date_source"] = "manual"
+            _write_csv(queue_path, rows, fieldnames)
+
+            first = pipeline.apply_reviewed_external_references(canonical_root, queue_path)
+
+            self.assertEqual(first.selected_count, 1)
+            self.assertEqual(first.associated_count, 1)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                records = connection.execute(
+                    """
+                    SELECT role, selected_default, transformation_json
+                    FROM media_assets
+                    WHERE role IN ('external_original_reference', 'external_original_associated_photo')
+                    ORDER BY role
+                    """
+                ).fetchall()
+            self.assertEqual([record[0] for record in records], ["external_original_associated_photo", "external_original_reference"])
+            self.assertEqual(records[0][1], 0)
+            associated_transformation = json.loads(records[0][2])
+            self.assertEqual(associated_transformation["associated_entry_date"], "1998-04-13")
+            self.assertEqual(associated_transformation["source"], "external_original_associated_photo")
+
+            for row in rows:
+                row["review_decision"] = ""
+                row["review_notes"] = ""
+            by_name[rejected.name]["review_decision"] = "rejected"
+            _write_csv(queue_path, rows, fieldnames)
+
+            second = pipeline.apply_reviewed_external_references(canonical_root, queue_path)
+
+            self.assertEqual(second.rejected_count, 1)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                roles = [
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT role
+                        FROM media_assets
+                        WHERE role IN (
+                            'external_original_reference',
+                            'external_original_associated_photo',
+                            'external_original_rejected'
+                        )
+                        ORDER BY role
+                        """
+                    ).fetchall()
+                ]
+            self.assertEqual(
+                roles,
+                [
+                    "external_original_associated_photo",
+                    "external_original_reference",
+                    "external_original_rejected",
+                ],
+            )
+
     def test_review_crop_from_row_preserves_rotation(self) -> None:
         crop = pipeline._review_crop_from_row(
             {
@@ -227,6 +310,130 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             self.assertEqual(summary.skipped_file_count, 1)
             candidate = photo_index.query_index_candidates(index_db, {"2004-01-01"})["2004-01-01"][0]
             self.assertEqual(candidate["candidate_sha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_photo_index_snapshot_is_scoped_to_selected_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            selected_root = base / "selected"
+            other_root = base / "other"
+            selected_root.mkdir()
+            other_root.mkdir()
+            selected_photo = selected_root / "2004-01-01 selected.png"
+            other_photo = other_root / "2004-01-02 other.png"
+            selected_photo.write_bytes(_tiny_png())
+            other_photo.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [selected_root, other_root], reset=True)
+
+            with sqlite3.connect(index_db) as connection:
+                snapshot = photo_index._indexed_file_snapshot(connection, [selected_root])
+
+        self.assertIn(str(selected_photo.resolve()), snapshot)
+        self.assertNotIn(str(other_photo.resolve()), snapshot)
+
+    def test_photo_index_omits_child_root_when_parent_root_is_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            parent_root = base / "Photos - Travels Places Events & Homes"
+            child_root = parent_root / "India - 2003 The Year on A Bike"
+            child_root.mkdir(parents=True)
+            (parent_root / "2004-01-01 parent.png").write_bytes(_tiny_png())
+            (child_root / "2004-01-02 child.png").write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                summary = photo_index.build_photo_library_index(
+                    index_db,
+                    [child_root, parent_root],
+                    reset=True,
+                )
+
+            with sqlite3.connect(index_db) as connection:
+                roots = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT root FROM photo_library_files GROUP BY root ORDER BY root"
+                    )
+                ]
+                run_roots = connection.execute(
+                    "SELECT roots FROM photo_library_index_runs ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()[0]
+
+        self.assertEqual(summary.scanned_file_count, 2)
+        self.assertEqual(roots, [str(parent_root)])
+        self.assertEqual(run_roots, str(parent_root))
+
+    def test_photo_index_relabels_existing_child_root_when_parent_root_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            parent_root = base / "Photos - Travels Places Events & Homes"
+            child_root = parent_root / "India - 2003 The Year on A Bike"
+            child_root.mkdir(parents=True)
+            child_photo = child_root / "2004-01-02 child.png"
+            child_photo.write_bytes(_tiny_png())
+            parent_photo = parent_root / "2004-01-01 parent.png"
+            parent_photo.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [child_root], reset=True)
+                summary = photo_index.build_photo_library_index(index_db, [parent_root], reset=False)
+
+            with sqlite3.connect(index_db) as connection:
+                roots = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT root FROM photo_library_files GROUP BY root ORDER BY root"
+                    )
+                ]
+                child_root_value = connection.execute(
+                    "SELECT root FROM photo_library_files WHERE path = ?",
+                    (str(child_photo.resolve()),),
+                ).fetchone()[0]
+
+        self.assertEqual(summary.scanned_file_count, 2)
+        self.assertEqual(summary.indexed_file_count, 1)
+        self.assertEqual(summary.skipped_file_count, 1)
+        self.assertEqual(roots, [str(parent_root)])
+        self.assertEqual(child_root_value, str(parent_root))
+
+    def test_photo_index_prunes_contained_roots_without_deleting_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            parent_root = base / "Photos - Travels Places Events & Homes"
+            child_root = parent_root / "India - 2003 The Year on A Bike"
+            child_root.mkdir(parents=True)
+            child_photo = child_root / "2004-01-02 child.png"
+            child_photo.write_bytes(_tiny_png())
+            parent_photo = parent_root / "2004-01-01 parent.png"
+            parent_photo.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [parent_root], reset=True)
+
+            with sqlite3.connect(index_db) as connection:
+                connection.execute(
+                    "UPDATE photo_library_files SET root = ? WHERE path = ?",
+                    (str(child_root), str(child_photo.resolve())),
+                )
+                connection.commit()
+
+            summary = photo_index.prune_contained_index_roots(index_db)
+
+            with sqlite3.connect(index_db) as connection:
+                root_rows = [
+                    row
+                    for row in connection.execute(
+                        "SELECT path, root FROM photo_library_files ORDER BY path"
+                    )
+                ]
+                date_count = connection.execute("SELECT COUNT(*) FROM photo_library_dates").fetchone()[0]
+
+        self.assertEqual(summary, {"roots_before": 2, "roots_after": 1, "rows_relabelled": 1})
+        self.assertEqual(len(root_rows), 2)
+        self.assertEqual({row[1] for row in root_rows}, {str(parent_root)})
+        self.assertGreater(date_count, 0)
 
     def test_photo_index_refreshes_unchanged_files_from_old_metadata_version(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -661,6 +868,262 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             )
             derivative_rows = _read_csv(Path(derivative_summary.report_path))
             self.assertEqual(derivative_rows[0]["source_path"], str(original_path))
+
+    def test_apply_marks_confirmed_original_low_quality_when_axis_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            original_path = source_root / "1998-04-12 camera-original.jpg"
+            original_path.write_bytes(_jpeg_with_dimensions(900, 1200))
+
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            rows = _read_csv(Path(summary.search_queue_path))
+            rows[0]["review_decision"] = "use_external_original"
+            reviewed_path = base / "reviewed.csv"
+            _write_csv(reviewed_path, rows, list(rows[0]))
+
+            pipeline.apply_reviewed_external_references(
+                canonical_root=canonical_root,
+                reviewed_csv=reviewed_path,
+            )
+
+            with _sqlite_connection(canonical_root / "canonical.db") as connection:
+                transformation_text = connection.execute(
+                    """
+                    SELECT transformation_json
+                    FROM media_assets
+                    WHERE role = 'external_original_reference'
+                    """
+                ).fetchone()[0]
+            transformation = json.loads(transformation_text)
+            self.assertTrue(transformation["original_low_quality"])
+            self.assertEqual(transformation["original_dimensions"], {"width": 900, "height": 1200})
+            self.assertTrue(transformation["better_deal_search_eligible"])
+
+    def test_apply_persists_associated_photo_additively_with_primary_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            primary_path = source_root / "1998-04-12 primary.png"
+            associated_path = source_root / "1998-04-13 associated.png"
+            primary_path.write_bytes(_tiny_png())
+            associated_path.write_bytes(_tiny_png() + b"associated")
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            rows = _read_csv(Path(summary.search_queue_path))
+            for row in rows:
+                row["review_decision"] = (
+                    "use_external_original"
+                    if row["candidate_path"] == str(primary_path)
+                    else "external_original_associated_photo"
+                )
+                if row["candidate_path"] == str(associated_path):
+                    row["associated_entry_date"] = "1998-04-13"
+                    row["associated_date_source"] = "requested_date"
+            reviewed_path = base / "reviewed.csv"
+            _write_csv(reviewed_path, rows, list(rows[0]))
+
+            apply_summary = pipeline.apply_reviewed_external_references(canonical_root, reviewed_path)
+
+            self.assertEqual(apply_summary.selected_count, 1)
+            self.assertEqual(apply_summary.associated_count, 1)
+            with _sqlite_connection(canonical_root / "canonical.db") as connection:
+                db_rows = connection.execute(
+                    """
+                    SELECT role, storage_path, selected_default, transformation_json
+                    FROM media_assets
+                    WHERE entry_id = ?
+                        AND role IN ('external_original_reference', 'external_original_associated_photo')
+                    ORDER BY role
+                    """,
+                    ("project365:1998-04-12",),
+                ).fetchall()
+            self.assertEqual(
+                [(row[0], row[1], row[2]) for row in db_rows],
+                [
+                    ("external_original_associated_photo", str(associated_path), 0),
+                    ("external_original_reference", str(primary_path), 0),
+                ],
+            )
+            associated_transformation = json.loads(db_rows[0][3])
+            self.assertEqual(associated_transformation["source"], "external_original_associated_photo")
+            self.assertEqual(associated_transformation["source_path"], str(associated_path))
+            self.assertEqual(associated_transformation["associated_entry_date"], "1998-04-13")
+            self.assertEqual(associated_transformation["associated_date_source"], "requested_date")
+            self.assertNotIn("diary", associated_transformation)
+
+    def test_rejected_row_preserves_existing_associated_photo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            associated_path = source_root / "1998-04-12 associated.png"
+            rejected_path = source_root / "1998-04-12 rejected.png"
+            associated_path.write_bytes(_tiny_png())
+            rejected_path.write_bytes(_tiny_png() + b"rejected")
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            rows = _read_csv(Path(summary.search_queue_path))
+            for row in rows:
+                row["review_decision"] = (
+                    "external_original_associated_photo"
+                    if row["candidate_path"] == str(associated_path)
+                    else "rejected"
+                )
+            reviewed_path = base / "reviewed.csv"
+            _write_csv(reviewed_path, rows, list(rows[0]))
+
+            apply_summary = pipeline.apply_reviewed_external_references(canonical_root, reviewed_path)
+
+            self.assertEqual(apply_summary.associated_count, 1)
+            self.assertEqual(apply_summary.rejected_count, 1)
+            with _sqlite_connection(canonical_root / "canonical.db") as connection:
+                db_rows = connection.execute(
+                    """
+                    SELECT role, storage_path
+                    FROM media_assets
+                    WHERE entry_id = ?
+                        AND role IN ('external_original_associated_photo', 'external_original_rejected')
+                    ORDER BY role
+                    """,
+                    ("project365:1998-04-12",),
+                ).fetchall()
+            self.assertEqual(
+                db_rows,
+                [
+                    ("external_original_associated_photo", str(associated_path)),
+                    ("external_original_rejected", str(rejected_path)),
+                ],
+            )
+
+    def test_search_can_reopen_low_quality_confirmed_matches_for_better_deal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            low_quality = source_root / "1998-04-12 low-quality.jpg"
+            better = source_root / "1998-04-12 better.jpg"
+            low_quality.write_bytes(_jpeg_with_dimensions(900, 1200))
+            better.write_bytes(_jpeg_with_dimensions(1600, 1200))
+
+            first_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            rows = _read_csv(Path(first_summary.search_queue_path))
+            for row in rows:
+                row["review_decision"] = (
+                    "use_external_original"
+                    if row["candidate_path"] == str(low_quality)
+                    else "rejected"
+                )
+            reviewed_path = base / "reviewed.csv"
+            _write_csv(reviewed_path, rows, list(rows[0]))
+            pipeline.apply_reviewed_external_references(canonical_root, reviewed_path)
+
+            default_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports_default",
+                scan_metadata_dates=False,
+            )
+            self.assertEqual(default_summary.unclear_entry_count, 0)
+
+            better_deal_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports_better",
+                scan_metadata_dates=False,
+                include_low_quality_matches=True,
+            )
+
+            better_rows = _read_csv(Path(better_deal_summary.search_queue_path))
+            self.assertEqual(better_deal_summary.unclear_entry_count, 1)
+            self.assertEqual({row["current_match_status"] for row in better_rows}, {"low_quality_match"})
+            self.assertEqual({row["current_decision"] for row in better_rows}, {"better_deal_search"})
+            self.assertIn(str(better), {row["candidate_path"] for row in better_rows})
+
+    def test_replacing_confirmed_original_drops_previous_crop_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            first = source_root / "1998-04-12 first.jpg"
+            second = source_root / "1998-04-12 second.jpg"
+            first.write_bytes(_jpeg_with_dimensions(900, 1200))
+            second.write_bytes(_jpeg_with_dimensions(1600, 1200))
+
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            rows = _read_csv(Path(summary.search_queue_path))
+            for row in rows:
+                row["review_decision"] = "use_external_original" if row["candidate_path"] == str(first) else ""
+                if row["candidate_path"] == str(first):
+                    row["review_crop_x"] = "1"
+                    row["review_crop_y"] = "2"
+                    row["review_crop_size"] = "3"
+                    row["review_crop_candidate_width"] = "900"
+                    row["review_crop_candidate_height"] = "1200"
+                    row["review_crop_source"] = "manual"
+            reviewed_path = base / "reviewed.csv"
+            _write_csv(reviewed_path, rows, list(rows[0]))
+            pipeline.apply_reviewed_external_references(canonical_root, reviewed_path)
+
+            replacement_rows = _read_csv(Path(summary.search_queue_path))
+            for row in replacement_rows:
+                row["review_decision"] = "use_external_original" if row["candidate_path"] == str(second) else ""
+                for field in pipeline._review_crop_fieldnames():
+                    row[field] = ""
+            replacement_path = base / "replacement.csv"
+            _write_csv(replacement_path, replacement_rows, list(replacement_rows[0]))
+
+            pipeline.apply_reviewed_external_references(canonical_root, replacement_path)
+
+            with _sqlite_connection(canonical_root / "canonical.db") as connection:
+                db_rows = connection.execute(
+                    """
+                    SELECT storage_path, transformation_json
+                    FROM media_assets
+                    WHERE role = 'external_original_reference'
+                    ORDER BY storage_path
+                    """
+                ).fetchall()
+            self.assertEqual(len(db_rows), 1)
+            self.assertEqual(db_rows[0][0], str(second))
+            self.assertIsNone(json.loads(db_rows[0][1])["review_crop"])
 
     def test_rejected_candidate_is_persisted_and_not_relisted_for_same_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2037,6 +2500,18 @@ def _jpeg_with_exif_date(value: str, tag: int = 0x9003) -> bytes:
     tiff.extend(payload)
     app1 = b"Exif\x00\x00" + bytes(tiff)
     return b"\xff\xd8" + b"\xff\xe1" + (len(app1) + 2).to_bytes(2, "big") + app1 + b"\xff\xd9"
+
+
+def _jpeg_with_dimensions(width: int, height: int) -> bytes:
+    sof = (
+        b"\xff\xc0"
+        + (17).to_bytes(2, "big")
+        + b"\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00"
+    )
+    return b"\xff\xd8" + sof + b"\xff\xd9"
 
 
 def _tiny_png() -> bytes:

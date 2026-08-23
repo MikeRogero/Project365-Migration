@@ -29,6 +29,7 @@ class DerivativeSummary:
     not_ready_count: int
     format: str
     long_edge: int
+    not_ready_dates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,8 @@ class DerivativeReadinessSummary:
     source_count: int
     ready_count: int
     not_ready_count: int
+    current_count: int
+    needs_update_count: int
 
 
 def main() -> int:
@@ -47,6 +50,8 @@ def main() -> int:
     parser.add_argument("--long-edge", type=int, default=2560)
     parser.add_argument("--quality", type=int, default=88)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--start-date", default="")
+    parser.add_argument("--end-date", default="")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -60,6 +65,8 @@ def main() -> int:
         long_edge=args.long_edge,
         quality=args.quality,
         limit=args.limit,
+        start_date=args.start_date,
+        end_date=args.end_date,
         force=args.force,
     )
     print("Project365 media derivative generation: PASS")
@@ -68,8 +75,12 @@ def main() -> int:
     print(f"Generated: {summary.generated_count}")
     print(f"Skipped: {summary.skipped_count}")
     print(f"Not ready: {summary.not_ready_count}")
+    if summary.not_ready_dates:
+        print(f"Not ready dates: {', '.join(summary.not_ready_dates)}")
     print(f"Format: {summary.format}")
     print(f"Long edge: {summary.long_edge}")
+    if args.start_date or args.end_date:
+        print(f"Date scope: {args.start_date or 'start'} to {args.end_date or 'end'}")
     return 0
 
 
@@ -79,6 +90,8 @@ def generate_derivatives(
     long_edge: int = 2560,
     quality: int = 88,
     limit: int | None = None,
+    start_date: str = "",
+    end_date: str = "",
     force: bool = False,
 ) -> DerivativeSummary:
     if output_format not in {"jpeg", "heic"}:
@@ -101,23 +114,27 @@ def generate_derivatives(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        rows = _load_source_media(connection, policy, limit)
+        rows = _load_source_media(connection, policy, limit, start_date, end_date)
         report_rows = []
         generated_count = 0
         skipped_count = 0
         not_ready_count = 0
+        not_ready_dates: set[str] = set()
         for row in rows:
             source_path = Path(row["storage_path"])
             if not source_path.exists():
                 raise FileNotFoundError(f"Missing source media for derivative: {source_path}")
             month = row["entry_date"][:7]
             extension = "jpg" if output_format == "jpeg" else "heic"
-            output_path = output_root / month / f"{row['entry_id'].replace(':', '_')}.{extension}"
+            output_stem = _derivative_output_stem(row)
+            output_path = output_root / month / f"{output_stem}.{extension}"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             crop = _review_crop_from_transformation(row["source_transformation_json"])
-            derivative_id = f"{row['entry_id']}:diarium_derivative:{policy}"
+            derivative_id = str(row["derivative_id"])
+            derivative_role = str(row["derivative_role"])
             if crop is None:
                 not_ready_count += 1
+                not_ready_dates.add(str(row["entry_date"]))
                 _mark_derivative_not_ready(connection, row, derivative_id)
                 report_rows.append(
                     _report_row(
@@ -138,6 +155,8 @@ def generate_derivatives(
                 continue
             transformation = {
                 "source_media_asset_id": row["media_asset_id"],
+                "source_role": row["source_role"],
+                "derivative_role": derivative_role,
                 "source_sha256": row["source_sha256"],
                 "source_byte_size": int(row["source_byte_size"]),
                 "source_path": row["storage_path"],
@@ -198,7 +217,7 @@ def generate_derivatives(
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, 'diarium_derivative', ?, ?, ?, ?, ?, ?, 'available',
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available',
                         'unreviewed', 0, ?, ?, ?, ?)
                 ON CONFLICT(id)
                 DO UPDATE SET
@@ -217,6 +236,7 @@ def generate_derivatives(
                 (
                     derivative_id,
                     row["entry_id"],
+                    derivative_role,
                     row["source_file_id"],
                     output_path.name,
                     str(output_path),
@@ -259,6 +279,7 @@ def generate_derivatives(
         not_ready_count=not_ready_count,
         format=output_format,
         long_edge=long_edge,
+        not_ready_dates=tuple(sorted(not_ready_dates)),
     )
 
 
@@ -273,30 +294,72 @@ def derivative_readiness_summary(
     output_format: str = "jpeg",
     long_edge: int = 2560,
     quality: int = 88,
+    start_date: str = "",
+    end_date: str = "",
 ) -> DerivativeReadinessSummary:
     db_path = canonical_root / "canonical.db"
     if not db_path.exists():
-        return DerivativeReadinessSummary(source_count=0, ready_count=0, not_ready_count=0)
+        return DerivativeReadinessSummary(
+            source_count=0,
+            ready_count=0,
+            not_ready_count=0,
+            current_count=0,
+            needs_update_count=0,
+        )
 
     policy = derivative_policy_name(output_format, long_edge, quality)
+    output_root = canonical_root / "media" / "diarium_derivatives" / policy
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        rows = _load_source_media(connection, policy, None)
+        rows = _load_source_media(connection, policy, None, start_date, end_date)
     except sqlite3.Error:
-        return DerivativeReadinessSummary(source_count=0, ready_count=0, not_ready_count=0)
+        return DerivativeReadinessSummary(
+            source_count=0,
+            ready_count=0,
+            not_ready_count=0,
+            current_count=0,
+            needs_update_count=0,
+        )
     finally:
         connection.close()
 
-    ready_count = sum(
-        1
-        for row in rows
-        if _has_valid_review_crop(row["source_transformation_json"])
-    )
+    ready_count = 0
+    current_count = 0
+    needs_update_count = 0
+    extension = "jpg" if output_format == "jpeg" else "heic"
+    for row in rows:
+        try:
+            crop = _review_crop_from_transformation(row["source_transformation_json"])
+        except (TypeError, ValueError):
+            crop = None
+        if crop is None:
+            continue
+        ready_count += 1
+        month = row["entry_date"][:7]
+        output_path = output_root / month / f"{_derivative_output_stem(row)}.{extension}"
+        transformation = {
+            "source_media_asset_id": row["media_asset_id"],
+            "source_role": row["source_role"],
+            "derivative_role": row["derivative_role"],
+            "source_sha256": row["source_sha256"],
+            "source_byte_size": int(row["source_byte_size"]),
+            "source_path": row["storage_path"],
+            "format": output_format,
+            "long_edge": long_edge,
+            "quality": quality,
+            "crop": crop,
+        }
+        if _derivative_is_current(row, output_path, transformation):
+            current_count += 1
+        else:
+            needs_update_count += 1
     return DerivativeReadinessSummary(
         source_count=len(rows),
         ready_count=ready_count,
         not_ready_count=len(rows) - ready_count,
+        current_count=current_count,
+        needs_update_count=needs_update_count,
     )
 
 
@@ -304,19 +367,77 @@ def _load_source_media(
     connection: sqlite3.Connection,
     policy: str,
     limit: int | None,
+    start_date: str = "",
+    end_date: str = "",
 ) -> list[sqlite3.Row]:
     query = """
+        WITH source_rows AS (
+            SELECT
+                entries.id AS entry_id,
+                entries.entry_date,
+                COALESCE(external_media.id, fallback_media.id) AS media_asset_id,
+                COALESCE(external_media.source_file_id, fallback_media.source_file_id) AS source_file_id,
+                COALESCE(external_media.storage_path, fallback_media.storage_path) AS storage_path,
+                COALESCE(external_media.sha256, fallback_media.sha256) AS source_sha256,
+                COALESCE(external_media.byte_size, fallback_media.byte_size) AS source_byte_size,
+                COALESCE(external_media.transformation_json, fallback_media.transformation_json) AS source_transformation_json,
+                COALESCE(external_media.import_batch_id, fallback_media.import_batch_id) AS import_batch_id,
+                COALESCE(external_media.updated_at, fallback_media.updated_at) AS source_updated_at,
+                'primary' AS source_role,
+                'diarium_derivative' AS derivative_role,
+                entries.id || ':diarium_derivative:' || ? AS derivative_id
+            FROM entries
+            LEFT JOIN media_assets AS external_media
+                ON external_media.id = (
+                    SELECT id
+                    FROM media_assets
+                    WHERE entry_id = entries.id
+                        AND role = 'external_original_reference'
+                        AND review_status = 'confirmed'
+                    ORDER BY updated_at DESC, id
+                    LIMIT 1
+                )
+            LEFT JOIN media_assets AS fallback_media
+                ON fallback_media.entry_id = entries.id
+                AND fallback_media.selected_default = 1
+            WHERE COALESCE(external_media.id, fallback_media.id) IS NOT NULL
+            UNION ALL
+            SELECT
+                entries.id AS entry_id,
+                entries.entry_date,
+                associated_media.id AS media_asset_id,
+                associated_media.source_file_id AS source_file_id,
+                associated_media.storage_path AS storage_path,
+                associated_media.sha256 AS source_sha256,
+                associated_media.byte_size AS source_byte_size,
+                associated_media.transformation_json AS source_transformation_json,
+                associated_media.import_batch_id AS import_batch_id,
+                associated_media.updated_at AS source_updated_at,
+                'associated' AS source_role,
+                'diarium_associated_derivative' AS derivative_role,
+                associated_media.id || ':diarium_associated_derivative:' || ? AS derivative_id
+            FROM entries
+            JOIN media_assets AS associated_media
+                ON associated_media.entry_id = entries.id
+                AND associated_media.role = 'external_original_associated_photo'
+                AND associated_media.review_status = 'confirmed'
+                AND associated_media.status = 'available'
+                AND COALESCE(associated_media.storage_path, '') != ''
+        )
         SELECT
-            entries.id AS entry_id,
-            entries.entry_date,
-            COALESCE(external_media.id, fallback_media.id) AS media_asset_id,
-            COALESCE(external_media.source_file_id, fallback_media.source_file_id) AS source_file_id,
-            COALESCE(external_media.storage_path, fallback_media.storage_path) AS storage_path,
-            COALESCE(external_media.sha256, fallback_media.sha256) AS source_sha256,
-            COALESCE(external_media.byte_size, fallback_media.byte_size) AS source_byte_size,
-            COALESCE(external_media.transformation_json, fallback_media.transformation_json) AS source_transformation_json,
-            COALESCE(external_media.import_batch_id, fallback_media.import_batch_id) AS import_batch_id,
-            COALESCE(external_media.updated_at, fallback_media.updated_at) AS source_updated_at,
+            source_rows.entry_id,
+            source_rows.entry_date,
+            source_rows.media_asset_id,
+            source_rows.source_file_id,
+            source_rows.storage_path,
+            source_rows.source_sha256,
+            source_rows.source_byte_size,
+            source_rows.source_transformation_json,
+            source_rows.import_batch_id,
+            source_rows.source_updated_at,
+            source_rows.source_role,
+            source_rows.derivative_role,
+            source_rows.derivative_id,
             derivative_media.id AS derivative_media_asset_id,
             derivative_media.storage_path AS derivative_storage_path,
             derivative_media.sha256 AS derivative_sha256,
@@ -324,30 +445,33 @@ def _load_source_media(
             derivative_media.status AS derivative_status,
             derivative_media.transformation_json AS derivative_transformation_json,
             derivative_media.updated_at AS derivative_updated_at
-        FROM entries
-        LEFT JOIN media_assets AS external_media
-            ON external_media.id = (
-                SELECT id
-                FROM media_assets
-                WHERE entry_id = entries.id
-                    AND role = 'external_original_reference'
-                    AND review_status = 'confirmed'
-                ORDER BY updated_at DESC, id
-                LIMIT 1
-            )
-        LEFT JOIN media_assets AS fallback_media
-            ON fallback_media.entry_id = entries.id
-            AND fallback_media.selected_default = 1
+        FROM source_rows
         LEFT JOIN media_assets AS derivative_media
-            ON derivative_media.id = entries.id || ':diarium_derivative:' || ?
-        WHERE COALESCE(external_media.id, fallback_media.id) IS NOT NULL
-        ORDER BY entries.entry_date, entries.id
+            ON derivative_media.id = source_rows.derivative_id
+        WHERE 1 = 1
     """
-    params: list[object] = [policy]
+    params: list[object] = [policy, policy]
+    if str(start_date or "").strip():
+        query += " AND source_rows.entry_date >= ?\n"
+        params.append(str(start_date).strip())
+    if str(end_date or "").strip():
+        query += " AND source_rows.entry_date <= ?\n"
+        params.append(str(end_date).strip())
+    query += """
+        ORDER BY source_rows.entry_date, source_rows.entry_id, source_rows.source_role, source_rows.media_asset_id
+    """
     if limit is not None:
         query += " LIMIT ?"
         params.append(limit)
     return list(connection.execute(query, params))
+
+
+def _derivative_output_stem(row: sqlite3.Row) -> str:
+    entry_stem = str(row["entry_id"]).replace(":", "_")
+    if str(row["source_role"]) != "associated":
+        return entry_stem
+    digest = hashlib.sha256(str(row["media_asset_id"]).encode("utf-8")).hexdigest()[:12]
+    return f"{entry_stem}_associated_{digest}"
 
 
 def _derivative_is_current(

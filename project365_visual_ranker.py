@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 import shutil
 import sqlite3
 import struct
@@ -23,6 +24,7 @@ METHOD_VERSION = "visual_similarity_v2"
 DEFAULT_SAMPLE_SIZE = 16
 DEFAULT_LIKELY_LIMIT = 20
 DEFAULT_OVERSIZED_THRESHOLD = 20
+DEFAULT_THUMBNAIL_TOOL = "auto"
 
 
 @dataclass(frozen=True)
@@ -275,8 +277,14 @@ def build_descriptor(path: Path, sample_size: int = DEFAULT_SAMPLE_SIZE) -> dict
     }
 
 
-def load_visual_image(path: Path) -> VisualImage:
+def load_visual_image(
+    path: Path,
+    max_dimension: int | None = None,
+    thumbnail_tool: str = DEFAULT_THUMBNAIL_TOOL,
+) -> VisualImage:
     path = path.resolve()
+    if max_dimension and max_dimension > 0 and path.suffix.lower() != ".bmp":
+        return _load_thumbnail_image(path, int(max_dimension), thumbnail_tool)
     if path.suffix.lower() == ".bmp":
         return _read_bmp_rgb(path)
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -299,6 +307,73 @@ def load_visual_image(path: Path) -> VisualImage:
                 stderr=subprocess.DEVNULL,
             )
         return _read_bmp_rgb(bmp_path)
+
+
+def _load_thumbnail_image(path: Path, max_dimension: int, thumbnail_tool: str) -> VisualImage:
+    tool = (thumbnail_tool or DEFAULT_THUMBNAIL_TOOL).strip().lower()
+    if tool not in {"auto", "vipsthumbnail", "magick"}:
+        raise ValueError(f"Unsupported thumbnail tool: {thumbnail_tool}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ppm_path = Path(temp_dir) / "thumbnail.ppm"
+        errors: list[str] = []
+        if tool in {"auto", "vipsthumbnail"}:
+            vipsthumbnail_path = _find_executable("vipsthumbnail")
+            if vipsthumbnail_path:
+                command = [
+                    vipsthumbnail_path,
+                    str(path),
+                    "--size",
+                    f"{max_dimension}x{max_dimension}>",
+                    "--rotate",
+                    "--path",
+                    str(ppm_path),
+                ]
+                try:
+                    _run_thumbnail_command(command)
+                    return _read_ppm_rgb(ppm_path)
+                except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+                    errors.append(f"vipsthumbnail: {type(exc).__name__}")
+            elif tool == "vipsthumbnail":
+                raise FileNotFoundError("vipsthumbnail is not installed or not on PATH")
+        magick_path = _find_executable("magick")
+        if magick_path and tool in {"auto", "magick"}:
+            command = [
+                magick_path,
+                str(path),
+                "-auto-orient",
+                "-resize",
+                f"{max_dimension}x{max_dimension}>",
+                str(ppm_path),
+            ]
+            try:
+                _run_thumbnail_command(command)
+                return _read_ppm_rgb(ppm_path)
+            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+                errors.append(f"magick: {type(exc).__name__}")
+        detail = "; ".join(errors) if errors else "no thumbnail tool found"
+        raise RuntimeError(f"Unable to thumbnail image with {tool}: {detail}")
+
+
+def _find_executable(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in (
+        Path("/opt/homebrew/bin") / name,
+        Path("/usr/local/bin") / name,
+    ):
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def _run_thumbnail_command(command: list[str]) -> None:
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def _read_bmp_rgb(path: Path) -> VisualImage:
@@ -334,6 +409,44 @@ def _read_bmp_rgb(path: Path) -> VisualImage:
             blue, green, red = payload[offset : offset + 3]
             rgb[row * width_abs + col] = (red, green, blue)
     return VisualImage(width=width_abs, height=height, rgb=rgb)
+
+
+def _read_ppm_rgb(path: Path) -> VisualImage:
+    payload = path.read_bytes()
+    offset = 0
+
+    def next_token() -> bytes:
+        nonlocal offset
+        while offset < len(payload) and payload[offset] in b" \t\r\n":
+            offset += 1
+        if offset < len(payload) and payload[offset] == ord("#"):
+            while offset < len(payload) and payload[offset] not in b"\r\n":
+                offset += 1
+            return next_token()
+        start = offset
+        while offset < len(payload) and payload[offset] not in b" \t\r\n":
+            offset += 1
+        return payload[start:offset]
+
+    magic = next_token()
+    if magic != b"P6":
+        raise ValueError(f"Not a binary PPM file: {path}")
+    width = int(next_token())
+    height = int(next_token())
+    max_value = int(next_token())
+    if max_value != 255:
+        raise ValueError("Unsupported PPM max value")
+    if offset < len(payload) and payload[offset] in b" \t\r\n":
+        offset += 1
+    expected = width * height * 3
+    data = payload[offset : offset + expected]
+    if len(data) != expected:
+        raise ValueError("Truncated PPM pixel payload")
+    rgb = [
+        (data[index], data[index + 1], data[index + 2])
+        for index in range(0, expected, 3)
+    ]
+    return VisualImage(width=width, height=height, rgb=rgb)
 
 
 def _candidate_views(width: int, height: int) -> list[tuple[str, int, int, int, int]]:
