@@ -61,6 +61,40 @@ class Project365CropAlignTests(unittest.TestCase):
             self.assertEqual(suggestion.width, 40)
             self.assertEqual(suggestion.height, 40)
 
+    def test_refines_low_confidence_largest_crop_between_scan_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            candidate = _make_smooth_gradient_pixels(430, 300)
+            reference = _brighten(_crop(candidate, 430, 67, 0, 300, 300), 20)
+            candidate_path = base / "candidate.bmp"
+            reference_path = base / "reference.bmp"
+            _write_bmp(candidate_path, 430, 300, candidate)
+            _write_bmp(reference_path, 300, 300, reference)
+
+            suggestion = crop_align.suggest_crop(reference_path, candidate_path)
+
+            self.assertEqual(suggestion.x, 67)
+            self.assertEqual(suggestion.y, 0)
+            self.assertEqual(suggestion.width, 300)
+            self.assertEqual(suggestion.height, 300)
+            self.assertEqual(suggestion.confidence, "low")
+
+    def test_does_not_refine_high_confidence_largest_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            candidate = _make_gradient_pixels(80, 40)
+            reference = _crop(candidate, 80, 20, 0, 40, 40)
+            candidate_path = base / "candidate.bmp"
+            reference_path = base / "reference.bmp"
+            _write_bmp(candidate_path, 80, 40, candidate)
+            _write_bmp(reference_path, 40, 40, reference)
+
+            with mock.patch.object(crop_align, "_refine_crop") as refine_crop:
+                suggestion = crop_align.suggest_crop(reference_path, candidate_path)
+
+            self.assertLessEqual(abs(suggestion.x - 20), 4)
+            refine_crop.assert_not_called()
+
     def test_loads_bmp_dimensions_and_pixels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "sample.bmp"
@@ -113,6 +147,28 @@ def _make_grayscale_gradient_pixels(width: int, height: int) -> list[tuple[int, 
             value = (x * 3 + y * 17) % 256
             pixels.append((value, value, value))
     return pixels
+
+
+def _make_smooth_gradient_pixels(width: int, height: int) -> list[tuple[int, int, int]]:
+    pixels = []
+    for y in range(height):
+        for x in range(width):
+            red = (x * 2 + y) % 256
+            green = (x + y * 3) % 256
+            blue = (x * 5 + y * 7) % 256
+            pixels.append((red, green, blue))
+    return pixels
+
+
+def _brighten(pixels: list[tuple[int, int, int]], amount: int) -> list[tuple[int, int, int]]:
+    return [
+        (
+            max(0, min(255, red + amount)),
+            max(0, min(255, green + amount)),
+            max(0, min(255, blue + amount)),
+        )
+        for red, green, blue in pixels
+    ]
 
 
 def _crop(

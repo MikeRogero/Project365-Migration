@@ -97,6 +97,7 @@ def start_control_panel(config: ServiceConfig) -> dict[str, Any]:
         process = subprocess.Popen(
             command,
             cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -184,7 +185,7 @@ def _wait_for_control_panel(config: ServiceConfig, process: subprocess.Popen[Any
         if process.poll() is not None:
             raise RuntimeError(f"Project365 control panel exited early. Check {config.log_path}.")
         try:
-            with urllib.request.urlopen(f"{config.url}/api/status", timeout=20):
+            with urllib.request.urlopen(config.url, timeout=20):
                 return
         except (OSError, urllib.error.URLError):
             time.sleep(0.2)
@@ -252,11 +253,11 @@ def _project_server_pids(
 
 def _port_has_project365_status(host: str, port: int) -> bool:
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/api/status", timeout=20) as response:
-            payload = json.loads(response.read().decode())
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        with urllib.request.urlopen(f"http://{host}:{port}", timeout=20) as response:
+            payload = response.read(4096).decode(errors="replace")
+    except (OSError, urllib.error.URLError):
         return False
-    return all(key in payload for key in ("paths", "database", "photo_library_index"))
+    return "Project365 Control" in payload
 
 
 def _project_server_pids_from_ps(include_any_project_server: bool = False) -> list[int]:

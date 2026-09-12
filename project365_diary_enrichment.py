@@ -276,17 +276,36 @@ def _entry_summary(
         (entry_id,),
     ).fetchone()[0]
     source_app = str(row["source_app"])
+    people_names = _entry_people(connection, entry_id)
+    primary_payload = _media_payload(primary, image_tokens)
+    if primary_payload:
+        primary_payload["people_names"] = people_names
     return {
         "entry_id": entry_id,
         "entry_date": str(row["entry_date"]),
         "source_app": source_app,
         "is_subentry": source_app == ENRICHMENT_SOURCE_APP,
         "text_present": row["original_text"] is not None and str(row["original_text"]) != "",
-        "primary_photo": _media_payload(primary, image_tokens),
+        "primary_photo": primary_payload,
         "primary_photo_ready": primary is not None,
         "primary_photo_status": "working_copy_ready" if primary else "working_copy_missing",
         "associated_count": int(associated_count or 0),
+        "people_names": people_names,
     }
+
+
+def _entry_people(connection: sqlite3.Connection, entry_id: str) -> list[str]:
+    rows = connection.execute(
+        """
+        SELECT canonical_name
+        FROM people
+        WHERE entry_id = ?
+            AND review_status IN ('suggested', 'confirmed', 'reviewed')
+        ORDER BY canonical_name
+        """,
+        (entry_id,),
+    ).fetchall()
+    return [str(row["canonical_name"]) for row in rows if str(row["canonical_name"] or "").strip()]
 
 
 def _primary_media(connection: sqlite3.Connection, entry_id: str) -> sqlite3.Row | None:
@@ -675,6 +694,15 @@ button { color: var(--ink); }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.people-script {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .main {
   min-width: 0;
   min-height: 0;
@@ -696,6 +724,7 @@ button { color: var(--ink); }
 }
 .heading strong { font-size: 18px; }
 .heading span { color: var(--muted); font-size: 12px; }
+.heading .people-script { font-size: 12px; }
 .range-controls {
   display: flex;
   gap: 6px;
@@ -829,6 +858,7 @@ button { color: var(--ink); }
       <div class="heading">
         <strong id="entryHeading">No entry selected</strong>
         <span id="entryMeta"></span>
+        <span id="entryPeople"></span>
       </div>
       <div id="rangeControls" class="range-controls">
         <button data-days="0" class="active">Same day</button>
@@ -893,6 +923,13 @@ function filename(item) {
   return item?.filename || String(item?.path || "").split("/").filter(Boolean).pop() || "";
 }
 
+function peopleScript(names) {
+  const values = Array.isArray(names) ? names.filter(Boolean) : [];
+  if (!values.length) return "";
+  const text = values.join(", ");
+  return `<span class="people-script" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
+}
+
 function applyInitialQuery() {
   const query = new URLSearchParams(window.location.search);
   state.startDate = query.get("start_date") || "";
@@ -943,11 +980,13 @@ function renderEntries() {
     button.onclick = () => loadEntry(entry.entry_id);
     const primarySrc = imageSrc(entry.primary_photo);
     const workingCopyText = entry.primary_photo_ready ? "" : "working copy missing · ";
+    const people = peopleScript(entry.people_names);
     button.innerHTML = `
       ${primarySrc ? `<img class="entry-thumb" src="${primarySrc}" alt="">` : '<div class="entry-thumb"></div>'}
       <span>
         <span class="entry-date">${escapeHtml(entry.entry_date)}</span>
         <span class="entry-meta">${workingCopyText}${entry.associated_count || 0} additional photo${entry.associated_count === 1 ? "" : "s"}</span>
+        ${people}
       </span>`;
     list.appendChild(button);
   }
@@ -964,6 +1003,7 @@ function renderEntryDetail() {
   const entry = state.currentEntry;
   document.getElementById("entryHeading").textContent = entry ? `${entry.entry_date}${entry.is_subentry ? " sub-entry" : ""}` : "No entry selected";
   document.getElementById("entryMeta").textContent = entry ? entry.entry_id : "";
+  document.getElementById("entryPeople").innerHTML = entry ? peopleScript(entry.people_names) : "";
   document.querySelectorAll("[data-days]").forEach(button => {
     button.classList.toggle("active", Number(button.dataset.days) === state.candidateDays);
   });

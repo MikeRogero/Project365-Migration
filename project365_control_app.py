@@ -60,6 +60,7 @@ STATUS_BATCH_LIMIT = 50
 CONTROL_RUN_HISTORY = VERIFY_REPORT_DIR / "control_run_history.jsonl"
 RUN_HISTORY_LIMIT = 50
 ARCHIVE_RESULT_LIMIT = 25
+_BROAD_MONTHLY_COVERAGE_CACHE: dict[str, Any] = {"key": None, "rows": []}
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,7 @@ class ControlState:
     def status(self, steps: list[str] | None = None) -> dict[str, Any]:
         if steps is not None:
             return self._scoped_status(steps)
-        active_jobs = self._active_jobs()
+        active_jobs = self._active_jobs(include_crop_estimates=True)
         active_owners = {_owner_step(str(job.get("step", ""))) for job in active_jobs}
         diarium_package = _diarium_package_status(DIARIUM_IMPORT_BATCH_DIR)
         diarium_local = _diarium_local_status(DIARIUM_DB_PATH)
@@ -125,6 +126,7 @@ class ControlState:
             "history": self.history[-20:],
             "active_jobs": active_jobs,
         }
+        _attach_visual_job_progress(status)
         status["top_metrics"] = _top_metrics(
             status["database"],
             status["photo_library_index"],
@@ -138,15 +140,17 @@ class ControlState:
             for owner in (_owner_step(str(step).strip()) for step in steps)
             if owner in WORKFLOW_STEPS
         }
-        active_jobs = self._active_jobs()
+        active_jobs = self._active_jobs(include_crop_estimates="crop_confirmation" in requested)
         active_owners = {_owner_step(str(job.get("step", ""))) for job in active_jobs}
+        needs_photo_index_metric = bool(
+            requested & {"build_photo_index", "match_easy_originals"}
+        ) and "build_photo_index" not in active_owners
         status: dict[str, Any] = {
             "top_metrics": _initial_top_metrics(
-                include_photo_index="build_photo_index" not in active_owners
+                include_photo_index=needs_photo_index_metric
             ),
-            "history": self.history[-20:],
             "active_jobs": active_jobs,
-            "workflow_history": _workflow_history(self.history),
+            "workflow_history": _workflow_history(self.history, requested),
         }
         paths: dict[str, Any] = {}
         if "import_zips" in requested:
@@ -168,9 +172,14 @@ class ControlState:
             status["original_remainder_overview"] = _remainder_overview(ORIGINAL_UNCLEAR_GROUPS)
             status["original_batch_plan"] = _batch_plan_status(ORIGINAL_BATCH_PLAN, ORIGINAL_SEARCH_ATTEMPTS)
             status["original_search_attempts"] = _search_attempt_status(ORIGINAL_SEARCH_ATTEMPTS)
-        if "broad_visual_match" in requested:
+        if "broad_visual_match" in requested or "rough_visual_match" in requested:
             paths["broad_visual_match"] = _path_status(BROAD_VISUAL_DB)
-            status["broad_visual_match"] = _broad_visual_status()
+            status["broad_visual_match"] = _broad_visual_status(
+                include_monthly_coverage="broad_visual_match" in requested,
+                include_prefilter_stale_count=False,
+                include_review_runs="broad_visual_match" in requested,
+            )
+            _attach_visual_job_progress(status)
         if "crop_confirmation" in requested:
             status["crop_confirmation"] = self.crop_confirmation_status()
         if "generate_derivatives" in requested:
@@ -197,6 +206,7 @@ class ControlState:
             picker_state = self.picker_state()
             entries = picker_state.crop_entries(crop_filter="all")
             pending_commits = picker_state.pending_crop_commits()
+            crop_estimate_batch = picker_state.latest_crop_estimate_job() or {}
         except Exception as exc:  # noqa: BLE001 - status panel should stay readable if crop state is unavailable.
             return {
                 "exists": False,
@@ -207,6 +217,7 @@ class ControlState:
                 "confirmed_crop_count": 0,
                 "queued_count": 0,
                 "pending_commit_count": 0,
+                "crop_estimate_batch": {},
             }
         with_crop_count = sum(1 for entry in entries if entry.get("crop_has_crop"))
         estimated_crop_count = sum(
@@ -224,6 +235,7 @@ class ControlState:
             "confirmed_crop_count": confirmed_crop_count,
             "queued_count": queued_count,
             "pending_commit_count": int(pending_commits.get("pending_count") or 0),
+            "crop_estimate_batch": crop_estimate_batch,
         }
 
     def run_step(self, step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -287,13 +299,21 @@ class ControlState:
                 raise KeyError(f"Unknown job: {job_id}")
             return dict(job)
 
-    def _active_jobs(self) -> list[dict[str, Any]]:
+    def _active_jobs(self, include_crop_estimates: bool = False) -> list[dict[str, Any]]:
         with self._job_lock:
-            return [
+            active_jobs = [
                 dict(job)
                 for job in self.jobs.values()
                 if job.get("status") in {"queued", "running"}
             ]
+        if include_crop_estimates:
+            try:
+                crop_estimate_jobs = self.picker_state().crop_estimate_jobs(active_only=True)
+            except Exception:  # noqa: BLE001 - status should stay readable if crop state is unavailable.
+                crop_estimate_jobs = []
+            for job in crop_estimate_jobs:
+                active_jobs.append(_crop_estimate_active_job(job))
+        return active_jobs
 
     def picker_state(self) -> original_picker.PickerState:
         with self._picker_lock:
@@ -324,6 +344,14 @@ class ControlState:
     def broad_image_path(self, token: str) -> Path | None:
         with self._picker_lock:
             return self._broad_image_paths.get(token)
+
+    def broad_preview_path(self, token: str, max_size: int | None) -> Path | None:
+        path = self.broad_image_path(token)
+        if path is None or max_size is None:
+            return path
+        picker_state = self.picker_state()
+        picker_token = picker_state.image_token_for_path(path)
+        return picker_state.preview_path(picker_token, max_size)
 
     def _update_active_photo_index_folder(self, step: str, payload: dict[str, Any]) -> None:
         if step not in {"match_easy_originals", "search_originals"}:
@@ -511,6 +539,7 @@ def _run_command(
     process = subprocess.Popen(
         command,
         cwd=Path.cwd(),
+        stdin=subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -577,7 +606,14 @@ def _terminate_process_group(process: subprocess.Popen[Any], force: bool = False
 
 
 def _step_timeout_seconds(step: str) -> int:
-    if step in {"build_photo_index", "refresh_photo_index_metadata", "broad_visual_index", "broad_visual_match"}:
+    if step in {
+        "build_photo_index",
+        "refresh_photo_index_metadata",
+        "broad_visual_index",
+        "broad_visual_match",
+        "rough_prefilter_build",
+        "rough_visual_match",
+    }:
         return 12 * 60 * 60
     return 60 * 60
 
@@ -700,6 +736,8 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             "--canonical-root",
             str(CANONICAL_ROOT),
         ]
+        if payload.get("reconcile_moves_only"):
+            command.append("--reconcile-moves-only")
         for root in roots:
             command.extend(["--index-root", root])
         return [command]
@@ -776,6 +814,17 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
                 "Use Measure accuracy to compare against already confirmed originals, "
                 "or uncheck it before searching unresolved photos."
             )
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        candidate_scope = str(payload.get("candidate_scope") or "date_window_limited")
+        date_window_days = int(payload.get("date_window_days") or 0)
+        if start_date and end_date and candidate_scope == "whole_indexed_library":
+            raise ValueError(
+                "Date-range unresolved search must use a candidate date window. "
+                "Whole indexed library would compare each target to every stored fingerprint."
+            )
+        if candidate_scope == "date_window_limited" and date_window_days <= 0:
+            raise ValueError("Candidate date window must be greater than 0 days.")
         command = [
             python,
             "project365_broad_visual_match.py",
@@ -783,7 +832,7 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             str(CANONICAL_ROOT),
             "match",
             "--candidate-scope",
-            str(payload.get("candidate_scope") or "whole_indexed_library"),
+            candidate_scope,
             "--max-results",
             str(int(payload.get("max_results") or broad_visual_match.DEFAULT_TOP_N)),
             "--density",
@@ -791,8 +840,6 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
         ]
         for entry_id in _payload_list(payload, "entry_ids"):
             command.extend(["--entry-id", entry_id])
-        start_date = str(payload.get("start_date", "")).strip()
-        end_date = str(payload.get("end_date", "")).strip()
         if start_date:
             command.extend(["--start-date", start_date])
         if end_date:
@@ -804,13 +851,64 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             root_text = _folder_root_from_text(str(root))
             if root_text:
                 command.extend(["--candidate-root", root_text])
-        date_window_days = payload.get("date_window_days")
-        if date_window_days not in (None, ""):
-            command.extend(["--date-window-days", str(int(date_window_days))])
+        command.extend(["--date-window-days", str(date_window_days)])
         if payload.get("include_low_quality_candidates"):
             command.append("--include-low-quality")
         if payload.get("resume_existing_run"):
             latest_run_id = _latest_broad_match_run_id(BROAD_VISUAL_DB)
+            if latest_run_id:
+                command.extend(["--resume-run", latest_run_id])
+        if payload.get("dry_run"):
+            command.append("--dry-run")
+        return [command]
+    if step == "rough_prefilter_build":
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "prefilter",
+            "--density",
+            str(int(payload.get("density") or broad_visual_match.DEFAULT_DENSITY)),
+            "--commit-interval",
+            str(int(payload.get("commit_interval") or broad_visual_match.DEFAULT_PREFILTER_COMMIT_INTERVAL)),
+        ]
+        if payload.get("overwrite_existing_prefilter") or payload.get("rebuild_stale_prefilter"):
+            command.append("--overwrite-existing")
+        if payload.get("dry_run"):
+            command.append("--dry-run")
+        return [command]
+    if step == "rough_visual_match":
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "match-no-date",
+            "--max-results",
+            str(int(payload.get("max_results") or broad_visual_match.DEFAULT_TOP_N)),
+            "--shortlist-size",
+            str(int(payload.get("shortlist_size") or broad_visual_match.DEFAULT_PREFILTER_SHORTLIST_SIZE)),
+            "--per-band-hit-limit",
+            str(int(payload.get("per_band_hit_limit") or broad_visual_match.DEFAULT_PREFILTER_BAND_HIT_LIMIT)),
+            "--density",
+            str(int(payload.get("density") or broad_visual_match.DEFAULT_DENSITY)),
+        ]
+        for entry_id in _payload_list(payload, "entry_ids"):
+            command.extend(["--entry-id", entry_id])
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        needed_list = str(payload.get("broad_search_needed_list", "")).strip()
+        if needed_list:
+            command.extend(["--broad-search-needed-list", needed_list])
+        if payload.get("include_low_quality_candidates"):
+            command.append("--include-low-quality")
+        if payload.get("resume_existing_run"):
+            latest_run_id = _latest_rough_no_date_run_id(BROAD_VISUAL_DB)
             if latest_run_id:
                 command.extend(["--resume-run", latest_run_id])
         if payload.get("dry_run"):
@@ -828,6 +926,38 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             "--report-dir",
             str(VERIFY_REPORT_DIR),
         ]
+        for entry_id in _payload_list(payload, "entry_ids"):
+            command.extend(["--entry-id", entry_id])
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        needed_list = str(payload.get("broad_search_needed_list", "")).strip()
+        if needed_list:
+            command.extend(["--broad-search-needed-list", needed_list])
+        return [command]
+    if step == "rough_visual_benchmark":
+        command = [
+            python,
+            "project365_broad_visual_match.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "benchmark",
+            "--use-prefilter",
+            "--max-results",
+            str(int(payload.get("max_results") or broad_visual_match.DEFAULT_TOP_N)),
+            "--shortlist-size",
+            str(int(payload.get("shortlist_size") or broad_visual_match.DEFAULT_PREFILTER_SHORTLIST_SIZE)),
+            "--per-band-hit-limit",
+            str(int(payload.get("per_band_hit_limit") or broad_visual_match.DEFAULT_PREFILTER_BAND_HIT_LIMIT)),
+            "--report-dir",
+            str(VERIFY_REPORT_DIR),
+        ]
+        shortlist_sizes = str(payload.get("shortlist_sizes", "")).strip()
+        if shortlist_sizes:
+            command.extend(["--shortlist-sizes", shortlist_sizes])
         for entry_id in _payload_list(payload, "entry_ids"):
             command.extend(["--entry-id", entry_id])
         start_date = str(payload.get("start_date", "")).strip()
@@ -1063,10 +1193,90 @@ def _persistable_history_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _broad_visual_status() -> dict[str, Any]:
-    status = broad_visual_match.broad_status(BROAD_VISUAL_DB)
+def _broad_visual_status(
+    include_monthly_coverage: bool = True,
+    include_prefilter_stale_count: bool = False,
+    include_review_runs: bool = True,
+) -> dict[str, Any]:
+    if not CANONICAL_ROOT.exists():
+        return {
+            "exists": False,
+            "path": str(CANONICAL_ROOT / "broad_visual_match.sqlite"),
+            "descriptor_count": 0,
+            "descriptor_error_count": 0,
+            "result_count": 0,
+            "latest_run": {},
+            "latest_no_date_run": {},
+            "latest_index_run": {},
+            "rough_prefilter": {},
+            "latest_index_errors": [],
+            "latest_benchmark": {},
+            "monthly_coverage": [],
+            "review_runs": [],
+        }
+    if (
+        not include_monthly_coverage
+        and not include_prefilter_stale_count
+        and not include_review_runs
+    ):
+        status = broad_visual_match.rough_visual_status(BROAD_VISUAL_DB)
+    else:
+        status = broad_visual_match.broad_status(
+            BROAD_VISUAL_DB,
+            include_prefilter_stale_count=include_prefilter_stale_count,
+        )
     status["latest_benchmark"] = _latest_broad_visual_benchmark(VERIFY_REPORT_DIR)
+    status["monthly_coverage"] = _cached_broad_monthly_coverage() if include_monthly_coverage else []
+    status["review_runs"] = broad_visual_match.review_runs(BROAD_VISUAL_DB, limit=10) if include_review_runs else []
     return status
+
+
+def _attach_visual_job_progress(status: dict[str, Any]) -> None:
+    broad = status.get("broad_visual_match") or {}
+    prefilter = broad.get("rough_prefilter") or {}
+    progress_by_step = {
+        "broad_visual_index": ("broad_visual_index_run", broad.get("latest_index_run") or {}),
+        "broad_visual_match": ("broad_visual_run", broad.get("latest_run") or {}),
+        "rough_prefilter_build": ("rough_prefilter_run", prefilter.get("latest_run") or {}),
+        "rough_visual_match": ("rough_visual_run", broad.get("latest_no_date_run") or {}),
+    }
+    for job in status.get("active_jobs") or []:
+        target = progress_by_step.get(str(job.get("step") or ""))
+        if not target:
+            continue
+        key, latest_run = target
+        if _active_visual_run(latest_run):
+            job[key] = latest_run
+
+
+def _active_visual_run(run: dict[str, Any]) -> bool:
+    if not run.get("run_id"):
+        return False
+    status = str(run.get("status") or "running")
+    return status not in {"pass", "fail", "cancelled"} and not str(run.get("finished_at") or "")
+
+
+def _cached_broad_monthly_coverage() -> list[dict[str, Any]]:
+    key = (
+        _file_cache_key(CANONICAL_ROOT / "canonical.db"),
+        _file_cache_key(PHOTO_LIBRARY_INDEX),
+        _file_cache_key(BROAD_VISUAL_DB),
+    )
+    if _BROAD_MONTHLY_COVERAGE_CACHE.get("key") != key:
+        _BROAD_MONTHLY_COVERAGE_CACHE["key"] = key
+        _BROAD_MONTHLY_COVERAGE_CACHE["rows"] = broad_visual_match.monthly_fingerprint_coverage(
+            CANONICAL_ROOT,
+            BROAD_VISUAL_DB,
+        )
+    return list(_BROAD_MONTHLY_COVERAGE_CACHE.get("rows") or [])
+
+
+def _file_cache_key(path: Path) -> tuple[str, int, int]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (str(path), 0, 0)
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def _latest_broad_visual_benchmark(report_dir: Path) -> dict[str, Any]:
@@ -1130,14 +1340,65 @@ def _photo_index_has_geolocation(index_path: Path, path: Path) -> bool:
     return bool(row and row[0] is not None and row[1] is not None)
 
 
+def _photo_index_geolocation_by_path(index_path: Path, paths: list[str]) -> dict[str, bool]:
+    normalized_paths = [str(Path(path).resolve()) for path in paths if str(path or "").strip()]
+    if not normalized_paths or not index_path.exists():
+        return {}
+    try:
+        with sqlite3.connect(index_path, timeout=1) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(photo_library_files)")
+            }
+            if not {"gps_latitude", "gps_longitude"}.issubset(columns):
+                return {}
+            placeholders = ", ".join("?" for _ in normalized_paths)
+            rows = connection.execute(
+                f"""
+                SELECT path, gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
+                FROM photo_library_files
+                WHERE path IN ({placeholders})
+                """,
+                normalized_paths,
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(path): bool(has_geo) for path, has_geo in rows}
+
+
+def _broad_result_photo_facts(result: dict[str, Any], geolocation_by_path: dict[str, bool]) -> dict[str, Any]:
+    width = int(result.get("candidate_width") or 0)
+    height = int(result.get("candidate_height") or 0)
+    path_text = str(result.get("candidate_path") or "").strip()
+    resolved_path = str(Path(path_text).resolve()) if path_text else ""
+    return {
+        "mime_type": str(result.get("mime_type") or "application/octet-stream"),
+        "byte_size": int(result.get("byte_size") or 0),
+        "dimensions": f"{width} x {height}" if width and height else str(result.get("dimensions") or ""),
+        "has_geolocation": bool(geolocation_by_path.get(resolved_path)),
+    }
+
+
 def _workflow_snapshot(step: str = "", include_details: bool = True) -> dict[str, Any]:
     snapshot = {
         "database": _database_snapshot(CANONICAL_ROOT / "canonical.db"),
     }
     if step in {"build_photo_index", "refresh_photo_index_metadata", ""}:
         snapshot["photo_index"] = _photo_index_snapshot(PHOTO_LIBRARY_INDEX)
-    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark", ""}:
-        snapshot["broad_visual_match"] = _broad_visual_status()
+    if step in {
+        "broad_visual_index",
+        "broad_visual_match",
+        "broad_visual_benchmark",
+        "rough_prefilter_build",
+        "rough_visual_match",
+        "rough_visual_benchmark",
+        "",
+    }:
+        snapshot["broad_visual_match"] = _broad_visual_status(
+            include_monthly_coverage=step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark", ""},
+            include_prefilter_stale_count=False,
+            include_review_runs=step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark", ""},
+        )
     if include_details and step in {"match_easy_originals", "search_originals", ""}:
         snapshot["queue"] = _queue_status(ORIGINAL_QUEUE)
         snapshot["original_remainder_overview"] = _remainder_overview(ORIGINAL_UNCLEAR_GROUPS)
@@ -1286,8 +1547,17 @@ def _workflow_run_summary(
         "archive_changed_count": archive_changed_count,
         "zero_change": zero_change,
         "zero_change_message": _zero_change_message(step) if zero_change else "",
+        "warnings": _summary_warnings(step, outputs),
         "error": _safe_error(error, outputs),
     }
+
+
+def _summary_warnings(step: str, outputs: list[dict[str, Any]]) -> list[str]:
+    if step != "broad_visual_match":
+        return []
+    parsed = _parse_key_value_output(outputs)
+    coverage_warning = parsed.get("coverage_warning", "")
+    return [coverage_warning] if coverage_warning else []
 
 
 def _summary_metrics(
@@ -1335,15 +1605,74 @@ def _summary_metrics(
             {"label": "Review-ready entries", "value": str(after.get("original_remainder_overview", {}).get("review_ready_entry_count", 0))},
             {"label": "Search batches", "value": str(batch_after.get("rows", 0))},
         ]
-    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark"}:
-        latest_run = broad_after.get("latest_run") or {}
+    if step == "broad_visual_index":
         latest_index = broad_after.get("latest_index_run") or {}
-        latest_benchmark = broad_after.get("latest_benchmark") or {}
         return [
             {"label": "Stored fingerprints", "value": str(broad_after.get("descriptor_count", 0))},
             {"label": "New/rebuilt fingerprints", "value": str(latest_index.get("indexed_descriptor_count", 0))},
+            {"label": "Reused fingerprints", "value": str(latest_index.get("reused_descriptor_count", 0))},
+            {"label": "Fingerprint errors", "value": str(latest_index.get("error_count", 0))},
+        ]
+    if step == "broad_visual_match":
+        latest_run = broad_after.get("latest_run") or {}
+        processed = max(
+            _to_int(latest_run.get("processed_target_count")),
+            _to_int(latest_run.get("target_count")),
+        )
+        target_count = _to_int(latest_run.get("target_count"))
+        entries_value = f"{processed}/{target_count}" if target_count else str(processed)
+        return [
+            {"label": "Entries searched", "value": entries_value},
+            {"label": "Candidate comparisons", "value": str(latest_run.get("scanned_count", 0))},
+            {"label": "Matched entries", "value": str(latest_run.get("matched_entries", 0))},
+            {"label": "Saved candidate rows", "value": str(latest_run.get("result_count", 0))},
+            {"label": "Search errors", "value": str(latest_run.get("error_count", 0))},
+        ]
+    if step == "broad_visual_benchmark":
+        latest_benchmark = broad_after.get("latest_benchmark") or {}
+        return [
             {"label": "Accuracy targets tested", "value": str(latest_benchmark.get("confirmed_count", 0))},
-            {"label": "Unresolved candidates saved", "value": str(latest_run.get("result_count", 0))},
+            {"label": "Top-1 hits", "value": str(latest_benchmark.get("top_1_count", 0))},
+            {"label": "Top-5 hits", "value": str(latest_benchmark.get("top_5_count", 0))},
+            {"label": "Top-N hits", "value": str(latest_benchmark.get("top_n_count", 0))},
+            {"label": "Benchmark errors", "value": str(latest_benchmark.get("error_count", 0))},
+        ]
+    if step == "rough_prefilter_build":
+        prefilter = broad_after.get("rough_prefilter") or {}
+        latest = prefilter.get("latest_run") or {}
+        return [
+            {"label": "Stored prefilter rows", "value": str(prefilter.get("feature_count", 0))},
+            {"label": "Stale/missing rows", "value": str(prefilter.get("stale_count", 0))},
+            {"label": "New/rebuilt rows", "value": str(latest.get("indexed_feature_count", 0))},
+            {"label": "Reused rows", "value": str(latest.get("reused_feature_count", 0))},
+            {"label": "Prefilter errors", "value": str(latest.get("error_count", 0))},
+        ]
+    if step == "rough_visual_match":
+        latest_run = broad_after.get("latest_no_date_run") or {}
+        metrics = latest_run.get("prefilter_metrics") or {}
+        processed = max(
+            _to_int(latest_run.get("processed_target_count")),
+            _to_int(latest_run.get("target_count")),
+        )
+        target_count = _to_int(latest_run.get("target_count"))
+        entries_value = f"{processed}/{target_count}" if target_count else str(processed)
+        return [
+            {"label": "Entries searched", "value": entries_value},
+            {"label": "Shortlisted candidates", "value": str(metrics.get("shortlist_size", 0))},
+            {"label": "Dense descriptor loads", "value": str(latest_run.get("scanned_count", 0))},
+            {"label": "Matched entries", "value": str(latest_run.get("matched_entries", 0))},
+            {"label": "Saved candidate rows", "value": str(latest_run.get("result_count", 0))},
+            {"label": "Capped band hits", "value": str(metrics.get("capped_band_count", 0))},
+            {"label": "Search errors", "value": str(latest_run.get("error_count", 0))},
+        ]
+    if step == "rough_visual_benchmark":
+        latest_benchmark = broad_after.get("latest_benchmark") or {}
+        return [
+            {"label": "Accuracy targets tested", "value": str(latest_benchmark.get("confirmed_count", 0))},
+            {"label": "Prefilter recall @1000", "value": str(latest_benchmark.get("prefilter_recall_at_1000_count", 0))},
+            {"label": "Top-1 hits", "value": str(latest_benchmark.get("top_1_count", 0))},
+            {"label": "Top-N hits", "value": str(latest_benchmark.get("top_n_count", 0))},
+            {"label": "Benchmark errors", "value": str(latest_benchmark.get("error_count", 0))},
         ]
     if step == "generate_derivatives":
         return [
@@ -1399,6 +1728,10 @@ def _summary_deltas(step: str, before: dict[str, Any], after: dict[str, Any]) ->
         "diarium_derivatives": _numeric_delta(db_before.get("diarium_derivatives"), db_after.get("diarium_derivatives")),
         "broad_descriptors": _numeric_delta(broad_before.get("descriptor_count"), broad_after.get("descriptor_count")),
         "broad_results": _numeric_delta(broad_before.get("result_count"), broad_after.get("result_count")),
+        "rough_prefilter": _numeric_delta(
+            (broad_before.get("rough_prefilter") or {}).get("feature_count"),
+            (broad_after.get("rough_prefilter") or {}).get("feature_count"),
+        ),
     }
     if step == "import_zips":
         return {key: values[key] for key in ("diary_entries", "unique_diary_days", "source_links", "media_records")}
@@ -1408,8 +1741,16 @@ def _summary_deltas(step: str, before: dict[str, Any], after: dict[str, Any]) ->
         return {key: values[key] for key in ("people", "tags")}
     if step == "generate_derivatives":
         return {"diarium_derivatives": values["diarium_derivatives"]}
-    if step in {"broad_visual_index", "broad_visual_match", "broad_visual_benchmark"}:
-        return {key: values[key] for key in ("broad_descriptors", "broad_results")}
+    if step == "broad_visual_index":
+        return {"broad_descriptors": values["broad_descriptors"]}
+    if step == "broad_visual_match":
+        return {"broad_results": values["broad_results"]}
+    if step == "rough_prefilter_build":
+        return {"rough_prefilter": values["rough_prefilter"]}
+    if step == "rough_visual_match":
+        return {"broad_results": values["broad_results"]}
+    if step in {"broad_visual_benchmark", "rough_visual_benchmark"}:
+        return {}
     return values
 
 
@@ -1422,9 +1763,10 @@ def _summary_scope(step: str, payload: dict[str, Any]) -> list[str]:
         return [f"Folders: {'; '.join(str(root) for root in roots)}", f"Mode: {reset}"]
     if step == "refresh_photo_index_metadata":
         roots = payload.get("search_roots") or []
+        mode = "reconcile moved/renamed files" if payload.get("reconcile_moves_only") else "refresh metadata"
         if roots:
-            return [f"Folders: {'; '.join(str(root) for root in roots)}", "Mode: refresh metadata"]
-        return ["Existing indexed folders"]
+            return [f"Folders: {'; '.join(str(root) for root in roots)}", f"Mode: {mode}"]
+        return ["Existing indexed folders", f"Mode: {mode}"]
     if step == "match_easy_originals":
         folder = str(payload.get("photo_index_folder") or "").strip()
         return [f"Photo index folder: {folder}" if folder else "Photo index folder: all indexed folders"]
@@ -1436,13 +1778,34 @@ def _summary_scope(step: str, payload: dict[str, Any]) -> list[str]:
         ]
     if step == "broad_visual_match":
         scope = str(payload.get("target_scope") or "all_unresolved")
-        return [
+        candidate_scope = str(payload.get("candidate_scope") or "date_window_limited")
+        date_window = payload.get("date_window_days")
+        items = [
             f"Target scope: {scope}",
-            f"Candidate scope: {payload.get('candidate_scope') or 'whole_indexed_library'}",
+            f"Candidate scope: {candidate_scope}",
             f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}",
         ]
+        if date_window not in (None, ""):
+            items.insert(2, f"Candidate date window: +/- {date_window} days")
+        return items
     if step == "broad_visual_benchmark":
         return [f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}"]
+    if step == "rough_prefilter_build":
+        return [
+            f"Density: {payload.get('density') or broad_visual_match.DEFAULT_DENSITY}",
+            f"Mode: {'rebuild' if payload.get('overwrite_existing_prefilter') else 'incremental'}",
+        ]
+    if step == "rough_visual_match":
+        return [
+            f"Target scope: {payload.get('target_scope') or 'all_unresolved'}",
+            f"Shortlist size: {payload.get('shortlist_size') or broad_visual_match.DEFAULT_PREFILTER_SHORTLIST_SIZE}",
+            f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}",
+        ]
+    if step == "rough_visual_benchmark":
+        return [
+            f"Shortlist size: {payload.get('shortlist_size') or broad_visual_match.DEFAULT_PREFILTER_SHORTLIST_SIZE}",
+            f"Max results: {payload.get('max_results') or broad_visual_match.DEFAULT_TOP_N}",
+        ]
     if step == "import_digikam_people":
         roots = payload.get("xmp_roots") or []
         csv_path = str(payload.get("suggestions_csv") or "").strip()
@@ -1608,6 +1971,9 @@ def _step_title(step: str) -> str:
         "broad_visual_index": "Broad descriptor index",
         "broad_visual_match": "Broad visual match",
         "broad_visual_benchmark": "Broad visual benchmark",
+        "rough_prefilter_build": "Rough visual prefilter",
+        "rough_visual_match": "No-date visual match",
+        "rough_visual_benchmark": "No-date visual benchmark",
         "diary_enrichment": "Diary enrichment",
         "generate_derivatives": "Working photo copies",
         "face_tagging": "Build tag queue",
@@ -1636,11 +2002,16 @@ def _top_metrics(database: dict[str, Any], photo_index: dict[str, Any]) -> dict[
     }
 
 
-def _workflow_history(history: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _workflow_history(
+    history: list[dict[str, Any]],
+    owners: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for record in reversed(history):
         step = str(record.get("step") or "")
         if not step:
+            continue
+        if owners is not None and _owner_step(step) not in owners:
             continue
         grouped.setdefault(step, [])
         if len(grouped[step]) < 5:
@@ -2003,6 +2374,27 @@ def _latest_broad_match_run_id(db_path: Path) -> str:
             """
             SELECT run_id
             FROM broad_match_runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return str(row[0]) if row else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        connection.close()
+
+
+def _latest_rough_no_date_run_id(db_path: Path) -> str:
+    if not db_path.exists():
+        return ""
+    connection = sqlite3.connect(db_path, timeout=60)
+    try:
+        row = connection.execute(
+            """
+            SELECT run_id
+            FROM broad_match_runs
+            WHERE candidate_scope_json LIKE '%rough_prefilter_no_date%'
             ORDER BY started_at DESC
             LIMIT 1
             """
@@ -2615,7 +3007,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self.end_headers()
                 elif parsed.path == "/api/status":
                     query = urllib.parse.parse_qs(parsed.query)
-                    steps = query.get("step")
+                    steps = query.get("step") or query.get("steps")
                     self._send_json(state.status(steps if steps else None))
                 elif parsed.path == "/api/working-copy-readiness":
                     query = urllib.parse.parse_qs(parsed.query)
@@ -2640,6 +3032,16 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         self._send_error(HTTPStatus.NOT_FOUND, str(exc))
                 elif parsed.path == "/broad/api/status":
                     self._send_json(_broad_visual_status())
+                elif parsed.path == "/broad/api/review-runs":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_json(
+                        {
+                            "runs": broad_visual_match.review_runs(
+                                BROAD_VISUAL_DB,
+                                limit=original_picker._query_int(query, "limit", 25) or 25,
+                            )
+                        }
+                    )
                 elif parsed.path == "/broad/api/results":
                     query = urllib.parse.parse_qs(parsed.query)
                     self._send_json(
@@ -2665,6 +3067,9 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         entry_id=query.get("entry_id", [""])[0],
                         limit=original_picker._query_int(query, "limit", 1) or 1,
                         offset=original_picker._query_int(query, "offset", 0) or 0,
+                        after_date=query.get("after_date", [""])[0],
+                        before_date=query.get("before_date", [""])[0],
+                        picker_queue_path=ORIGINAL_QUEUE,
                     )
                     self._send_json(self._with_broad_image_urls(payload))
                 elif parsed.path == "/broad/api/benchmark-entries":
@@ -2678,7 +3083,11 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                     self._send_json(self._with_broad_image_urls(payload))
                 elif parsed.path.startswith("/broad/image/"):
-                    self._send_broad_image(parsed.path.removeprefix("/broad/image/"))
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_broad_image(
+                        parsed.path.removeprefix("/broad/image/"),
+                        original_picker._query_int(query, "max", None),
+                    )
                 elif parsed.path == "/api/choose-folder":
                     self._send_json(_choose_folder_dialog())
                 elif parsed.path == "/picker/api/choose-folder":
@@ -2770,6 +3179,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         {
                             "entries": state.picker_state().crop_entries(crop_filter=crop_filter),
                             "pending_crop_commits": state.picker_state().pending_crop_commits(),
+                            "crop_estimate_batch": state.picker_state().latest_crop_estimate_job() or {},
                         }
                     )
                 elif parsed.path.startswith("/crop/api/entry/"):
@@ -2875,6 +3285,17 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     state._invalidate_picker_state()
                     self._send_json(result)
                     return
+                if parsed.path == "/broad/api/keep-project365":
+                    payload = self._read_json()
+                    result = broad_visual_match.keep_project365_export_for_broad_entry(
+                        canonical_root=CANONICAL_ROOT,
+                        db_path=BROAD_VISUAL_DB,
+                        run_id=str(payload.get("run_id", "")),
+                        entry_id=str(payload.get("entry_id", "")),
+                    )
+                    state._invalidate_picker_state()
+                    self._send_json(result)
+                    return
                 if parsed.path == "/broad/api/reject-entry":
                     payload = self._read_json()
                     result = broad_visual_match.reject_broad_entry(
@@ -2885,6 +3306,29 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                     state._invalidate_picker_state()
                     self._send_json(result)
+                    return
+                if parsed.path == "/broad/api/undo-entry-decision":
+                    payload = self._read_json()
+                    result = broad_visual_match.undo_broad_entry_decision(
+                        canonical_root=CANONICAL_ROOT,
+                        db_path=BROAD_VISUAL_DB,
+                        run_id=str(payload.get("run_id", "")),
+                        entry_id=str(payload.get("entry_id", "")),
+                    )
+                    state._invalidate_picker_state()
+                    self._send_json(result)
+                    return
+                if parsed.path == "/broad/api/clear-review-run":
+                    payload = self._read_json()
+                    self._send_json(
+                        broad_visual_match.clear_review_run(
+                            BROAD_VISUAL_DB,
+                            run_id=str(payload.get("run_id", "")),
+                        )
+                    )
+                    return
+                if parsed.path == "/broad/api/clear-all-review-runs":
+                    self._send_json(broad_visual_match.clear_all_review_runs(BROAD_VISUAL_DB))
                     return
                 if parsed.path == "/picker/api/decision":
                     payload = self._read_json()
@@ -2935,6 +3379,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     detail = state.picker_state().reset_crop(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
+                        preserve_estimate=bool(payload.get("preserve_estimate")),
                     )
                     self._send_json(detail)
                     return
@@ -3130,8 +3575,8 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
             self.end_headers()
             self.wfile.write(payload)
 
-        def _send_broad_image(self, token: str) -> None:
-            path = state.broad_image_path(urllib.parse.unquote(token))
+        def _send_broad_image(self, token: str, max_size: int | None = None) -> None:
+            path = state.broad_preview_path(urllib.parse.unquote(token), max_size)
             if path is None or not path.exists() or not path.is_file():
                 self._send_error(HTTPStatus.NOT_FOUND, "Image not found")
                 return
@@ -3149,24 +3594,42 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
             entries = []
             for entry in payload.get("entries", []):
                 entry_copy = dict(entry)
-                entry_copy["source_url"] = self._broad_image_url(entry_copy.get("source_path", ""))
+                entry_copy["source_url"] = self._broad_image_url(entry_copy.get("source_path", ""), max_size=1280)
                 entry_copy["source_facts"] = _broad_photo_facts(entry_copy.get("source_path", ""))
-                entry_copy["confirmed_url"] = self._broad_image_url(entry_copy.get("confirmed_path", ""))
+                entry_copy["confirmed_url"] = self._broad_image_url(entry_copy.get("confirmed_path", ""), max_size=1280)
                 entry_copy["confirmed_facts"] = _broad_photo_facts(entry_copy.get("confirmed_path", ""))
                 results = []
+                candidate_paths = [
+                    str(result.get("candidate_path", "")).strip()
+                    for result in entry_copy.get("results", [])
+                    if str(result.get("candidate_path", "")).strip()
+                ]
+                geolocation_by_path = _photo_index_geolocation_by_path(PHOTO_LIBRARY_INDEX, candidate_paths)
                 for result in entry_copy.get("results", []):
                     result_copy = dict(result)
-                    result_copy["candidate_url"] = self._broad_image_url(result_copy.get("candidate_path", ""))
-                    result_copy.update(_broad_photo_facts(result_copy.get("candidate_path", "")))
+                    candidate_url = self._broad_image_url(result_copy.get("candidate_path", ""), max_size=640)
+                    if not candidate_url:
+                        continue
+                    result_copy["candidate_url"] = candidate_url
+                    result_copy.update(_broad_result_photo_facts(result_copy, geolocation_by_path))
                     results.append(result_copy)
                 entry_copy["results"] = results
                 entries.append(entry_copy)
             enriched["entries"] = entries
             return enriched
 
-        def _broad_image_url(self, path_text: str) -> str:
-            token = state.broad_image_token(str(path_text or ""))
-            return f"/broad/image/{urllib.parse.quote(token)}" if token else ""
+        def _broad_image_url(self, path_text: str, max_size: int | None = None) -> str:
+            text = str(path_text or "").strip()
+            path = Path(text)
+            if not text or not path.exists() or not path.is_file():
+                return ""
+            token = state.broad_image_token(text)
+            if not token:
+                return ""
+            url = f"/broad/image/{urllib.parse.quote(token)}"
+            if max_size is not None:
+                url = f"{url}?max={int(max_size)}"
+            return url
 
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             payload = json.dumps({"error": message}).encode("utf-8")
@@ -3184,6 +3647,7 @@ WORKFLOW_STEPS = (
     "build_photo_index",
     "match_easy_originals",
     "broad_visual_match",
+    "rough_visual_match",
     "crop_confirmation",
     "generate_derivatives",
     "face_tagging",
@@ -3197,8 +3661,19 @@ STEP_OWNER = {
     "apply_original_decisions": "match_easy_originals",
     "broad_visual_index": "broad_visual_match",
     "broad_visual_benchmark": "broad_visual_match",
+    "rough_prefilter_build": "rough_visual_match",
+    "rough_visual_benchmark": "rough_visual_match",
     "import_digikam_people": "face_tagging",
 }
+
+
+def _crop_estimate_active_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **job,
+        "step": "crop_confirmation",
+        "kind": "crop_estimate_batch",
+        "cancellable": False,
+    }
 
 
 def _owner_step(step: str) -> str:
@@ -3242,14 +3717,9 @@ def _initial_top_metrics(include_photo_index: bool = True) -> dict[str, Any]:
     canonical_db = CANONICAL_ROOT / "canonical.db"
     photo_gaps = _initial_project365_photo_gap_counts(canonical_db)
     project365_entries = photo_gaps["project365_entries"]
-    return {
+    metrics = {
         "unique_diary_days": _initial_unique_day_count(canonical_db),
         "diary_entries": _initial_entry_count(canonical_db),
-        "photo_index_files": (
-            _initial_photo_index_file_count(PHOTO_LIBRARY_INDEX)
-            if include_photo_index
-            else 0
-        ),
         "project365_entries": project365_entries,
         "missing_photos": photo_gaps["without_identified_original"],
         "missing_photos_percent": _percentage(
@@ -3263,6 +3733,9 @@ def _initial_top_metrics(include_photo_index: bool = True) -> dict[str, Any]:
             project365_entries,
         ),
     }
+    if include_photo_index:
+        metrics["photo_index_files"] = _initial_photo_index_file_count(PHOTO_LIBRARY_INDEX)
+    return metrics
 
 
 def _initial_entry_count(db_path: Path) -> int:
@@ -3552,7 +4025,7 @@ input[type="checkbox"] { width: 16px; min-height: 16px; }
 .source-image { width: 100%; max-height: 560px; object-fit: contain; background: #f1f1ec; border-radius: 6px; }
 .source-meta { display: grid; gap: 4px; }
 .candidate-pane { display: grid; gap: 8px; min-width: 0; }
-.candidate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; align-items: start; }
+.candidate-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
 .candidate-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px; overflow: hidden; display: grid; grid-template-rows: 210px auto auto; gap: 7px; min-width: 0; background: #fff; }
 .candidate-image { width: 100%; height: 210px; object-fit: contain; background: #f1f1ec; border-radius: 6px; }
 .candidate-meta { display: grid; gap: 4px; min-width: 0; }
@@ -3567,13 +4040,21 @@ input[type="checkbox"] { width: 16px; min-height: 16px; }
 .action-button { border: 1px solid var(--line); background: #fff; border-radius: 6px; min-height: 34px; padding: 0 10px; cursor: pointer; }
 .action-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .candidate-card.known-match { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(23, 105, 93, 0.18); }
+.review-loading { opacity: 0.55; transition: opacity 120ms ease; }
+button:disabled { cursor: wait; opacity: 0.62; }
 .path { overflow-wrap: anywhere; font-size: 12px; color: var(--muted); }
 .bad { color: var(--fail); }
 a { color: var(--accent); }
+@media (max-width: 1200px) {
+  .candidate-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 850px) {
   .review-layout { grid-template-columns: 1fr; }
   .source-pane { position: static; }
   .entry-head { position: static; }
+}
+@media (max-width: 560px) {
+  .candidate-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -3587,40 +4068,33 @@ a { color: var(--accent); }
     </div>
   </div>
   <section class="panel">
-    <div class="field-row">
-      <div class="field">
-        <label>Review type</label>
-        <select id="reviewMode">
-          <option value="search">Unresolved search results</option>
-          <option value="benchmark">Accuracy benchmark</option>
-        </select>
-      </div>
-      <div class="field"><label>Run ID</label><input id="runId" placeholder="latest"></div>
-      <div class="field"><label>Project365 entry ID</label><input id="entryId" placeholder="optional"></div>
-      <div class="field"><label>Entries per page</label><input id="limit" type="number" min="1" max="10" value="1"></div>
-    </div>
-    <div class="button-row">
-      <button class="button primary" onclick="loadEntries(0)">Load entries</button>
-      <button class="button" onclick="previousPage()">Previous entry</button>
-      <button class="button" onclick="nextPage()">Next entry</button>
-    </div>
-    <div id="status" class="status" role="status" aria-live="polite">Loading...</div>
-  </section>
+	    <div class="button-row">
+	      <button class="button" onclick="previousPage()">Previous entry</button>
+	      <button class="button" onclick="nextPage()">Next entry</button>
+	      <button id="undoBroadDecisionButton" class="button danger" onclick="undoLastBroadDecision()" disabled>Undo last action</button>
+	    </div>
+	    <div id="status" class="status" role="status" aria-live="polite">Loading...</div>
+	  </section>
   <section id="entries"></section>
 </main>
 <script>
 let currentOffset = 0;
 let currentHasMore = false;
+let currentReviewMode = "search";
+let currentRunId = "";
+let currentEntryId = "";
+let currentEntryDate = "";
+let currentLimit = 1;
+let lastBroadDecision = null;
 function applyInitialQuery() {
   const query = new URLSearchParams(window.location.search);
   const mode = query.get("mode");
   if (mode === "search" || mode === "benchmark") {
-    document.getElementById("reviewMode").value = mode;
+    currentReviewMode = mode;
   }
-  const runId = query.get("run_id") || "";
-  if (runId) document.getElementById("runId").value = runId;
-  const entryId = query.get("entry_id") || "";
-  if (entryId) document.getElementById("entryId").value = entryId;
+  currentRunId = query.get("run_id") || "";
+  currentEntryId = query.get("entry_id") || "";
+  currentLimit = Math.max(1, Math.min(10, Number(query.get("limit") || "1") || 1));
 }
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
@@ -3630,25 +4104,83 @@ async function fetchJson(url, options) {
 }
 async function loadEntries(offset = currentOffset) {
   const params = new URLSearchParams();
-  const mode = document.getElementById("reviewMode").value;
-  const runId = document.getElementById("runId").value.trim();
-  const entryId = document.getElementById("entryId").value.trim();
-  const limit = document.getElementById("limit").value || "1";
-  if (mode === "search" && runId) params.set("run_id", runId);
-  if (entryId) params.set("entry_id", entryId);
-  params.set("limit", limit);
+  const mode = currentReviewMode;
+  if (mode === "search" && currentRunId) params.set("run_id", currentRunId);
+  if (currentEntryId) params.set("entry_id", currentEntryId);
+  params.set("limit", String(currentLimit));
   params.set("offset", String(offset));
+  setReviewBusy(true);
   setStatus(mode === "benchmark" ? "Loading latest accuracy benchmark..." : "Loading stored broad-search candidates...");
   try {
     const endpoint = mode === "benchmark" ? "/broad/api/benchmark-entries" : "/broad/api/review-entries";
     const payload = await fetchJson(`${endpoint}?${params.toString()}`);
     currentOffset = payload.offset || 0;
     currentHasMore = Boolean(payload.has_more);
+    currentEntryDate = (payload.entries || [])[0]?.entry_date || "";
     renderEntries(payload, mode);
     const source = mode === "benchmark" ? (payload.report_path || "no benchmark report") : `run ${payload.run_id || "none"}`;
     setStatus(`${payload.returned_count || 0} entries · ${source} · offset ${currentOffset}`);
   } catch (error) {
     setStatus(error.message, true);
+  } finally {
+    setReviewBusy(false);
+  }
+}
+async function loadEntriesByDate(direction, entryDate) {
+  if (!entryDate) return loadEntries(currentOffset);
+  const params = new URLSearchParams();
+  const mode = currentReviewMode;
+  if (mode === "search" && currentRunId) params.set("run_id", currentRunId);
+  params.set("limit", String(currentLimit));
+  params.set("offset", "0");
+  params.set(direction === "before" ? "before_date" : "after_date", entryDate);
+  setReviewBusy(true);
+  setStatus(mode === "benchmark" ? "Loading latest accuracy benchmark..." : "Loading stored broad-search candidates...");
+  try {
+    const endpoint = mode === "benchmark" ? "/broad/api/benchmark-entries" : "/broad/api/review-entries";
+    const payload = await fetchJson(`${endpoint}?${params.toString()}`);
+    currentOffset = payload.offset || 0;
+    currentHasMore = Boolean(payload.has_more);
+    currentEntryDate = (payload.entries || [])[0]?.entry_date || "";
+    currentEntryId = "";
+    renderEntries(payload, mode);
+    const source = mode === "benchmark" ? (payload.report_path || "no benchmark report") : `run ${payload.run_id || "none"}`;
+    setStatus(`${payload.returned_count || 0} entries · ${source} · ${direction} ${entryDate}`);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    setReviewBusy(false);
+  }
+}
+async function loadEntriesAfterRemoval(removedEntryDate) {
+  const referenceDate = removedEntryDate || currentEntryDate;
+  if (!referenceDate) return loadEntries(currentOffset);
+  await loadEntriesByDate("after", referenceDate);
+  if (!currentEntryDate) await loadEntriesByDate("before", referenceDate);
+}
+async function loadEntryById(entryId, runId = currentRunId) {
+  if (!entryId) return loadEntries(currentOffset);
+  const params = new URLSearchParams();
+  if (runId) params.set("run_id", runId);
+  params.set("entry_id", entryId);
+  params.set("limit", "1");
+  params.set("offset", "0");
+  setReviewBusy(true);
+  setStatus("Reloading restored entry...");
+  try {
+    const payload = await fetchJson(`/broad/api/review-entries?${params.toString()}`);
+    currentReviewMode = "search";
+    currentRunId = payload.run_id || runId || "";
+    currentEntryId = entryId;
+    currentOffset = payload.offset || 0;
+    currentHasMore = Boolean(payload.has_more);
+    currentEntryDate = (payload.entries || [])[0]?.entry_date || "";
+    renderEntries(payload, "search");
+    setStatus(`${payload.returned_count || 0} entries · run ${payload.run_id || "none"} · restored ${entryId}`);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    setReviewBusy(false);
   }
 }
 function renderEntries(payload, mode) {
@@ -3670,6 +4202,7 @@ function renderEntries(payload, mode) {
         </div>
         <div class="button-row">
           <div class="meta">${entryStatus(entry, mode)} · ${(entry.results || []).length} stored candidates</div>
+          ${mode === "search" ? `<button class="button" onclick="keepProject365Photo('${escapeJs(payload.run_id || "")}', '${escapeJs(entry.entry_id || "")}')">Use Project365 photo</button>` : ""}
           ${mode === "search" ? `<button class="button danger" onclick="rejectBroadEntry('${escapeJs(payload.run_id || "")}', '${escapeJs(entry.entry_id || "")}')">Reject all</button>` : ""}
         </div>
       </div>
@@ -3711,30 +4244,46 @@ function entryStatus(entry, mode) {
 }
 function renderCandidates(entry, rows, mode) {
   if (!rows.length) return `<div class="subtle">No candidates stored for this entry.</div>`;
-  return rows.map(row => {
+  return rows.map((row, index) => {
     const matchesKnown = candidateMatchesKnownOriginal(entry, row);
+    const factsId = `candidate-facts-${safeDomId(entry.entry_id || "entry")}-${index}`;
     return `
     <div class="candidate-card ${matchesKnown ? "known-match" : ""}">
-      ${row.candidate_url ? `<img class="candidate-image" src="${escapeHtml(row.candidate_url)}" loading="lazy" alt="">` : `<div class="candidate-image subtle">Image unavailable.</div>`}
+      ${row.candidate_url ? `<img class="candidate-image" src="${escapeHtml(row.candidate_url)}" loading="lazy" alt="" data-facts-target="${escapeHtml(factsId)}" onload="syncCandidateImageFacts(this)">` : `<div class="candidate-image subtle">Image unavailable.</div>`}
       <div class="candidate-meta">
         <div class="candidate-title">${matchesKnown ? "Known original" : "Candidate"}${matchesKnown ? ` <span class="match-badge">match</span>` : ""}</div>
         <div class="candidate-filename-row">
           <div class="file-name" title="${escapeHtml(row.candidate_path || "")}">${escapeHtml(row.candidate_filename || fileName(row.candidate_path))}</div>
           ${locationIndicator(row.has_geolocation)}
         </div>
-        <div class="facts">${escapeHtml(formatBroadPhotoFacts({
+        <div class="facts" id="${escapeHtml(factsId)}" data-mime-type="${escapeHtml(row.mime_type || "")}" data-byte-size="${Number(row.byte_size || 0)}" data-dimensions="${escapeHtml(row.dimensions || "")}" data-has-geolocation="${row.has_geolocation ? "1" : "0"}">${escapeHtml(formatBroadPhotoFacts({
           mime_type: row.mime_type,
           byte_size: row.byte_size,
           dimensions: row.dimensions,
           has_geolocation: row.has_geolocation
         }))}</div>
       </div>
-      ${mode === "search" && row.result_id
+      ${mode === "search" && row.result_id && row.candidate_url
         ? `<div class="candidate-actions"><button class="action-button primary" onclick="confirmBroadMatch(${Number(row.result_id || 0)})">Match</button></div>`
         : ""}
     </div>
   `;
   }).join("");
+}
+function safeDomId(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+function syncCandidateImageFacts(image) {
+  const targetId = image.dataset.factsTarget || "";
+  const target = targetId ? document.getElementById(targetId) : null;
+  if (!target || !image.naturalWidth || !image.naturalHeight) return;
+  target.dataset.dimensions = `${image.naturalWidth} x ${image.naturalHeight}`;
+  target.textContent = formatBroadPhotoFacts({
+    mime_type: target.dataset.mimeType || "",
+    byte_size: Number(target.dataset.byteSize || 0),
+    dimensions: target.dataset.dimensions || "",
+    has_geolocation: target.dataset.hasGeolocation === "1"
+  });
 }
 function candidateMatchesKnownOriginal(entry, row) {
   return Boolean(entry.confirmed_path && row.candidate_path && entry.confirmed_path === row.candidate_path);
@@ -3753,16 +4302,19 @@ async function confirmBroadMatch(resultId) {
     return;
   }
   setStatus("Recording broad visual match...");
+  setReviewBusy(true);
   try {
     const payload = await fetchJson("/broad/api/confirm-match", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify({result_id: resultId})
     });
-    setStatus(`Matched ${payload.entry_id || "entry"}.`);
-    await loadEntries(currentOffset);
+    setLastBroadDecision(payload);
+    setStatus(`Matched ${payload.entry_id || "entry"}. Loading next entry...`);
+    await loadEntriesAfterRemoval(payload.entry_date || "");
   } catch (error) {
     setStatus(error.message, true);
+    setReviewBusy(false);
   }
 }
 async function rejectBroadEntry(runId, entryId) {
@@ -3771,16 +4323,41 @@ async function rejectBroadEntry(runId, entryId) {
     return;
   }
   setStatus("Recording broad visual rejection...");
+  setReviewBusy(true);
   try {
     const payload = await fetchJson("/broad/api/reject-entry", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify({run_id: runId, entry_id: entryId})
     });
-    setStatus(`Rejected ${payload.rejected_count || 0} candidates for ${payload.entry_id || entryId}.`);
-    await loadEntries(currentOffset);
+    setLastBroadDecision(payload);
+    setStatus(`Rejected ${payload.rejected_count || 0} candidates for ${payload.entry_id || entryId}. Loading next entry...`);
+    await loadEntriesAfterRemoval(payload.entry_date || "");
   } catch (error) {
     setStatus(error.message, true);
+    setReviewBusy(false);
+  }
+}
+async function keepProject365Photo(runId, entryId) {
+  if (!entryId) {
+    setStatus("This entry cannot use the Project365 photo.", true);
+    return;
+  }
+  if (!window.confirm("Keep the Project365 export for this entry and remove it from Broad Visual Review?")) return;
+  setStatus("Recording Project365 photo fallback...");
+  setReviewBusy(true);
+  try {
+    const payload = await fetchJson("/broad/api/keep-project365", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({run_id: runId, entry_id: entryId})
+    });
+    setLastBroadDecision(payload);
+    setStatus(`Kept Project365 photo for ${payload.entry_id || entryId}. Loading next entry...`);
+    await loadEntriesAfterRemoval(payload.entry_date || "");
+  } catch (error) {
+    setStatus(error.message, true);
+    setReviewBusy(false);
   }
 }
 function formatBroadPhotoFacts(facts = {}) {
@@ -3800,13 +4377,58 @@ function formatFileSize(bytes) {
   return `${bytes} B`;
 }
 function previousPage() {
-  const limit = Number(document.getElementById("limit").value || "1");
-  loadEntries(Math.max(0, currentOffset - limit));
+  if (currentEntryDate) loadEntriesByDate("before", currentEntryDate);
+  else loadEntries(Math.max(0, currentOffset - currentLimit));
 }
 function nextPage() {
-  if (!currentHasMore) return;
-  const limit = Number(document.getElementById("limit").value || "1");
-  loadEntries(currentOffset + limit);
+  if (currentEntryDate) loadEntriesByDate("after", currentEntryDate);
+  else if (currentHasMore) loadEntries(currentOffset + currentLimit);
+}
+async function undoLastBroadDecision() {
+  if (!lastBroadDecision) {
+    setStatus("No Broad Visual action is available to undo.", true);
+    return;
+  }
+  const action = lastBroadDecision;
+  setReviewBusy(true);
+  setStatus("Undoing last Broad Visual action...");
+  try {
+    const payload = await fetchJson("/broad/api/undo-entry-decision", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({run_id: action.run_id, entry_id: action.entry_id})
+    });
+    setLastBroadDecision(null);
+    setStatus(`Undid ${payload.decision || "decision"} for ${payload.entry_id || action.entry_id}. Reloading entry...`);
+    await loadEntryById(payload.entry_id || action.entry_id, payload.run_id || action.run_id);
+  } catch (error) {
+    setStatus(error.message, true);
+    setReviewBusy(false);
+  }
+}
+function setLastBroadDecision(payload) {
+  if (payload && payload.run_id && payload.entry_id) {
+    lastBroadDecision = {
+      run_id: String(payload.run_id),
+      entry_id: String(payload.entry_id),
+      decision: String(payload.decision || "")
+    };
+  } else {
+    lastBroadDecision = null;
+  }
+  updateUndoButton();
+}
+function updateUndoButton() {
+  const button = document.getElementById("undoBroadDecisionButton");
+  if (!button) return;
+  button.disabled = !lastBroadDecision;
+}
+function setReviewBusy(isBusy) {
+  document.getElementById("entries").classList.toggle("review-loading", Boolean(isBusy));
+  document.querySelectorAll("button").forEach(button => {
+    button.disabled = Boolean(isBusy);
+  });
+  if (!isBusy) updateUndoButton();
 }
 function setStatus(message, error = false) {
   const target = document.getElementById("status");
@@ -3832,6 +4454,7 @@ function fileName(path) {
   return parts[parts.length - 1] || text;
 }
 applyInitialQuery();
+updateUndoButton();
 loadEntries(0);
 </script>
 </body>
@@ -4281,6 +4904,66 @@ pre {
 .compact-list strong {
   text-align: right;
 }
+.compact-list .coverage-table-wrap {
+  display: block;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 5px;
+}
+.compact-list .review-runs-wrap {
+  display: grid;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 5px;
+}
+.compact-list .review-runs-head,
+.compact-list .review-run-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+.review-run-label {
+  overflow-wrap: anywhere;
+}
+.review-run-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.review-run-actions {
+  display: flex;
+  gap: 6px;
+}
+.coverage-table-wrap h3 {
+  margin: 0 0 6px;
+}
+.coverage-table-scroll {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.coverage-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+}
+.coverage-table th,
+.coverage-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+.coverage-table th:first-child,
+.coverage-table td:first-child {
+  text-align: left;
+}
+.coverage-table tr.low-coverage td {
+  color: var(--fail);
+  font-weight: 600;
+}
 .step-list {
   margin: 0;
   padding-left: 18px;
@@ -4471,6 +5154,10 @@ a { color: var(--accent); }
         Replace existing photo index
       </label>
       <button class="button primary" onclick="buildPhotoIndex()">Build photo index</button>
+      <label class="checkbox-line">
+        <input id="reconcileMovedPhotoIndex" type="checkbox">
+        Moved/renamed only
+      </label>
       <button class="button" onclick="refreshPhotoIndexMetadata()">Refresh existing index metadata</button>
       <div id="photoIndexMessage" class="inline-status" role="status" aria-live="polite"></div>
       <div class="step-result" data-step-result="build_photo_index"></div>
@@ -4558,21 +5245,21 @@ a { color: var(--accent); }
           <label title="Which Project365 entries to test, benchmark, or search. These dates are the target entries, not candidate-photo metadata dates.">Project365 entries to test/search</label>
           <select id="broadTargetScope">
             <option value="all_unresolved">All unresolved</option>
-            <option value="entry_ids">Entry IDs</option>
+            <option value="entry_ids">Specific entries</option>
             <option value="date_range">Date range</option>
             <option value="broad_search_needed_list">Broad-search-needed list</option>
           </select>
-          <div class="field-hint">Use Date range or Entry IDs for a small test before running a broad unresolved search.</div>
+          <div class="field-hint">Use Date range or Specific entries for a small test before running a broad unresolved search.</div>
         </div>
         <div class="field">
-          <label title="Which indexed original-photo candidates each Project365 entry is compared against. This is separate from the Project365 date range.">Original candidates to compare</label>
+          <label title="Which indexed original-photo candidates each Project365 entry is compared against. Date-window is the safe default for unresolved date-range searches.">Original candidates to compare</label>
           <select id="broadCandidateScope">
+            <option value="date_window_limited">Only candidates dated near each entry</option>
             <option value="whole_indexed_library">Whole indexed library</option>
             <option value="folder_limited">Folder-limited</option>
-            <option value="date_window_limited">Only candidates dated near each entry</option>
             <option value="same_setting_folder_limited">Same-setting/folder-limited</option>
           </select>
-          <div class="field-hint">Use Whole indexed library for accuracy checks. Use date-window only when you want to limit candidate photos by their own dates.</div>
+          <div class="field-hint">Date-window compares each target only with already-fingerprinted candidates whose own dates are nearby. Whole indexed library is intentionally broad.</div>
         </div>
         <div class="field">
           <label title="How many candidate originals to keep for each Project365 entry.">Candidates kept per entry</label>
@@ -4584,21 +5271,22 @@ a { color: var(--accent); }
           <div class="field-hint">Default 9 is a balanced setting for landscape originals cropped into square Project365 exports.</div>
         </div>
         <div class="field">
-          <label title="Used only when Original candidates to compare is set to 'Only candidates dated near each entry'. A value of 30 means candidates within plus/minus 30 days of each Project365 entry date.">Candidate date window, +/- days</label>
-          <input id="broadDateWindowDays" type="number" min="0" value="0">
-          <div class="field-hint">Not the same as Start/End date. Leave 0 unless using the date-window candidate filter; then try 30 to 90 days.</div>
+          <label title="Used when Original candidates to compare is set to 'Only candidates dated near each entry'. A value of 30 means candidates within plus/minus 30 days of each Project365 entry date.">Candidate date window, +/- days</label>
+          <input id="broadDateWindowDays" type="number" min="0" value="30">
+          <div class="field-hint">Default 30 keeps date-range unresolved searches bounded to nearby already-fingerprinted originals.</div>
         </div>
         <div class="field">
-          <label title="Use only when Project365 entries to test/search is set to Entry IDs. Separate multiple IDs with semicolons.">Project365 entry IDs</label>
-          <input id="broadEntryIds" placeholder="project365:1998-04-12; project365:1998-04-13">
+          <label title="Use only when Project365 entries to test/search is set to Specific entries. Separate multiple dates or IDs with semicolons.">Specific entry dates</label>
+          <input id="broadEntryIds" placeholder="2026-09-11; 2026-09-12">
+          <div class="field-hint">Dates are converted to Project365 entry IDs when the command runs.</div>
         </div>
         <div class="field">
-          <label title="First Project365 entry date for a date-range target scope. This does not set the candidate date window.">Target start date</label>
-          <input id="broadStartDate" placeholder="YYYY-MM-DD">
+          <label title="First Project365 entry date for a date-range target scope. Candidate filtering is controlled by Original candidates to compare.">Target start date</label>
+          <input id="broadStartDate" placeholder="YYYY-MM-DD or YYYY-MM">
         </div>
         <div class="field">
-          <label title="Last Project365 entry date for a date-range target scope. This does not set the candidate date window.">Target end date</label>
-          <input id="broadEndDate" placeholder="YYYY-MM-DD">
+          <label title="Last Project365 entry date for a date-range target scope. Candidate filtering is controlled by Original candidates to compare.">Target end date</label>
+          <input id="broadEndDate" placeholder="YYYY-MM-DD or YYYY-MM">
         </div>
         <div class="field">
           <label title="Optional file containing Project365 entry IDs that need broad search.">Broad-search-needed list</label>
@@ -4606,19 +5294,130 @@ a { color: var(--accent); }
         </div>
       </div>
       <label class="checkbox-line" title="Include candidates that the broad index would otherwise skip as low quality. Usually leave off for the first pass."><input id="broadIncludeLowQuality" type="checkbox"> Include low-quality candidates</label>
-      <label class="checkbox-line" title="Only affects Build fingerprints. It fingerprints originals that are already confirmed for the selected Project365 entries, so Measure accuracy can compare predicted results to known originals."><input id="broadConfirmedOnly" type="checkbox"> Fingerprint already confirmed originals</label>
+      <label class="checkbox-line" title="Only affects Build fingerprints for accuracy benchmarks. It fingerprints originals that are already confirmed for the selected Project365 entries; it does not rebuild monthly candidate coverage."><input id="broadConfirmedOnly" type="checkbox"> Fingerprint already confirmed originals for accuracy benchmark</label>
       <label class="checkbox-line" title="Only affects Search unresolved photos. Continues the latest broad match run if one exists."><input id="broadResumeExisting" type="checkbox"> Resume existing match run</label>
       <label class="checkbox-line" title="Only affects Build/refresh index. When unchecked, already-current fingerprints are skipped for speed. When checked, every scanned item is recomputed."><input id="broadOverwriteFingerprints" type="checkbox"> Overwrite existing fingerprints</label>
       <label class="checkbox-line" title="Show what would run without writing index, match, or report output."><input id="broadDryRun" type="checkbox"> Dry run</label>
       <div class="button-row">
         <button class="button primary" title="Step 1. Fingerprint original-photo candidates into the separate broad database." onclick="buildBroadVisualIndex()">1. Build fingerprints</button>
         <button class="button" title="Step 2 for known-answer testing. Exports accuracy numbers for entries that already have confirmed originals." onclick="runBroadVisualBenchmark()">2. Measure accuracy</button>
+        <button class="button" title="Check selected date-window fingerprint coverage before starting a search." onclick="checkBroadVisualCoverage()">Check coverage</button>
         <button class="button primary" title="Step 3 for unresolved photos. Uses an existing index to precompute broad candidates for review." onclick="runBroadVisualMatch()">3. Search unresolved photos</button>
-        <button id="broadReviewResultsButton" class="button" data-review-mode="search" title="Step 4. Opens Broad Visual Review. The count updates after status loads." onclick="openBroadVisualReview()">4. Review results (loading)</button>
+        <button id="broadReviewResultsButton" class="button primary" data-review-mode="search" title="Step 4. Opens saved Broad Visual results. The count updates after status loads." onclick="openBroadVisualReview()">4. Review results (loading)</button>
+      </div>
+      <div class="review-options">
+        <h3>Review options</h3>
+        <div class="grid">
+          <div class="field">
+            <label>Review type</label>
+            <select id="broadReviewMode" onchange="this.dataset.userSelected = '1'">
+              <option value="search">Unresolved search results</option>
+              <option value="benchmark">Accuracy benchmark</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Run ID</label>
+            <input id="broadReviewRunId" placeholder="latest">
+          </div>
+          <div class="field">
+            <label title="Optional jump target for already-saved review results. Use a Project365 date, or paste a raw project365:YYYY-MM-DD entry ID from a result URL.">Jump to entry date</label>
+            <input id="broadReviewEntryId" placeholder="YYYY-MM-DD or project365:YYYY-MM-DD">
+            <div class="field-hint">Leave blank to open the first saved result.</div>
+          </div>
+          <div class="field">
+            <label>Entries per page</label>
+            <input id="broadReviewLimit" type="number" min="1" max="10" value="1">
+          </div>
+        </div>
       </div>
       <div id="broadVisualMessage" class="inline-status" role="status" aria-live="polite"></div>
       <div class="step-result" data-step-result="broad_visual_match"></div>
       <div class="step-history" data-step-history="broad_visual_match"></div>
+      </div>
+    </section>
+
+    <section class="panel workflow-step" data-step="rough_visual_match">
+      <div class="workflow-step-header">
+        <div>
+          <div class="step-kicker">Step 4B</div>
+          <h2>No-Date Visual Match</h2>
+        </div>
+        <div class="step-status-bar" data-step-status="rough_visual_match">No runs yet</div>
+        <button class="button small step-toggle" data-step-toggle="rough_visual_match" onclick="toggleWorkflowStep('rough_visual_match')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+      <div class="subtle">Separate no-date search for unresolved originals. It builds a rough prefilter from stored fingerprints, shortlists candidates without date constraints, then uses the dense scorer only on the shortlist.</div>
+      <div id="roughVisualBox" class="compact-list"></div>
+      <div class="grid">
+        <div class="field">
+          <label title="Which unresolved Project365 entries to search without candidate date constraints.">Project365 entries to search</label>
+          <select id="roughTargetScope">
+            <option value="all_unresolved">All unresolved</option>
+            <option value="entry_ids">Specific entries</option>
+            <option value="date_range">Date range</option>
+            <option value="broad_search_needed_list">Broad-search-needed list</option>
+          </select>
+        </div>
+        <div class="field">
+          <label title="Maximum rough candidates loaded into the dense scorer for each Project365 entry.">Shortlist size</label>
+          <input id="roughShortlistSize" type="number" min="1" value="1000">
+        </div>
+        <div class="field">
+          <label title="Maximum stored prefilter rows accepted from any one rough lookup band.">Per-band hit cap</label>
+          <input id="roughPerBandHitLimit" type="number" min="1" value="50000">
+        </div>
+        <div class="field">
+          <label title="How many final candidates to save per Project365 entry for manual review.">Candidates kept per entry</label>
+          <input id="roughMaxResults" type="number" min="1" value="20">
+        </div>
+        <div class="field">
+          <label title="Must match the density used for the stored broad fingerprints.">Square crop positions</label>
+          <input id="roughDensity" type="number" min="1" value="9">
+        </div>
+        <div class="field">
+          <label title="Use only when Project365 entries to search is set to Specific entries. Separate multiple dates or IDs with semicolons.">Specific entry dates</label>
+          <input id="roughEntryIds" placeholder="2026-09-11; 2026-09-12">
+          <div class="field-hint">Dates are converted to Project365 entry IDs when the command runs.</div>
+        </div>
+        <div class="field">
+          <label title="First unresolved target date for a bounded no-date run. Candidate dates are ignored.">Target start date</label>
+          <input id="roughStartDate" placeholder="YYYY-MM-DD or YYYY-MM">
+        </div>
+        <div class="field">
+          <label title="Last unresolved target date for a bounded no-date run. Candidate dates are ignored.">Target end date</label>
+          <input id="roughEndDate" placeholder="YYYY-MM-DD or YYYY-MM">
+        </div>
+        <div class="field">
+          <label title="Optional file containing Project365 entry IDs that need broad search.">Broad-search-needed list</label>
+          <input id="roughNeededList" placeholder="/path/to/entry_ids.csv">
+        </div>
+        <div class="field">
+          <label title="Only affects Measure no-date accuracy. Reports rough prefilter recall at several shortlist cutoffs.">Accuracy benchmark depth</label>
+          <select id="roughBenchmarkShortlistSizes">
+            <option value="100,500,1000,5000" selected>Standard: 100 / 500 / 1,000 / 5,000</option>
+            <option value="100,500,1000">Quick: 100 / 500 / 1,000</option>
+            <option value="500,1000,5000,10000">Deep: 500 / 1,000 / 5,000 / 10,000</option>
+          </select>
+        </div>
+      </div>
+      <label class="checkbox-line" title="Include candidates that the broad index marked as low-quality."><input id="roughIncludeLowQuality" type="checkbox"> Include low-quality candidates</label>
+      <label class="checkbox-line" title="Only affects Build rough prefilter. When unchecked, current rows are reused."><input id="roughOverwritePrefilter" type="checkbox"> Overwrite existing prefilter rows</label>
+      <label class="checkbox-line" title="Only affects no-date search. Continues the latest no-date match run if one exists."><input id="roughResumeExisting" type="checkbox"> Resume existing no-date run</label>
+      <label class="checkbox-line" title="Show what would run without writing prefilter, match, or report output."><input id="roughDryRun" type="checkbox"> Dry run</label>
+      <div class="button-row">
+        <button class="button primary" title="Build compact rough lookup rows from stored broad fingerprints." onclick="buildRoughPrefilter()">1. Build rough prefilter</button>
+        <button class="button" title="Check whether rough prefilter rows exist for the current dense fingerprint method." onclick="checkRoughPrefilterReadiness()">Check readiness</button>
+        <button class="button primary" title="Search unresolved entries without candidate date constraints, then densely score only the shortlist." onclick="runRoughVisualMatch()">2. Search no-date matches</button>
+        <button class="button" title="Benchmark prefilter recall separately from final dense rank recall." onclick="runRoughVisualBenchmark()">Measure no-date accuracy</button>
+        <button id="roughReviewResultsButton" class="button" title="Open saved no-date visual review rows." onclick="openRoughVisualReview()">Review no-date results</button>
+      </div>
+      <div class="field">
+        <label>Review run ID</label>
+        <input id="roughReviewRunId" placeholder="latest no-date run">
+      </div>
+      <div id="roughVisualMessage" class="inline-status" role="status" aria-live="polite"></div>
+      <div class="step-result" data-step-result="rough_visual_match"></div>
+      <div class="step-history" data-step-history="rough_visual_match"></div>
       </div>
     </section>
 
@@ -4635,11 +5434,11 @@ a { color: var(--accent); }
       <div class="subtle">After an original has been selected, confirm the square crop on the identified original next to the Project365 target.</div>
       <div id="cropConfirmationOverview" class="result-grid"></div>
       <div class="button-row">
-        <button id="estimateCropBatchButton" class="button" type="button" onclick="startCropEstimateBatch()">Batch estimate crop</button>
-        <label class="checkbox-line inline-checkbox">
-          <input id="applyCropEstimates" type="checkbox">
-          Apply estimates
-        </label>
+	        <button id="estimateCropBatchButton" class="button" type="button" onclick="startCropEstimateBatch()">Batch estimate crop</button>
+	        <label class="checkbox-line inline-checkbox">
+	          <input id="applyCropEstimates" type="checkbox" checked>
+	          Save estimates as calculated
+	        </label>
         <button id="openCropConfirmationButton" class="button" type="button" onclick="openCropConfirmation()">Open crop confirmation</button>
         <span id="cropEstimateBatchStatus" class="inline-status" role="status" aria-live="polite"></span>
       </div>
@@ -4788,6 +5587,8 @@ const STEP_OWNER = {
   apply_original_decisions: "match_easy_originals",
   broad_visual_index: "broad_visual_match",
   broad_visual_benchmark: "broad_visual_match",
+  rough_prefilter_build: "rough_visual_match",
+  rough_visual_benchmark: "rough_visual_match",
   import_digikam_people: "face_tagging"
 };
 const initialStep = new URLSearchParams(window.location.search).get("step") || "";
@@ -4823,10 +5624,13 @@ async function loadStatus(steps) {
     renderPhotoIndexBox(payload);
     renderEasyMatchBox(payload);
     renderBroadVisualBox(payload);
+    renderRoughVisualBox(payload);
     renderCropConfirmationBox(payload);
+    attachCropEstimateBatchJob(payload);
     renderBatchOverview(payload);
     renderAttemptOverview(payload);
     scheduleActiveStatusRefresh(payload);
+    return payload;
   } catch (error) {
     setStatusLoadError(`Could not load current database status: ${error.message}`);
     throw error;
@@ -4901,7 +5705,7 @@ function renderWorkingCopyReadiness(payload) {
     <div class="result-metric"><span>Source chosen</span><strong>${sources}</strong></div>
     <div class="result-metric"><span>Already current</span><strong>${current}</strong></div>
     <div class="result-metric"><span>Need update</span><strong>${needsUpdate}</strong></div>
-    <div class="result-metric"><span>Needs crop</span><strong>${notReady}</strong></div>
+    <div class="result-metric"><span>Not ready</span><strong>${notReady}</strong></div>
   `;
 }
 
@@ -4941,6 +5745,16 @@ function renderCropConfirmationBox(payload) {
   `;
 }
 
+function attachCropEstimateBatchJob(payload) {
+  const job = (payload.crop_confirmation || {}).crop_estimate_batch || {};
+  if (!job.id) return;
+  renderCropEstimateBatchJob(job);
+  if (job.status === "queued" || job.status === "running") {
+    const button = document.getElementById("estimateCropBatchButton");
+    if (button) button.dataset.jobId = job.id;
+  }
+}
+
 function renderTopMetrics(payload) {
   const metrics = payload.top_metrics || {};
   const project365Total = Number(metrics.project365_entries || 0);
@@ -4951,7 +5765,9 @@ function renderTopMetrics(payload) {
     formatCountPercent(metrics.missing_photos || 0, project365Total)
   );
   setText("metricAssociatedPhotos", metrics.associated_photos || 0);
-  setText("metricPhotoIndexFiles", metrics.photo_index_files || 0);
+  if (Object.prototype.hasOwnProperty.call(metrics, "photo_index_files")) {
+    setText("metricPhotoIndexFiles", metrics.photo_index_files || 0);
+  }
 }
 
 function formatCountPercent(count, total) {
@@ -5045,7 +5861,12 @@ function formatCropConfirmationStatus(crop) {
 }
 
 function openCropConfirmation() {
-  window.location.assign("/crop");
+  const job = ((lastStatus || {}).crop_confirmation || {}).crop_estimate_batch || {};
+  const url = new URL("/crop", window.location.href);
+  if (job.apply_estimates && Number(job.estimated_count || 0) > 0 && ["queued", "running"].includes(job.status || "")) {
+    url.searchParams.set("crop_filter", "estimated");
+  }
+  window.location.assign(url.toString());
 }
 
 function setDiaryEnrichmentMessage(message, isError = false) {
@@ -5257,7 +6078,7 @@ function formatWorkflowStatus(record, active) {
 function formatWorkflowResult(record, active) {
   if (active) return formatActiveWorkflowResult(record);
   const summary = record.summary || {};
-  const metrics = (summary.metrics || []).map(metric => `
+  const metrics = workflowHistoryMetrics(record).map(metric => `
     <div class="result-metric"><span>${escapeHtml(metric.label)}</span><strong>${escapeHtml(metric.value)}</strong></div>
   `).join("");
   const scope = (summary.scope || []).length
@@ -5275,12 +6096,16 @@ function formatWorkflowResult(record, active) {
     : "";
   const zeroMessage = summary.zero_change_message || (showArchives ? "Known ZIP inputs were unchanged or skipped." : "");
   const zero = summary.zero_change && zeroMessage ? `<div class="status-note"><strong>No changes.</strong> ${escapeHtml(zeroMessage)}</div>` : "";
+  const warnings = (summary.warnings || []).map(warning => `
+    <div class="status-note bad"><strong>Warning:</strong> ${escapeHtml(warning)}</div>
+  `).join("");
   const error = summary.error ? `<div class="status-note bad"><strong>Error:</strong> ${escapeHtml(summary.error)}</div>` : "";
   return `
     ${scope}
     <div class="result-grid">${metrics}</div>
     ${archives}
     ${zero}
+    ${warnings}
     ${error}
   `;
 }
@@ -5288,11 +6113,16 @@ function formatWorkflowResult(record, active) {
 function formatActiveWorkflowResult(job) {
   const startedAt = Date.parse(job.started_at || new Date().toISOString());
   const elapsed = formatElapsed(Date.now() - startedAt);
-  const jobId = job.job_id || activeJobId;
+  const canCancel = job.cancellable !== false;
+  const jobId = canCancel ? (job.job_id || activeJobId) : "";
   const canCancelStart = !jobId && running && (job.status === "starting" || job.status === "running");
   const actionLabel = jobId ? "Stop" : "Cancel";
   const status = job.status || "running";
   const liveLabel = ["queued", "running", "starting", "cancelling"].includes(status) ? "Working" : formatJobStatus(status);
+  const progressPercent = jobProgressPercent(job);
+  const progressStyle = progressPercent === null
+    ? ""
+    : ` style="width: ${progressPercent.toFixed(1)}%; animation: none; transform: none;"`;
   return `
     <div class="run-progress status-${escapeHtml(status)}">
       <div class="run-progress-header">
@@ -5305,13 +6135,44 @@ function formatActiveWorkflowResult(job) {
           <button class="button danger small" onclick="cancelActiveJob()" ${jobId || canCancelStart ? "" : "hidden"}>${escapeHtml(actionLabel)}</button>
         </div>
       </div>
-      <div class="progress-track"><div class="progress-bar"></div></div>
+      <div class="progress-track"><div class="progress-bar"${progressStyle}></div></div>
       <div class="subtle run-progress-detail">
         <span class="run-progress-text">${escapeHtml(progressDetail(job))}</span>
         <span class="run-progress-live">${escapeHtml(liveLabel)}</span>
       </div>
     </div>
   `;
+}
+
+function jobProgressPercent(job) {
+  const step = job.step || progressStep;
+  if (job.kind === "crop_estimate_batch") {
+    return percentComplete(job.processed_count, job.target_count);
+  }
+  if (step === "broad_visual_index") {
+    const run = job.broad_visual_index_run || {};
+    return percentComplete(run.scanned_count, run.total_candidate_count);
+  }
+  if (step === "broad_visual_match") {
+    const run = job.broad_visual_run || {};
+    return percentComplete(run.processed_target_count, run.target_count);
+  }
+  if (step === "rough_prefilter_build") {
+    const run = job.rough_prefilter_run || {};
+    return percentComplete(run.scanned_count, run.total_descriptor_count);
+  }
+  if (step === "rough_visual_match") {
+    const run = job.rough_visual_run || {};
+    return percentComplete(run.processed_target_count, run.target_count);
+  }
+  return null;
+}
+
+function percentComplete(done, total) {
+  const totalCount = Number(total || 0);
+  if (!totalCount) return null;
+  const doneCount = Math.max(0, Math.min(Number(done || 0), totalCount));
+  return Math.max(0, Math.min(100, (doneCount / totalCount) * 100));
 }
 
 function formatArchiveResults(archives, hiddenCount = 0, totalCount = 0, anomalyCount = 0, changedCount = 0) {
@@ -5347,12 +6208,79 @@ function formatArchiveResults(archives, hiddenCount = 0, totalCount = 0, anomaly
 
 function formatWorkflowHistory(records) {
   const rows = records.map(record => {
-    const metrics = ((record.summary || {}).metrics || []).slice(0, 2)
+    const metrics = workflowHistoryMetrics(record).slice(0, 2)
       .map(metric => `${metric.label}: ${metric.value}`)
       .join(" · ");
     return `<div><span>${escapeHtml(formatShortDateTime(record.finished_at || record.started_at))}</span><strong>${escapeHtml(formatJobStatus(record.status || ""))}${metrics ? " · " + escapeHtml(metrics) : ""}</strong></div>`;
   }).join("");
   return `<div class="run-list">${rows}</div>`;
+}
+
+function workflowHistoryMetrics(record) {
+  const metrics = ((record.summary || {}).metrics || []);
+  const step = record.step || "";
+  if (step === "broad_visual_match") {
+    return metrics
+      .filter(metric => [
+        "Entries searched",
+        "Candidate comparisons",
+        "Matched entries",
+        "Saved candidate rows",
+        "Search errors",
+        "Unresolved candidates saved"
+      ].includes(metric.label))
+      .map(metric => metric.label === "Unresolved candidates saved"
+        ? { label: "Saved candidate rows", value: metric.value }
+        : metric
+      );
+  }
+  if (step === "broad_visual_index") {
+    return metrics.filter(metric => [
+      "Stored fingerprints",
+      "New/rebuilt fingerprints",
+      "Reused fingerprints",
+      "Fingerprint errors"
+    ].includes(metric.label));
+  }
+  if (step === "broad_visual_benchmark") {
+    return metrics.filter(metric => [
+      "Accuracy targets tested",
+      "Top-1 hits",
+      "Top-5 hits",
+      "Top-N hits",
+      "Benchmark errors"
+    ].includes(metric.label));
+  }
+  if (step === "rough_prefilter_build") {
+    return metrics.filter(metric => [
+      "Stored prefilter rows",
+      "Stale/missing rows",
+      "New/rebuilt rows",
+      "Reused rows",
+      "Prefilter errors"
+    ].includes(metric.label));
+  }
+  if (step === "rough_visual_match") {
+    return metrics.filter(metric => [
+      "Entries searched",
+      "Shortlisted candidates",
+      "Dense descriptor loads",
+      "Matched entries",
+      "Saved candidate rows",
+      "Capped band hits",
+      "Search errors"
+    ].includes(metric.label));
+  }
+  if (step === "rough_visual_benchmark") {
+    return metrics.filter(metric => [
+      "Accuracy targets tested",
+      "Prefilter recall @1000",
+      "Top-1 hits",
+      "Top-N hits",
+      "Benchmark errors"
+    ].includes(metric.label));
+  }
+  return metrics;
 }
 
 function setText(id, value) {
@@ -5414,6 +6342,8 @@ function renderBroadVisualBox(payload) {
   const latestIndex = broad.latest_index_run || {};
   const latestBenchmark = broad.latest_benchmark || {};
   const active = (payload.active_jobs || []).find(job => ownerStep(job.step) === "broad_visual_match");
+  const activeIndex = active && active.step === "broad_visual_index";
+  const activeSearch = active && active.step === "broad_visual_match";
   updateBroadReviewButton(latestBenchmark, latestRun);
   const skippedIndex = Math.max(
     0,
@@ -5434,15 +6364,75 @@ function renderBroadVisualBox(payload) {
     <div><span>New/rebuilt fingerprints</span><strong>${latestIndex.indexed_descriptor_count || 0}</strong></div>
     <div><span>Already reused</span><strong>${latestIndex.reused_descriptor_count || 0}</strong></div>
     <div><span>Not fingerprinted</span><strong>${skippedIndex}</strong></div>
-    <div><span>Speed</span><strong>${escapeHtml(formatBroadIndexThroughput(latestIndex, Boolean(active)))}</strong></div>
+    <div><span>Speed</span><strong>${escapeHtml(formatBroadIndexThroughput(latestIndex, Boolean(activeIndex)))}</strong></div>
     <div><span>Current item</span><strong>${escapeHtml(formatBroadCurrentItem(latestIndex))}</strong></div>
     <div><span>Date coverage</span><strong>${escapeHtml(formatBroadDateCoverage(latestIndex))}</strong></div>
     <div><span>Latest fingerprint errors</span><strong>${escapeHtml(formatBroadIndexErrors(broad.latest_index_errors || [], Number(latestIndex.error_count || 0)))}</strong></div>
     <div><span>Latest accuracy benchmark</span><strong>${escapeHtml(formatBroadBenchmarkSummary(latestBenchmark))}</strong></div>
-    <div><span>Latest unresolved search</span><strong>${escapeHtml(formatBroadSearchSummary(latestRun))}</strong></div>
+    <div><span>Latest unresolved search</span><strong>${escapeHtml(formatBroadSearchSummary(latestRun, Boolean(activeSearch)))}</strong></div>
+    <div><span>Search heartbeat</span><strong>${escapeHtml(formatBroadSearchHeartbeat(latestRun, Boolean(activeSearch)))}</strong></div>
     <div><span>Saved unresolved candidate rows</span><strong>${latestRun.result_count || 0}</strong></div>
     <div><span>Errors</span><strong>${Number(latestIndex.error_count || 0) + Number(latestRun.error_count || 0) + Number(latestBenchmark.error_count || 0)}</strong></div>
+    ${renderBroadReviewRunControls(broad.review_runs || [])}
+    ${renderBroadMonthlyCoverage(broad.monthly_coverage || [])}
   `;
+  if (!activeSearch && latestRun.run_id) {
+    setStepMessage("broad_visual_match", broadVisualRunCompleteMessage(latestRun));
+  }
+}
+
+function renderRoughVisualBox(payload) {
+  const target = document.getElementById("roughVisualBox");
+  if (!target) return;
+  const broad = payload.broad_visual_match || {};
+  const prefilter = broad.rough_prefilter || {};
+  const latestBuild = prefilter.latest_run || {};
+  const latestRun = broad.latest_no_date_run || {};
+  const metrics = latestRun.prefilter_metrics || {};
+  const active = (payload.active_jobs || []).find(job => ownerStep(job.step) === "rough_visual_match");
+  const activeBuild = active && active.step === "rough_prefilter_build";
+  const activeSearch = active && active.step === "rough_visual_match";
+  const reviewButton = document.getElementById("roughReviewResultsButton");
+  if (reviewButton) {
+    const count = Number(latestRun.matched_entries || 0);
+    reviewButton.textContent = count ? `Review no-date results (${count})` : "Review no-date results (0)";
+  }
+  const reviewRun = document.getElementById("roughReviewRunId");
+  if (reviewRun && !reviewRun.value && latestRun.run_id) reviewRun.placeholder = latestRun.run_id;
+  target.innerHTML = `
+    <div><span>Rough prefilter</span><strong>${prefilter.ready ? "ready" : "not ready"} · ${prefilter.feature_count || 0} rows · ${prefilter.band_count || 0} bands</strong></div>
+    <div><span>Source fingerprints</span><strong>${prefilter.descriptor_count || 0}</strong></div>
+    <div><span>Stale/missing prefilter rows</span><strong>${prefilter.stale_count || 0}</strong></div>
+    <div><span>Latest prefilter build</span><strong>${escapeHtml(formatRoughBuildSummary(latestBuild, Boolean(activeBuild)))}</strong></div>
+    <div><span>Latest prefilter errors</span><strong>${escapeHtml(formatBroadIndexErrors(prefilter.latest_errors || [], Number(prefilter.error_count || 0)))}</strong></div>
+    <div><span>Active job</span><strong>${active ? escapeHtml(`${formatStepName(active.step || "")} · ${active.status || "running"}`) : "none"}</strong></div>
+    <div><span>Latest no-date search</span><strong>${escapeHtml(formatBroadSearchSummary(latestRun, Boolean(activeSearch)))}</strong></div>
+    <div><span>No-date search heartbeat</span><strong>${escapeHtml(formatBroadSearchHeartbeat(latestRun, Boolean(activeSearch)))}</strong></div>
+    <div><span>Shortlisted candidates</span><strong>${metrics.shortlist_size || 0}</strong></div>
+    <div><span>Dense descriptor loads</span><strong>${latestRun.scanned_count || 0}</strong></div>
+    <div><span>Capped band hits</span><strong>${metrics.capped_band_count || 0}</strong></div>
+    <div><span>Prefilter timing</span><strong>${formatElapsed(Number(metrics.elapsed_ms || 0))}</strong></div>
+  `;
+  if (!activeSearch && latestRun.run_id) {
+    setStepMessage("rough_visual_match", roughVisualRunCompleteMessage(latestRun));
+  }
+}
+
+function formatRoughBuildSummary(latestBuild, active) {
+  if (!latestBuild || !latestBuild.run_id) return "none yet";
+  const total = Number(latestBuild.total_descriptor_count || 0);
+  const scanned = Number(latestBuild.scanned_count || 0);
+  const progress = total ? `${scanned}/${total}` : `${scanned}`;
+  const state = active ? "running" : (latestBuild.status || "finished");
+  return `${state} · ${progress} fingerprints checked · ${latestBuild.indexed_feature_count || 0} built · ${latestBuild.reused_feature_count || 0} reused`;
+}
+
+function roughVisualRunCompleteMessage(latestRun) {
+  if (!Number(latestRun.target_count || 0)) {
+    return "No-date visual search found no entries in the selected scope. Nothing was searched.";
+  }
+  const metrics = latestRun.prefilter_metrics || {};
+  return `No-date visual match complete: ${latestRun.processed_target_count || 0}/${latestRun.target_count || 0} entries, ${metrics.shortlist_size || 0} shortlisted, ${latestRun.scanned_count || 0} dense descriptor loads, ${latestRun.result_count || 0} saved rows.`;
 }
 
 function updateBroadReviewButton(latestBenchmark, latestRun) {
@@ -5460,6 +6450,131 @@ function updateBroadReviewButton(latestBenchmark, latestRun) {
     ? `Open Broad Visual Review: ${parts.join(", ")} entries available.`
     : "Open Broad Visual Review. No accuracy benchmark or unresolved search entries are available yet.";
   button.dataset.reviewMode = searchCount ? "search" : "benchmark";
+  const modeSelect = document.getElementById("broadReviewMode");
+  if (modeSelect && !modeSelect.dataset.userSelected) {
+    modeSelect.value = button.dataset.reviewMode;
+  }
+}
+
+function broadVisualRunCompleteMessage(latestRun) {
+  if (!Number(latestRun.target_count || 0)) {
+    return "Broad visual search found no entries in the selected scope. Nothing was searched.";
+  }
+  return `Broad visual match complete: ${latestRun.processed_target_count || 0}/${latestRun.target_count || 0} entries, ${latestRun.scanned_count || 0} candidate comparisons, ${latestRun.result_count || 0} saved rows.`;
+}
+
+function renderBroadReviewRunControls(runs) {
+  const rows = (runs || []).filter(run => Number(run.result_count || 0) || Number(run.decision_count || 0));
+  if (!rows.length) return `<div class="review-runs-wrap"><span>Previous reviews</span><strong>none stored</strong></div>`;
+  const body = rows.map(run => `
+    <div class="review-run-row">
+      <div>
+        <div class="review-run-label">${escapeHtml(run.run_id || "")}</div>
+        <div class="review-run-meta">${escapeHtml(formatBroadReviewRun(run))}</div>
+      </div>
+      <div class="review-run-actions">
+        <button class="button small" onclick="openBroadVisualReview('search', '${escapeJs(run.run_id || "")}')">Open</button>
+        <button class="button danger small" onclick="clearBroadReviewRunFromControl('${escapeJs(run.run_id || "")}')">Clear</button>
+      </div>
+    </div>
+  `).join("");
+  return `
+    <div class="review-runs-wrap">
+      <div class="review-runs-head">
+        <span>Previous reviews</span>
+        <button class="button danger small" onclick="clearAllBroadReviewRunsFromControl()">Clear all</button>
+      </div>
+      ${body}
+    </div>
+  `;
+}
+
+function formatBroadReviewRun(run) {
+  const pieces = [
+    run.status || "unknown",
+    `${Number(run.entry_count || 0)} entries`,
+    `${Number(run.result_count || 0)} candidates`
+  ];
+  const processed = Number(run.processed_target_count || 0);
+  const targets = Number(run.target_count || 0);
+  if (targets) pieces.push(`${processed}/${targets} searched`);
+  if (run.started_at) pieces.push(formatShortDateTime(run.started_at));
+  return pieces.join(" | ");
+}
+
+async function clearBroadReviewRunFromControl(runId) {
+  if (!runId) return;
+  if (!window.confirm("Clear stored Broad Visual review rows for this run? Confirmed originals and rejected-original records are kept.")) return;
+  setStepMessage("broad_visual_match", "Clearing stored review rows...", "running");
+  try {
+    const payload = await fetchJson("/broad/api/clear-review-run", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({run_id: runId})
+    });
+    setStepMessage("broad_visual_match", `Cleared ${payload.cleared_results || 0} candidate rows from ${payload.run_id || runId}.`);
+    await loadStatus(["broad_visual_match"]);
+  } catch (error) {
+    setStepMessage("broad_visual_match", error.message, "error");
+  }
+}
+
+async function clearAllBroadReviewRunsFromControl() {
+  if (!window.confirm("Clear all stored Broad Visual review rows? Confirmed originals and rejected-original records are kept.")) return;
+  setStepMessage("broad_visual_match", "Clearing all stored review rows...", "running");
+  try {
+    const payload = await fetchJson("/broad/api/clear-all-review-runs", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: "{}"
+    });
+    setStepMessage("broad_visual_match", `Cleared ${payload.cleared_results || 0} candidate rows from ${payload.cleared_runs || 0} run(s).`);
+    await loadStatus(["broad_visual_match"]);
+  } catch (error) {
+    setStepMessage("broad_visual_match", error.message, "error");
+  }
+}
+
+function renderBroadMonthlyCoverage(rows) {
+  if (!rows.length) return `<div><span>Monthly fingerprint coverage</span><strong>none yet</strong></div>`;
+  const body = rows.map(row => {
+    const photoCount = Number(row.photo_index_count || 0);
+    const fingerprintCount = Number(row.fingerprint_count || 0);
+    const coverage = photoCount ? fingerprintCount / photoCount : 0;
+    const low = photoCount >= 20 && coverage < 0.8;
+    return `
+      <tr class="${low ? "low-coverage" : ""}">
+        <td>${escapeHtml(row.month || "")}</td>
+        <td>${photoCount}</td>
+        <td>${fingerprintCount}</td>
+        <td>${formatPercent(coverage)}</td>
+        <td>${Number(row.missing_original_targets || 0)}</td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <div class="coverage-table-wrap">
+      <h3>Monthly fingerprint coverage</h3>
+      <div class="coverage-table-scroll">
+        <table class="coverage-table">
+          <thead>
+            <tr>
+              <th>Month</th>
+              <th>Indexed photos</th>
+              <th>Fingerprints</th>
+              <th>Coverage</th>
+              <th>Missing originals</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function formatPercent(value) {
+  return `${(Number(value || 0) * 100).toFixed(1)}%`;
 }
 
 function formatBroadRunState(active, latestRun) {
@@ -5561,10 +6676,28 @@ function formatBroadBenchmarkSummary(latestBenchmark) {
   return `${tested} known originals tested · ${top1} top choice · ${topN} in top ${latestBenchmark.max_results || "N"} · ${misses} missed`;
 }
 
-function formatBroadSearchSummary(latestRun) {
+function formatBroadSearchSummary(latestRun, active) {
   if (!latestRun || !latestRun.run_id) return "none yet";
   const scope = formatJsonScope(latestRun.target_scope_json || "");
-  return `${latestRun.target_count || 0} unresolved entries searched · ${latestRun.matched_entries || 0} entries have saved candidates${scope ? ` · ${scope}` : ""}`;
+  const total = Number(latestRun.target_count || 0);
+  const done = Number(latestRun.processed_target_count || 0);
+  const current = Number(latestRun.current_target_index || 0);
+  const progress = active && total ? `${done}/${total} done${current > done ? ` · checking ${current}/${total}` : ""}` : `${total} searched`;
+  return `${progress} · ${latestRun.scanned_count || 0} candidates scanned · ${latestRun.matched_entries || 0} entries have saved candidates${scope ? ` · ${scope}` : ""}`;
+}
+
+function formatBroadSearchHeartbeat(latestRun, active) {
+  if (!latestRun || !latestRun.run_id) return "none yet";
+  const phase = latestRun.phase || (active ? "running" : "finished");
+  const entry = latestRun.current_entry_id || "";
+  const candidateCount = Number(latestRun.current_candidate_count || 0);
+  const heartbeatAt = latestRun.heartbeat_at ? Date.parse(latestRun.heartbeat_at) : 0;
+  const age = heartbeatAt ? `${formatElapsed(Date.now() - heartbeatAt)} ago` : "unknown";
+  const pieces = [phase];
+  if (entry) pieces.push(entry);
+  if (candidateCount) pieces.push(`${candidateCount} current candidates`);
+  pieces.push(`updated ${age}`);
+  return pieces.join(" · ");
 }
 
 function formatJsonScope(value) {
@@ -5596,7 +6729,19 @@ function formatShortDateTime(value) {
   if (!value) return "unknown time";
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString();
+  return [
+    parsed.getFullYear(),
+    pad2(parsed.getMonth() + 1),
+    pad2(parsed.getDate())
+  ].join("-") + " " + [
+    pad2(parsed.getHours()),
+    pad2(parsed.getMinutes()),
+    pad2(parsed.getSeconds())
+  ].join(":");
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
 }
 
 function formatCanonicalEntries(db) {
@@ -5802,7 +6947,7 @@ function formatBatchAttempt(batch) {
   const count = Number(batch.search_attempt_count || "0");
   if (!count) return "not searched";
   const candidates = batch.latest_search_candidate_count || "0";
-  return `${batch.latest_search_finished_at || "unknown time"} · ${candidates} candidates`;
+  return `${formatShortDateTime(batch.latest_search_finished_at)} · ${candidates} candidates`;
 }
 
 function renderAttemptOverview(payload) {
@@ -5815,7 +6960,7 @@ function renderAttemptOverview(payload) {
   }
   const rows = attempts.map(attempt => `
     <tr>
-      <td>${escapeHtml(attempt.finished_at || "")}</td>
+      <td>${escapeHtml(formatShortDateTime(attempt.finished_at || ""))}</td>
       <td>${escapeHtml(formatAttemptScope(attempt))}</td>
       <td>${escapeHtml(replaceAllText(attempt.search_roots || "", ";", "; "))}</td>
       <td class="number">${escapeHtml(attempt.unclear_entry_count || "0")}</td>
@@ -5997,11 +7142,15 @@ async function buildPhotoIndex() {
 
 async function refreshPhotoIndexMetadata() {
   const searchRoots = parseDelimited("indexRoots");
+  const reconcileMovesOnly = document.getElementById("reconcileMovedPhotoIndex").checked;
   const message = searchRoots.length
-    ? "Refreshing metadata for selected folder..."
-    : "Refreshing metadata for existing indexed folders...";
+    ? (reconcileMovesOnly ? "Reconciling moved/renamed files in selected folder..." : "Refreshing metadata for selected folder...")
+    : (reconcileMovesOnly ? "Reconciling moved/renamed files in existing indexed folders..." : "Refreshing metadata for existing indexed folders...");
   setStepMessage("refresh_photo_index_metadata", message, "running");
-  await runStep("refresh_photo_index_metadata", {search_roots: searchRoots});
+  await runStep("refresh_photo_index_metadata", {
+    search_roots: searchRoots,
+    reconcile_moves_only: reconcileMovesOnly
+  });
 }
 
 async function buildBroadVisualIndex() {
@@ -6010,11 +7159,15 @@ async function buildBroadVisualIndex() {
     setStepMessage("broad_visual_index", "Choose a date range, entry IDs, or list for a constrained confirmed-only index.", "error");
     return;
   }
+  if (settings.confirmed_only) {
+    setStepMessage("broad_visual_index", "Confirmed-only fingerprints support Measure accuracy; they do not improve Monthly fingerprint coverage.", "running");
+  }
   await runStep("broad_visual_index", settings);
 }
 
 async function runBroadVisualMatch() {
   const settings = broadVisualSettings();
+  const trigger = activeButton();
   if (settings.confirmed_only) {
     setStepMessage("broad_visual_match", "Fingerprint already confirmed originals is for Build fingerprints plus Measure accuracy. Uncheck it before searching unresolved photos.", "error");
     return;
@@ -6039,7 +7192,26 @@ async function runBroadVisualMatch() {
     setStepMessage("broad_visual_match", "Set Candidate date window, +/- days. This is separate from Target start/end date; use 30 to 90 days, or choose Whole indexed library.", "error");
     return;
   }
-  await runStep("broad_visual_match", settings);
+  if (settings.target_scope === "date_range" && settings.candidate_scope === "whole_indexed_library") {
+    setStepMessage("broad_visual_match", "Date-range unresolved search must use a candidate date window. Whole indexed library compares each target to every stored fingerprint.", "error");
+    return;
+  }
+  setButtons(true, trigger);
+  markButtonRunning(trigger, true);
+  setStepMessage("broad_visual_match", "Checking fingerprint coverage before search...", "running");
+  try {
+    const coverage = await checkBroadVisualCoverage();
+    if (coverage.blocking) return;
+    await runStep("broad_visual_match", settings, trigger);
+  } catch (error) {
+    setStepMessage("broad_visual_match", error.message || "Could not start broad visual search.", "error");
+    document.getElementById("output").textContent = error.message || String(error);
+  } finally {
+    if (!running) {
+      markButtonRunning(trigger, false);
+      setButtons(false);
+    }
+  }
 }
 
 async function runBroadVisualBenchmark() {
@@ -6047,10 +7219,102 @@ async function runBroadVisualBenchmark() {
   await runStep("broad_visual_benchmark", settings);
 }
 
-function openBroadVisualReview() {
+function roughVisualSettings() {
+  const scope = document.getElementById("roughTargetScope")?.value || "all_unresolved";
+  return {
+    target_scope: scope,
+    entry_ids: scope === "entry_ids" ? parseDelimited("roughEntryIds").map(normalizeProject365EntryJump).filter(Boolean) : [],
+    start_date: scope === "date_range" ? document.getElementById("roughStartDate").value.trim() : "",
+    end_date: scope === "date_range" ? document.getElementById("roughEndDate").value.trim() : "",
+    broad_search_needed_list: scope === "broad_search_needed_list" ? document.getElementById("roughNeededList").value.trim() : "",
+    shortlist_size: Number(document.getElementById("roughShortlistSize").value || "1000"),
+    per_band_hit_limit: Number(document.getElementById("roughPerBandHitLimit").value || "50000"),
+    max_results: Number(document.getElementById("roughMaxResults").value || "20"),
+    density: Number(document.getElementById("roughDensity").value || "9"),
+    shortlist_sizes: document.getElementById("roughBenchmarkShortlistSizes").value.trim(),
+    include_low_quality_candidates: Boolean(document.getElementById("roughIncludeLowQuality").checked),
+    overwrite_existing_prefilter: Boolean(document.getElementById("roughOverwritePrefilter").checked),
+    resume_existing_run: Boolean(document.getElementById("roughResumeExisting").checked),
+    dry_run: Boolean(document.getElementById("roughDryRun").checked)
+  };
+}
+
+async function buildRoughPrefilter() {
+  const settings = roughVisualSettings();
+  await runStep("rough_prefilter_build", settings);
+}
+
+async function checkRoughPrefilterReadiness() {
+  setStepMessage("rough_visual_match", "Checking rough prefilter readiness...", "running");
+  const status = await loadStatus(["rough_visual_match"]);
+  const prefilter = ((status.broad_visual_match || {}).rough_prefilter || {});
+  if (prefilter.ready && !Number(prefilter.stale_count || 0)) {
+    setStepMessage("rough_visual_match", `Rough prefilter ready: ${prefilter.feature_count || 0} rows.`);
+    return true;
+  }
+  if (prefilter.ready) {
+    setStepMessage("rough_visual_match", `Rough prefilter has ${prefilter.feature_count || 0} rows, with ${prefilter.stale_count || 0} stale or missing. Build rough prefilter before a large no-date run.`, "error");
+    return false;
+  }
+  setStepMessage("rough_visual_match", "Build rough prefilter before running no-date matching.", "error");
+  return false;
+}
+
+async function runRoughVisualMatch() {
+  const settings = roughVisualSettings();
+  if (settings.target_scope === "entry_ids" && !settings.entry_ids.length) {
+    setStepMessage("rough_visual_match", "Enter at least one entry ID.", "error");
+    return;
+  }
+  if (settings.target_scope === "date_range" && (!settings.start_date || !settings.end_date)) {
+    setStepMessage("rough_visual_match", "Enter both target start and end dates.", "error");
+    return;
+  }
+  if (settings.target_scope === "broad_search_needed_list" && !settings.broad_search_needed_list) {
+    setStepMessage("rough_visual_match", "Enter a broad-search-needed list path.", "error");
+    return;
+  }
+  if (!settings.shortlist_size || settings.shortlist_size <= 0) {
+    setStepMessage("rough_visual_match", "Shortlist size must be greater than 0.", "error");
+    return;
+  }
+  if (!settings.per_band_hit_limit || settings.per_band_hit_limit <= 0) {
+    setStepMessage("rough_visual_match", "Per-band hit cap must be greater than 0.", "error");
+    return;
+  }
+  await runStep("rough_visual_match", settings);
+}
+
+async function runRoughVisualBenchmark() {
+  const settings = roughVisualSettings();
+  await runStep("rough_visual_benchmark", settings);
+}
+
+function openBroadVisualReview(modeOverride = "", runIdOverride = "") {
   const button = document.getElementById("broadReviewResultsButton");
-  const mode = button?.dataset.reviewMode || "search";
-  window.location.assign(`/broad-review?mode=${encodeURIComponent(mode)}`);
+  const modeSelect = document.getElementById("broadReviewMode");
+  const mode = modeOverride || modeSelect?.value || button?.dataset.reviewMode || "search";
+  const runId = runIdOverride || document.getElementById("broadReviewRunId")?.value.trim() || "";
+  const entryId = normalizeProject365EntryJump(document.getElementById("broadReviewEntryId")?.value || "");
+  const limit = Math.max(1, Math.min(10, Number(document.getElementById("broadReviewLimit")?.value || "1") || 1));
+  const params = new URLSearchParams();
+  params.set("mode", mode);
+  if (mode === "search" && runId) params.set("run_id", runId);
+  if (entryId) params.set("entry_id", entryId);
+  params.set("limit", String(limit));
+  window.location.assign(`/broad-review?${params.toString()}`);
+}
+
+function normalizeProject365EntryJump(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return /^\\d{4}-\\d{2}-\\d{2}$/.test(text) ? `project365:${text}` : text;
+}
+
+function openRoughVisualReview() {
+  const typedRunId = document.getElementById("roughReviewRunId")?.value.trim() || "";
+  const latestRunId = (((lastStatus || {}).broad_visual_match || {}).latest_no_date_run || {}).run_id || "";
+  openBroadVisualReview("search", typedRunId || latestRunId);
 }
 
 function broadVisualSettings() {
@@ -6058,7 +7322,7 @@ function broadVisualSettings() {
   return {
     candidate_roots: parseDelimited("broadCandidateRoots"),
     target_scope: scope,
-    entry_ids: scope === "entry_ids" ? parseDelimited("broadEntryIds") : [],
+    entry_ids: scope === "entry_ids" ? parseDelimited("broadEntryIds").map(normalizeProject365EntryJump).filter(Boolean) : [],
     start_date: scope === "date_range" ? document.getElementById("broadStartDate").value.trim() : "",
     end_date: scope === "date_range" ? document.getElementById("broadEndDate").value.trim() : "",
     broad_search_needed_list: scope === "broad_search_needed_list" ? document.getElementById("broadNeededList").value.trim() : "",
@@ -6072,6 +7336,119 @@ function broadVisualSettings() {
     overwrite_existing_fingerprints: Boolean(document.getElementById("broadOverwriteFingerprints").checked),
     dry_run: Boolean(document.getElementById("broadDryRun").checked)
   };
+}
+
+async function checkBroadVisualCoverage() {
+  const settings = broadVisualSettings();
+  let status = lastStatus || {};
+  if (!((status.broad_visual_match || {}).monthly_coverage || []).length) {
+    setStepMessage("broad_visual_match", "Checking fingerprint coverage...", "running");
+    status = await loadStatus(["broad_visual_match"]);
+  }
+  const coverage = broadCoveragePreview(settings, status);
+  setStepMessage("broad_visual_match", coverage.message, coverage.ok ? "" : "error");
+  return coverage;
+}
+
+function broadCoveragePreview(settings, status) {
+  if (settings.candidate_scope !== "date_window_limited") {
+    return {ok: true, blocking: false, message: "Coverage check applies to date-window candidate searches."};
+  }
+  const rows = ((status.broad_visual_match || {}).monthly_coverage || []);
+  if (!rows.length) {
+    return {ok: false, blocking: true, message: "Fingerprint coverage is unavailable. Refresh status or build fingerprints first."};
+  }
+  const candidateMonths = broadCandidateMonths(settings);
+  const targetMonths = broadTargetMonths(settings);
+  const selectedRows = candidateMonths
+    ? rows.filter(row => candidateMonths.has(row.month))
+    : rows;
+  const measuredRows = selectedRows.filter(row => Number(row.photo_index_count || 0) >= 20);
+  if (!measuredRows.length) {
+    return {ok: false, blocking: true, message: "No indexed candidate photos found for the selected date window."};
+  }
+  const lowRows = measuredRows.filter(row => broadCoverageRatio(row) < 0.8);
+  if (lowRows.length) {
+    return {
+      ok: false,
+      blocking: false,
+      message: `Fingerprint coverage too low: ${formatCoverageRowList(lowRows)}. Search will continue; run Build fingerprints with Fingerprint already confirmed originals unchecked to improve recall.`
+    };
+  }
+  const minRow = measuredRows.reduce((lowest, row) => (
+    broadCoverageRatio(row) < broadCoverageRatio(lowest) ? row : lowest
+  ));
+  const missingOriginals = targetMonths
+    ? rows.filter(row => targetMonths.has(row.month)).reduce((sum, row) => sum + Number(row.missing_original_targets || 0), 0)
+    : rows.reduce((sum, row) => sum + Number(row.missing_original_targets || 0), 0);
+  return {
+    ok: true,
+    blocking: false,
+    message: `Fingerprint coverage OK: minimum ${formatCoverageRow(minRow)} across ${measuredRows.length} candidate month(s); ${missingOriginals} missing-original target(s).`
+  };
+}
+
+function broadTargetMonths(settings) {
+  if (settings.target_scope !== "date_range" || !settings.start_date || !settings.end_date) return null;
+  const start = parseDateBound(settings.start_date, false);
+  const end = parseDateBound(settings.end_date, true);
+  if (!start || !end) return null;
+  return monthsBetween(start, end);
+}
+
+function broadCandidateMonths(settings) {
+  if (settings.target_scope !== "date_range" || !settings.start_date || !settings.end_date) return null;
+  const start = parseDateBound(settings.start_date, false);
+  const end = parseDateBound(settings.end_date, true);
+  if (!start || !end) return null;
+  const windowDays = Number(settings.date_window_days || 0);
+  return monthsBetween(addUtcDays(start, -windowDays), addUtcDays(end, windowDays));
+}
+
+function parseDateBound(value, endOfMonth = false) {
+  const text = String(value || "").trim();
+  const dateMatch = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(text);
+  if (dateMatch) {
+    return new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])));
+  }
+  const monthMatch = /^(\\d{4})-(\\d{2})$/.exec(text);
+  if (!monthMatch) return null;
+  const year = Number(monthMatch[1]);
+  const month = Number(monthMatch[2]);
+  if (month < 1 || month > 12) return null;
+  return endOfMonth
+    ? new Date(Date.UTC(year, month, 0))
+    : new Date(Date.UTC(year, month - 1, 1));
+}
+
+function addUtcDays(date, days) {
+  const next = new Date(date.getTime());
+  next.setUTCDate(next.getUTCDate() + Number(days || 0));
+  return next;
+}
+
+function monthsBetween(start, end) {
+  const months = new Set();
+  let current = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1));
+  const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1));
+  while (current <= last) {
+    months.add(`${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, "0")}`);
+    current.setUTCMonth(current.getUTCMonth() + 1);
+  }
+  return months;
+}
+
+function broadCoverageRatio(row) {
+  const photoCount = Number(row.photo_index_count || 0);
+  return photoCount ? Number(row.fingerprint_count || 0) / photoCount : 0;
+}
+
+function formatCoverageRow(row) {
+  return `${row.month} ${formatPercent(broadCoverageRatio(row))} (${Number(row.fingerprint_count || 0)}/${Number(row.photo_index_count || 0)})`;
+}
+
+function formatCoverageRowList(rows) {
+  return rows.slice(0, 4).map(formatCoverageRow).join(", ") + (rows.length > 4 ? `, +${rows.length - 4} more` : "");
 }
 
 function confirmPhotoIndexReplacement() {
@@ -6154,9 +7531,9 @@ async function importDigiKamPeople() {
   });
 }
 
-async function runStep(step, extra = {}) {
+async function runStep(step, extra = {}, triggerOverride = null) {
   if (running) return;
-  const trigger = activeButton();
+  const trigger = triggerOverride || activeButton();
   running = true;
   setButtons(true, trigger);
   markButtonRunning(trigger, true);
@@ -6179,7 +7556,10 @@ async function runStep(step, extra = {}) {
       result.status === "pass" ? stepCompletionMessage(step) : (result.error || "Task failed."),
       result.status === "pass" ? "" : "error"
     );
-    await loadStatus();
+    const refreshed = await loadStatus(expandedStatusSteps());
+    if (result.status === "pass") {
+      setStepMessage(step, stepRefreshedMessage(step, refreshed));
+    }
   } catch (error) {
     const message = error.name === "AbortError"
       ? "Start cancelled before a server job was created."
@@ -6221,6 +7601,9 @@ function setStepMessage(step, message, state = "") {
     broad_visual_index: "broadVisualMessage",
     broad_visual_match: "broadVisualMessage",
     broad_visual_benchmark: "broadVisualMessage",
+    rough_prefilter_build: "roughVisualMessage",
+    rough_visual_match: "roughVisualMessage",
+    rough_visual_benchmark: "roughVisualMessage",
     generate_derivatives: "workingCopyMessage",
     import_digikam_people: "digikamPeopleMessage"
   };
@@ -6232,14 +7615,34 @@ function setStepMessage(step, message, state = "") {
 
 function stepCompletionMessage(step) {
   if (step === "build_photo_index") return "Photo index completed.";
-  if (step === "refresh_photo_index_metadata") return "Photo index metadata refreshed.";
+  if (step === "refresh_photo_index_metadata") return "Photo index refresh completed.";
   if (step === "match_easy_originals") return "Match search completed. Refreshing results...";
   if (step === "broad_visual_index") return "Broad visual descriptor index completed.";
   if (step === "broad_visual_match") return "Broad visual match completed. Refreshing results...";
   if (step === "broad_visual_benchmark") return "Broad visual benchmark exported.";
+  if (step === "rough_prefilter_build") return "Rough visual prefilter completed.";
+  if (step === "rough_visual_match") return "No-date visual match completed. Refreshing results...";
+  if (step === "rough_visual_benchmark") return "No-date visual benchmark exported.";
   if (step === "generate_derivatives") return "Working photo copies completed.";
   if (step === "import_digikam_people") return "digiKam suggestions imported. Tag queue refreshed.";
   return "Task completed.";
+}
+
+function stepRefreshedMessage(step, payload) {
+  if (step === "broad_visual_match") {
+    const run = ((payload || {}).broad_visual_match || {}).latest_run || {};
+    if (run.run_id) {
+      return broadVisualRunCompleteMessage(run);
+    }
+  }
+  if (step === "rough_visual_match") {
+    const run = ((payload || {}).broad_visual_match || {}).latest_no_date_run || {};
+    if (run.run_id) {
+      return roughVisualRunCompleteMessage(run);
+    }
+  }
+  if (step === "match_easy_originals") return "Match search completed.";
+  return stepCompletionMessage(step).replace(" Refreshing results...", "");
 }
 
 function startProgress(step) {
@@ -6302,19 +7705,184 @@ async function cancelActiveJob() {
 }
 
 function progressDetail(job) {
+  if (job.kind === "crop_estimate_batch") {
+    return cropEstimateProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "broad_visual_index" && job.broad_visual_index_run) {
+    return broadVisualIndexProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "broad_visual_match" && job.broad_visual_run) {
+    return broadVisualMatchProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "rough_prefilter_build" && job.rough_prefilter_run) {
+    return roughPrefilterProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "rough_visual_match" && job.rough_visual_run) {
+    return roughVisualProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "generate_derivatives") {
+    return workingCopyProgressDetail(job);
+  }
   const latest = latestOutput(job);
   if (latest) {
     const lines = latest.trim().split("\\n").filter(Boolean);
     return lines[lines.length - 1] || "Working...";
   }
   if (job.status === "starting" && !job.job_id && !activeJobId) return "Waiting for the server to create a job...";
-  if (job.current_command) return "Running command...";
+  if (job.current_command) return genericRunningProgressDetail(job);
   if (job.status === "queued") return "Waiting for the current task to finish.";
   if (job.status === "cancelling") return "Stopping...";
   if (job.status === "cancelled") return "Stopped.";
   if (job.status === "pass") return "Finished.";
   if (job.status === "fail") return job.error || "Failed.";
   return "Working...";
+}
+
+function cropEstimateProgressDetail(job) {
+  const processed = Number(job.processed_count || 0);
+  const total = Number(job.target_count || 0);
+  const estimated = Number(job.estimated_count || 0);
+  const skipped = Number(job.skipped_count || 0);
+  const failed = Number(job.failed_count || 0);
+  const mode = job.apply_estimates ? "saved" : "previewed";
+  const current = job.current_entry_id ? ` · ${job.current_entry_id}` : "";
+  return `${processed}/${total} checked · ${estimated} ${mode} estimates · ${skipped} skipped · ${failed} failed${current}`;
+}
+
+function broadVisualIndexProgressDetail(job) {
+  const run = job.broad_visual_index_run || {};
+  const checked = Number(run.scanned_count || 0);
+  const total = Number(run.total_candidate_count || 0);
+  const indexed = Number(run.indexed_descriptor_count || 0);
+  const reused = Number(run.reused_descriptor_count || 0);
+  const errors = Number(run.error_count || 0);
+  const skipped = Math.max(
+    0,
+    run.skipped_candidate_count === undefined || run.skipped_candidate_count === null
+      ? checked - indexed - reused - errors
+      : Number(run.skipped_candidate_count || 0)
+  );
+  const current = formatBroadCurrentItem(run);
+  const currentText = current === "none" ? "" : ` · ${current}`;
+  const heartbeat = run.heartbeat_at ? ` · heartbeat ${formatHeartbeatAge(run.heartbeat_at)}` : "";
+  const pieces = [
+    total ? `${checked}/${total} files` : `${checked} files`,
+    `${indexed} fingerprinted`,
+    `${reused} reused`,
+    `${skipped} skipped`
+  ];
+  if (errors) pieces.push(`${errors} errors`);
+  return `${pieces.join(" · ")}${currentText}${heartbeat}`;
+}
+
+function broadVisualMatchProgressDetail(job) {
+  return visualMatchProgressDetail(job.broad_visual_run || {}, "candidates scanned");
+}
+
+function roughPrefilterProgressDetail(job) {
+  const run = job.rough_prefilter_run || {};
+  const scanned = Number(run.scanned_count || 0);
+  const total = Number(run.total_descriptor_count || 0);
+  const indexed = Number(run.indexed_feature_count || 0);
+  const reused = Number(run.reused_feature_count || 0);
+  const errors = Number(run.error_count || 0);
+  const phase = run.current_phase || "working";
+  const current = run.current_path ? ` · ${phase} · ${pathBasename(run.current_path)}` : ` · ${phase}`;
+  const heartbeat = run.heartbeat_at ? ` · heartbeat ${formatHeartbeatAge(run.heartbeat_at)}` : "";
+  const pieces = [
+    total ? `${scanned}/${total} fingerprints` : `${scanned} fingerprints`,
+    `${indexed} built`,
+    `${reused} reused`
+  ];
+  if (errors) pieces.push(`${errors} errors`);
+  return `${pieces.join(" · ")}${current}${heartbeat}`;
+}
+
+function roughVisualProgressDetail(job) {
+  return visualMatchProgressDetail(job.rough_visual_run || {}, "dense loads");
+}
+
+function visualMatchProgressDetail(run, scanLabel) {
+  const processed = Number(run.processed_target_count || 0);
+  const total = Number(run.target_count || 0);
+  const matched = Number(run.matched_entries || 0);
+  const savedRows = Number(run.result_count || 0);
+  const scanned = Number(run.scanned_count || 0);
+  const errors = Number(run.error_count || 0);
+  const current = run.current_entry_id
+    ? ` · current ${run.current_entry_id}`
+    : Number(run.current_target_index || 0)
+      ? ` · current ${run.current_target_index}${total ? `/${total}` : ""}`
+      : "";
+  const heartbeat = run.heartbeat_at ? ` · heartbeat ${formatHeartbeatAge(run.heartbeat_at)}` : "";
+  const stopNote = savedRows
+    ? ` · Stop now: ${savedRows} saved row${savedRows === 1 ? "" : "s"} ready to review`
+    : processed
+      ? " · Stop now: progress saved, no review rows yet"
+      : " · Stop now: no review rows yet";
+  const pieces = [
+    total ? `${processed}/${total} entries` : `${processed} entries`,
+    `${matched} matched`,
+    `${savedRows} saved rows`,
+    `${scanned} ${scanLabel}`
+  ];
+  if (errors) pieces.push(`${errors} errors`);
+  return `${pieces.join(" · ")}${current}${heartbeat}${stopNote}`;
+}
+
+function pathBasename(value) {
+  const parts = String(value || "").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(value || "");
+}
+
+function formatHeartbeatAge(value) {
+  const parsed = Date.parse(value || "");
+  if (!Number.isFinite(parsed)) return "unknown";
+  const ageMs = Math.max(0, Date.now() - parsed);
+  if (ageMs < 5000) return "just now";
+  if (ageMs < 60000) return `${Math.floor(ageMs / 1000)}s ago`;
+  return `${formatElapsed(ageMs)} ago`;
+}
+
+function workingCopyProgressDetail(job) {
+  const latest = latestOutput(job);
+  const parsed = parseColonLines(latest);
+  const generated = parsed.Generated || "";
+  const skipped = parsed.Skipped || "";
+  const notReady = parsed["Not ready"] || "";
+  const notReadyDates = parsed["Not ready dates"] || "";
+  const pieces = [];
+  if (generated) pieces.push(`generated ${generated}`);
+  if (skipped) pieces.push(`skipped ${skipped}`);
+  if (notReady) pieces.push(`not ready ${notReady}`);
+  if (notReadyDates) pieces.push(`missing: ${notReadyDates}`);
+  if (pieces.length) return pieces.join(" · ");
+  if (job.status === "queued") return "Waiting to generate working copies.";
+  if (job.status === "cancelling") return "Stopping working-copy generation.";
+  if (job.status === "cancelled") return "Stopped.";
+  if (job.status === "pass") return "Working copies finished.";
+  if (job.status === "fail") return job.error || "Working-copy generation failed.";
+  return "Generating working copies.";
+}
+
+function genericRunningProgressDetail(job) {
+  const startedAt = Date.parse(job.started_at || "");
+  const elapsed = Number.isFinite(startedAt)
+    ? ` · elapsed ${formatElapsed(Date.now() - startedAt)}`
+    : "";
+  if (job.status === "queued") return "Waiting for the current task to finish.";
+  if (job.status === "cancelling") return "Stopping...";
+  return `Still running · no detailed progress output yet${elapsed}`;
+}
+
+function parseColonLines(text) {
+  const parsed = {};
+  for (const line of String(text || "").split("\\n")) {
+    const index = line.indexOf(":");
+    if (index <= 0) continue;
+    parsed[line.slice(0, index).trim()] = line.slice(index + 1).trim();
+  }
+  return parsed;
 }
 
 function formatJob(job) {
@@ -6393,6 +7961,13 @@ function activeButton() {
 }
 
 function markButtonRunning(button, runningNow) {
+  if (runningNow) {
+    for (const other of document.querySelectorAll(".button.is-running")) {
+      if (other === button) continue;
+      other.classList.remove("is-running");
+      other.removeAttribute("aria-busy");
+    }
+  }
   if (!button) return;
   button.classList.toggle("is-running", runningNow);
   if (runningNow) {
@@ -6419,6 +7994,10 @@ function escapeHtml(value) {
     '"': "&quot;",
     "'": "&#039;"
   }[char]));
+}
+
+function escapeJs(value) {
+  return String(value).replace(/\\\\/g, "\\\\\\\\").replace(/'/g, "\\\\'");
 }
 
 for (const id of ["workingCopyStartDate", "workingCopyEndDate"]) {

@@ -35,6 +35,44 @@ class Project365ControlServiceTests(unittest.TestCase):
         self.assertEqual(record["pid"], 12345)
         self.assertEqual(record["port"], 9876)
 
+    def test_start_does_not_inherit_stdin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = service.ServiceConfig(port=9876, runtime_dir=Path(temp_dir))
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = None
+            with (
+                mock.patch.object(service, "_project_server_pids", return_value=[]),
+                mock.patch.object(service.subprocess, "Popen", return_value=process) as popen,
+                mock.patch.object(service, "_wait_for_control_panel"),
+            ):
+                service.start_control_panel(config)
+
+        self.assertEqual(popen.call_args.kwargs["stdin"], service.subprocess.DEVNULL)
+
+    def test_wait_for_control_panel_checks_page_not_full_status(self) -> None:
+        config = service.ServiceConfig(host="127.0.0.1", port=9876)
+        process = mock.Mock()
+        process.poll.return_value = None
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch.object(service.urllib.request, "urlopen", return_value=response) as urlopen:
+            service._wait_for_control_panel(config, process, timeout_seconds=0.1)
+
+        urlopen.assert_called_once_with(config.url, timeout=20)
+
+    def test_port_probe_checks_page_not_full_status(self) -> None:
+        response = mock.Mock()
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        response.read.return_value = b"<title>Project365 Control</title>"
+
+        with mock.patch.object(service.urllib.request, "urlopen", return_value=response) as urlopen:
+            self.assertTrue(service._port_has_project365_status("127.0.0.1", 9876))
+
+        urlopen.assert_called_once_with("http://127.0.0.1:9876", timeout=20)
+
     def test_stop_removes_pid_record_and_stops_tracked_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = service.ServiceConfig(runtime_dir=Path(temp_dir))

@@ -103,6 +103,21 @@ def suggest_crop(
         raise ValueError("No valid crop candidates")
 
     score, x, y, crop_w, crop_h = best
+    largest_crop = crop_sizes[0] if crop_sizes else None
+    if largest_crop == (crop_w, crop_h) and _confidence(score) == "low":
+        score, x, y, crop_w, crop_h = _refine_crop(
+            candidate,
+            reference_sample,
+            x,
+            y,
+            crop_w,
+            crop_h,
+            aspect,
+            sample_size,
+            rotation_degrees,
+            max_offset_x=max(1, crop_w // 20),
+            max_offset_y=max(1, crop_h // 20),
+        )
     return CropSuggestion(
         x=x,
         y=y,
@@ -217,6 +232,92 @@ def _scan_positions(limit: int, crop: int, step: int) -> list[int]:
     if positions[-1] != final:
         positions.append(final)
     return positions
+
+
+def _refine_crop(
+    image: ImagePixels,
+    reference_sample: list[int],
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    aspect: float,
+    sample_size: int,
+    rotation_degrees: float,
+    max_offset_x: int,
+    max_offset_y: int,
+) -> tuple[float, int, int, int, int]:
+    best = (
+        _mean_squared_error(
+            reference_sample,
+            _sample_crop(image, x, y, width, height, sample_size, rotation_degrees=rotation_degrees),
+        ),
+        x,
+        y,
+        width,
+        height,
+    )
+    min_x = max(0, x - max_offset_x)
+    max_x = min(image.width - width, x + max_offset_x)
+    min_y = max(0, y - max_offset_y)
+    max_y = min(image.height - height, y + max_offset_y)
+    max_size_delta = max(1, round(max(width, height) * 0.015))
+    min_width = max(1, width - max_size_delta)
+    max_width = min(image.width, width + max_size_delta)
+    position_steps = _refinement_steps(max(max_offset_x, max_offset_y))
+    size_steps = _refinement_steps(max_size_delta)
+
+    for step in position_steps:
+        changed = True
+        while changed:
+            changed = False
+            _, current_x, current_y, current_w, _ = best
+            candidate_widths = _nearby_values(current_w, size_steps, min_width, max_width)
+            for candidate_w in candidate_widths:
+                candidate_h = max(1, round(candidate_w / aspect))
+                if candidate_h > image.height:
+                    continue
+                bounded_min_x = max(0, min_x, current_x - step)
+                bounded_max_x = min(image.width - candidate_w, max_x, current_x + step)
+                bounded_min_y = max(0, min_y, current_y - step)
+                bounded_max_y = min(image.height - candidate_h, max_y, current_y + step)
+                for candidate_y in _nearby_values(current_y, [step], bounded_min_y, bounded_max_y):
+                    for candidate_x in _nearby_values(current_x, [step], bounded_min_x, bounded_max_x):
+                        sample = _sample_crop(
+                            image,
+                            candidate_x,
+                            candidate_y,
+                            candidate_w,
+                            candidate_h,
+                            sample_size,
+                            rotation_degrees=rotation_degrees,
+                        )
+                        score = _mean_squared_error(reference_sample, sample)
+                        if score < best[0]:
+                            best = (score, candidate_x, candidate_y, candidate_w, candidate_h)
+                            changed = True
+    return best
+
+
+def _refinement_steps(radius: int) -> list[int]:
+    steps = []
+    for divisor in (2, 4, 8):
+        step = max(1, radius // divisor)
+        if step not in steps:
+            steps.append(step)
+    if 1 not in steps:
+        steps.append(1)
+    return steps
+
+
+def _nearby_values(center: int, steps: list[int], lower: int, upper: int) -> list[int]:
+    if lower > upper:
+        return []
+    values = {min(max(center, lower), upper)}
+    for step in steps:
+        values.add(min(max(center - step, lower), upper))
+        values.add(min(max(center + step, lower), upper))
+    return sorted(values)
 
 
 def _sample_crop(

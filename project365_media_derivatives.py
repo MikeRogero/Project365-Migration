@@ -115,6 +115,7 @@ def generate_derivatives(
     try:
         connection.row_factory = sqlite3.Row
         rows = _load_source_media(connection, policy, limit, start_date, end_date)
+        staged_crops = _load_staged_review_crops(canonical_root)
         report_rows = []
         generated_count = 0
         skipped_count = 0
@@ -130,6 +131,7 @@ def generate_derivatives(
             output_path = output_root / month / f"{output_stem}.{extension}"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             crop = _review_crop_from_transformation(row["source_transformation_json"])
+            crop = _staged_review_crop_for_row(staged_crops, row) or crop
             derivative_id = str(row["derivative_id"])
             derivative_role = str(row["derivative_role"])
             if crop is None:
@@ -313,6 +315,7 @@ def derivative_readiness_summary(
     try:
         connection.row_factory = sqlite3.Row
         rows = _load_source_media(connection, policy, None, start_date, end_date)
+        staged_crops = _load_staged_review_crops(canonical_root)
     except sqlite3.Error:
         return DerivativeReadinessSummary(
             source_count=0,
@@ -333,6 +336,7 @@ def derivative_readiness_summary(
             crop = _review_crop_from_transformation(row["source_transformation_json"])
         except (TypeError, ValueError):
             crop = None
+        crop = _staged_review_crop_for_row(staged_crops, row) or crop
         if crop is None:
             continue
         ready_count += 1
@@ -361,6 +365,47 @@ def derivative_readiness_summary(
         current_count=current_count,
         needs_update_count=needs_update_count,
     )
+
+
+def _load_staged_review_crops(canonical_root: Path) -> dict[tuple[str, str], dict[str, object]]:
+    report_dir = canonical_root / "exports" / "verification_reports"
+    paths = [report_dir / "original_photo_external_search_queue_crop_staging.json"]
+    if report_dir.exists():
+        paths.extend(
+            path
+            for path in sorted(report_dir.glob("*_crop_staging.json"))
+            if path not in paths
+        )
+    staged: dict[tuple[str, str], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+        if not isinstance(entries, dict):
+            continue
+        for entry_id, candidates in entries.items():
+            if not isinstance(candidates, dict):
+                continue
+            for candidate_path, record in candidates.items():
+                if not isinstance(record, dict):
+                    continue
+                crop = record.get("crop")
+                if isinstance(crop, dict):
+                    staged[(str(entry_id), str(candidate_path))] = dict(crop)
+    return staged
+
+
+def _staged_review_crop_for_row(
+    staged_crops: dict[tuple[str, str], dict[str, object]],
+    row: sqlite3.Row,
+) -> dict[str, object] | None:
+    if str(row["source_role"]) == "associated":
+        return None
+    return staged_crops.get((str(row["entry_id"]), str(row["storage_path"])))
 
 
 def _load_source_media(

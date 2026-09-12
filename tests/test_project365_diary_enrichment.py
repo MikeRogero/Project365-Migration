@@ -63,6 +63,25 @@ class Project365DiaryEnrichmentTests(unittest.TestCase):
             self.assertTrue(ready["primary_photo_ready"])
             self.assertEqual(ready["primary_photo"]["role"], "diarium_derivative")
 
+    def test_entry_target_includes_imported_people_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            canonical_root = _sample_canonical_root(Path(temp_dir))
+            _insert_derivative(canonical_root, "project365:1998-04-12", _jpeg_with_dimensions(12, 12))
+            _insert_people(canonical_root, "project365:1998-04-12", ["Alex Example", "Bea Example"])
+
+            listed = enrichment.entry_list(
+                canonical_root,
+                start_date="1998-04-12",
+                end_date="1998-04-12",
+            )["entries"][0]
+            detail = enrichment.entry_detail(canonical_root, "project365:1998-04-12")
+
+            self.assertEqual(listed["people_names"], ["Alex Example", "Bea Example"])
+            self.assertEqual(listed["primary_photo"]["people_names"], ["Alex Example", "Bea Example"])
+            self.assertEqual(detail["people_names"], ["Alex Example", "Bea Example"])
+            self.assertIn("peopleScript(entry.people_names)", enrichment.ENRICHMENT_HTML)
+            self.assertIn('id="entryPeople"', enrichment.ENRICHMENT_HTML)
+
     def test_flagged_candidate_can_be_added_as_associated_photo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -291,6 +310,18 @@ def _insert_derivative(canonical_root: Path, entry_id: str, payload: bytes) -> N
                 import_batch_id,
             ),
         )
+
+
+def _insert_people(canonical_root: Path, entry_id: str, names: list[str]) -> None:
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        for name in names:
+            connection.execute(
+                """
+                INSERT INTO people (entry_id, canonical_name, diarium_tag, review_status, source)
+                VALUES (?, ?, ?, 'suggested', 'digikam_xmp')
+                """,
+                (entry_id, name, f"person:{name}"),
+            )
 
 
 def _write_zip(path: Path, members: dict[str, bytes]) -> None:

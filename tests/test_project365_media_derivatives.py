@@ -143,6 +143,69 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "not_ready_missing_crop")
             self.assertFalse(Path(rows[0]["derivative_path"]).exists())
 
+    def test_staged_estimate_makes_derivative_ready_without_confirming_source_crop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            external_path = base / "external-original.png"
+            external_path.write_bytes(_tiny_png())
+            _insert_external_original_without_crop(canonical_root, external_path)
+            _write_staged_crop(
+                canonical_root,
+                "project365:1998-04-12",
+                external_path,
+                {
+                    "x": 0,
+                    "y": 0,
+                    "size": 1,
+                    "candidate_width": 1,
+                    "candidate_height": 1,
+                    "source": "estimated",
+                },
+            )
+
+            readiness = derivatives.derivative_readiness_summary(
+                canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            self.assertEqual(readiness.ready_count, 1)
+            self.assertEqual(readiness.not_ready_count, 0)
+
+            summary = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+
+            self.assertEqual(summary.generated_count, 1)
+            self.assertEqual(summary.not_ready_count, 0)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                source_transformation, derivative_transformation = connection.execute(
+                    """
+                    SELECT source.transformation_json, derivative.transformation_json
+                    FROM media_assets AS source
+                    JOIN media_assets AS derivative
+                        ON derivative.entry_id = source.entry_id
+                    WHERE source.role = 'external_original_reference'
+                        AND derivative.role = 'diarium_derivative'
+                    """
+                ).fetchone()
+            self.assertIsNone(derivatives._review_crop_from_transformation(source_transformation))
+            self.assertEqual(json.loads(derivative_transformation)["crop"]["source"], "estimated")
+
     def test_unchanged_derivative_is_skipped_on_next_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -520,6 +583,78 @@ def _set_project365_export_crop(canonical_root: Path) -> None:
             (json.dumps(crop, sort_keys=True),),
         )
         connection.commit()
+
+
+def _insert_external_original_without_crop(canonical_root: Path, source_path: Path) -> None:
+    transformation = {
+        "source": "external_original_reference",
+        "source_path": str(source_path),
+        "original_is_read_only": True,
+    }
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        import_batch_id = connection.execute(
+            """
+            SELECT import_batch_id
+            FROM media_assets
+            WHERE entry_id = 'project365:1998-04-12'
+                AND role = 'project365_export_png'
+            """
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (
+                'external-source', 'project365:1998-04-12',
+                'external_original_reference', NULL, 'external-original.png', ?,
+                ?, ?, 'image/png', 'available', 'confirmed', 0, ?, ?,
+                '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z'
+            )
+            """,
+            (
+                str(source_path),
+                hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                source_path.stat().st_size,
+                json.dumps(transformation, sort_keys=True),
+                import_batch_id,
+            ),
+        )
+        connection.commit()
+
+
+def _write_staged_crop(
+    canonical_root: Path,
+    entry_id: str,
+    candidate_path: Path,
+    crop: dict[str, object],
+) -> None:
+    staging_path = (
+        canonical_root
+        / "exports"
+        / "verification_reports"
+        / "original_photo_external_search_queue_crop_staging.json"
+    )
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": {
+                    entry_id: {
+                        str(candidate_path): {
+                            "crop": crop,
+                            "commit_pending": False,
+                        }
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _insert_associated_original(canonical_root: Path, source_path: Path) -> None:

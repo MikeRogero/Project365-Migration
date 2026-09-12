@@ -14,6 +14,7 @@ htmlcov/
 
 # Local browser/test captures
 .playwright-cli/
+output/
 
 # Private/local Project365 archive material and generated outputs.
 # These contain original photos, diary/media exports, SQLite databases,

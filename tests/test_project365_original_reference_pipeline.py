@@ -308,8 +308,34 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             self.assertEqual(summary.scanned_file_count, 1)
             self.assertEqual(summary.indexed_file_count, 0)
             self.assertEqual(summary.skipped_file_count, 1)
+            with sqlite3.connect(index_db) as connection:
+                mtime_ns = connection.execute(
+                    "SELECT filesystem_mtime_ns FROM photo_library_files WHERE path = ?",
+                    (str(photo.resolve()),),
+                ).fetchone()[0]
+            self.assertGreater(mtime_ns, 0)
             candidate = photo_index.query_index_candidates(index_db, {"2004-01-01"})["2004-01-01"][0]
             self.assertEqual(candidate["candidate_sha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_photo_index_legacy_mtime_rows_still_skip_unchanged_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            photo = library_root / "2004-01-01 legacy.jpg"
+            photo.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            with sqlite3.connect(index_db) as connection:
+                connection.execute("UPDATE photo_library_files SET filesystem_mtime_ns = 0")
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata") as metadata:
+                summary = photo_index.build_photo_library_index(index_db, [library_root], reset=False)
+
+            metadata.assert_not_called()
+            self.assertEqual(summary.indexed_file_count, 0)
+            self.assertEqual(summary.skipped_file_count, 1)
 
     def test_photo_index_snapshot_is_scoped_to_selected_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -491,6 +517,186 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             self.assertEqual(summary.indexed_file_count, 1)
             self.assertEqual(summary.skipped_file_count, 0)
 
+    def test_photo_index_refreshes_file_when_size_changes_with_preserved_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            photo = library_root / "2004-01-01 same-mtime.jpg"
+            photo.write_bytes(_tiny_png())
+            original_stat = photo.stat()
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            photo.write_bytes(_tiny_png() + b"updated")
+            os.utime(photo, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                summary = photo_index.build_photo_library_index(index_db, [library_root], reset=False)
+
+            self.assertEqual(summary.scanned_file_count, 1)
+            self.assertEqual(summary.indexed_file_count, 1)
+            self.assertEqual(summary.skipped_file_count, 0)
+
+    def test_photo_index_relinks_file_rename_without_duplicate_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            original = library_root / "2004-01-01 original.jpg"
+            renamed = library_root / "2004-01-01 renamed.jpg"
+            original.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            original.rename(renamed)
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                summary = photo_index.build_photo_library_index(index_db, [library_root], reset=False)
+
+            with sqlite3.connect(index_db) as connection:
+                rows = connection.execute("SELECT path, filename FROM photo_library_files").fetchall()
+                date_paths = connection.execute("SELECT file_path FROM photo_library_dates").fetchall()
+
+        self.assertEqual(summary.moved_file_count, 1)
+        self.assertEqual(summary.pruned_file_count, 0)
+        self.assertEqual(rows, [(str(renamed.resolve()), renamed.name)])
+        self.assertEqual({row[0] for row in date_paths}, {str(renamed.resolve())})
+
+    def test_photo_index_move_only_relinks_without_metadata_refresh_or_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            original = library_root / "2004-01-01 original.jpg"
+            renamed = library_root / "2004-01-01 renamed.jpg"
+            new_file = library_root / "2004-01-02 new.jpg"
+            original.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            original.rename(renamed)
+            new_file.write_bytes(_different_tiny_png())
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", side_effect=AssertionError("metadata refresh")):
+                summary = photo_index.build_photo_library_index(
+                    index_db,
+                    [library_root],
+                    reset=False,
+                    reconcile_moves_only=True,
+                )
+
+            with sqlite3.connect(index_db) as connection:
+                rows = connection.execute("SELECT path, filename FROM photo_library_files").fetchall()
+
+        self.assertEqual(summary.moved_file_count, 1)
+        self.assertEqual(summary.indexed_file_count, 1)
+        self.assertEqual(summary.skipped_file_count, 1)
+        self.assertEqual(rows, [(str(renamed.resolve()), renamed.name)])
+
+    def test_photo_index_move_only_skips_same_path_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            photo = library_root / "2004-01-01 changed.jpg"
+            original_payload = _tiny_png()
+            photo.write_bytes(original_payload)
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            photo.write_bytes(_different_tiny_png())
+            os.utime(photo, (2000000000, 2000000000))
+
+            summary = photo_index.build_photo_library_index(
+                index_db,
+                [library_root],
+                reset=False,
+                reconcile_moves_only=True,
+            )
+
+            with sqlite3.connect(index_db) as connection:
+                stored_sha = connection.execute(
+                    "SELECT sha256 FROM photo_library_files WHERE path = ?",
+                    (str(photo.resolve()),),
+                ).fetchone()[0]
+
+        self.assertEqual(summary.moved_file_count, 0)
+        self.assertEqual(summary.indexed_file_count, 0)
+        self.assertEqual(summary.pruned_file_count, 0)
+        self.assertEqual(stored_sha, hashlib.sha256(original_payload).hexdigest())
+
+    def test_photo_index_prunes_deleted_files_from_scanned_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            library_root.mkdir()
+            keep = library_root / "2004-01-01 keep.jpg"
+            removed = library_root / "2004-01-02 removed.jpg"
+            keep.write_bytes(_tiny_png())
+            removed.write_bytes(_tiny_png() + b"removed")
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            removed.unlink()
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                summary = photo_index.build_photo_library_index(index_db, [library_root], reset=False)
+
+            with sqlite3.connect(index_db) as connection:
+                rows = connection.execute("SELECT path FROM photo_library_files ORDER BY path").fetchall()
+                date_paths = connection.execute("SELECT file_path FROM photo_library_dates").fetchall()
+
+        self.assertEqual(summary.pruned_file_count, 1)
+        self.assertEqual(rows, [(str(keep.resolve()),)])
+        self.assertEqual({row[0] for row in date_paths}, {str(keep.resolve())})
+
+    def test_photo_index_relinks_folder_rename_and_broad_fingerprint_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            old_root = base / "Old Library"
+            new_root = base / "New Library"
+            old_root.mkdir()
+            original = old_root / "2004-01-01 original.jpg"
+            original.write_bytes(_tiny_png())
+            index_db = base / "index.sqlite"
+            broad_db = base / photo_index.BROAD_VISUAL_INDEX_FILENAME
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [old_root], reset=True)
+            with sqlite3.connect(broad_db) as connection:
+                _create_minimal_broad_path_tables(connection)
+                connection.execute(
+                    "INSERT INTO broad_descriptors (path, root, filename) VALUES (?, ?, ?)",
+                    (str(original.resolve()), str(old_root), original.name),
+                )
+                connection.execute(
+                    "INSERT INTO rough_prefilter_features (path, root, filename) VALUES (?, ?, ?)",
+                    (str(original.resolve()), str(old_root), original.name),
+                )
+                connection.execute(
+                    "INSERT INTO rough_prefilter_bands (path, view_name, band_name, band_value) VALUES (?, ?, ?, ?)",
+                    (str(original.resolve()), "full", "color", "1"),
+                )
+                connection.commit()
+            old_root.rename(new_root)
+            renamed = new_root / original.name
+
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                summary = photo_index.build_photo_library_index(index_db, [new_root], reset=False)
+
+            with sqlite3.connect(index_db) as connection:
+                indexed_row = connection.execute("SELECT path, root FROM photo_library_files").fetchone()
+            with sqlite3.connect(broad_db) as connection:
+                descriptor_path = connection.execute("SELECT path FROM broad_descriptors").fetchone()[0]
+                feature_path = connection.execute("SELECT path FROM rough_prefilter_features").fetchone()[0]
+                band_path = connection.execute("SELECT path FROM rough_prefilter_bands").fetchone()[0]
+
+        self.assertEqual(summary.moved_file_count, 1)
+        self.assertEqual(indexed_row, (str(renamed.resolve()), str(new_root)))
+        self.assertEqual(descriptor_path, str(renamed.resolve()))
+        self.assertEqual(feature_path, str(renamed.resolve()))
+        self.assertEqual(band_path, str(renamed.resolve()))
+
     def test_photo_index_orders_same_date_candidates_by_capture_time(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -553,6 +759,64 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             enriched = photo_index.enrich_candidate_queue(index_db, queue_path)
 
             self.assertEqual(enriched, 1)
+
+    def test_queue_enrichment_relinks_missing_renamed_candidate_in_same_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            library_root = base / "library"
+            candidate_folder = library_root / "Stupid Games"
+            other_folder = library_root / "Other Copy"
+            candidate_folder.mkdir(parents=True)
+            other_folder.mkdir()
+            payload = _tiny_png()
+            stale_path = candidate_folder / "IMG_0252.JPG"
+            second_stale_path = candidate_folder / "IMG_0254.JPG"
+            renamed_path = candidate_folder / "2004-01-01 120000.JPG"
+            second_renamed_path = candidate_folder / "2004-01-01 120000 (2).JPG"
+            duplicate_path = other_folder / "2004-01-01 120000.JPG"
+            renamed_path.write_bytes(payload)
+            second_renamed_path.write_bytes(payload)
+            duplicate_path.write_bytes(payload)
+            index_db = base / "index.sqlite"
+            with mock.patch.object(photo_index, "_exiftool_photo_metadata", return_value={}):
+                photo_index.build_photo_library_index(index_db, [library_root], reset=True)
+            queue_path = base / "queue.csv"
+            digest = hashlib.sha256(payload).hexdigest()
+            _write_csv(
+                queue_path,
+                [
+                    {
+                        "entry_date": "2004-01-01",
+                        "candidate_path": str(stale_path),
+                        "candidate_filename": stale_path.name,
+                        "candidate_sha256": digest,
+                        "byte_size": str(len(payload)),
+                    },
+                    {
+                        "entry_date": "2004-01-01",
+                        "candidate_path": str(second_stale_path),
+                        "candidate_filename": second_stale_path.name,
+                        "candidate_sha256": digest,
+                        "byte_size": str(len(payload)),
+                    }
+                ],
+                ["entry_date", "candidate_path", "candidate_filename", "candidate_sha256", "byte_size"],
+            )
+
+            photo_index.enrich_candidate_queue(index_db, queue_path)
+
+            with queue_path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                [row["candidate_path"] for row in rows],
+                [str(second_renamed_path.resolve()), str(renamed_path.resolve())],
+            )
+            self.assertEqual(
+                [row["candidate_filename"] for row in rows],
+                [second_renamed_path.name, renamed_path.name],
+            )
+            self.assertEqual([row["capture_timestamp"] for row in rows], ["2004-01-01T12:00:00"] * 2)
+            self.assertEqual([row["date_distance"] for row in rows], ["0"] * 2)
 
     def test_source_scan_exposes_embedded_capture_timestamp_and_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2533,6 +2797,38 @@ def _different_tiny_png() -> bytes:
         b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00"
         b"\x00\x03\x01\x01\x00\xc9\xfe\x92\xef"
         b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+
+def _create_minimal_broad_path_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE broad_descriptors (
+            path TEXT PRIMARY KEY,
+            root TEXT NOT NULL,
+            filename TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE rough_prefilter_features (
+            path TEXT PRIMARY KEY,
+            root TEXT NOT NULL,
+            filename TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE rough_prefilter_bands (
+            path TEXT NOT NULL,
+            view_name TEXT NOT NULL,
+            band_name TEXT NOT NULL,
+            band_value TEXT NOT NULL,
+            PRIMARY KEY (path, view_name, band_name, band_value)
+        )
+        """
     )
 
 

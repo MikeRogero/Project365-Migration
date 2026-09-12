@@ -228,6 +228,9 @@ class PickerState:
         self._crop_staging = self._load_crop_staging()
         self._queue_shards = PickerQueueShards(config.queue_path, config.canonical_root)
         self._source_media = self._load_source_media()
+        self._confirmed_original_entry_ids_cache: set[str] | None = None
+        self._people_cache_signature: tuple[int, int] | None = None
+        self._people_by_entry: dict[str, list[str]] = {}
 
     def summary(self) -> dict[str, Any]:
         status_counts: dict[str, int] = {}
@@ -355,6 +358,8 @@ class PickerState:
         reverse_entry_order = status in {"accepted_not_applied", "rejected"}
         for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
             entry_id = str(record.get("entry_id", ""))
+            if self._entry_has_confirmed_external_original(entry_id) and not self._entry_has_active_review_state(entry_id):
+                continue
             if entry_id in affected_entry_ids:
                 entry = self._entry_summary(entry_id, self._entry_rows(entry_id))
             else:
@@ -392,6 +397,8 @@ class PickerState:
             raise ValueError("candidate_limit must be positive")
         if candidate_offset < 0:
             raise ValueError("candidate_offset must be zero or greater")
+        if self._entry_has_confirmed_external_original(entry_id) and not self._entry_has_active_review_state(entry_id):
+            return None
         entry_rows = self._entry_rows(entry_id)
         if not entry_rows:
             return None
@@ -417,7 +424,7 @@ class PickerState:
         entry["candidate_has_more"] = candidate_offset + len(candidates) < candidate_total
         return entry
 
-    def crop_entry_detail(self, entry_id: str) -> dict[str, Any] | None:
+    def crop_entry_detail(self, entry_id: str, mark_estimated_viewed: bool = True) -> dict[str, Any] | None:
         entry_rows = self._entry_rows(entry_id)
         if entry_rows:
             entry = self._entry_summary(entry_id, entry_rows)
@@ -434,7 +441,10 @@ class PickerState:
                 entry["crop_source_state"] = "accepted_not_applied"
                 entry["crop_has_crop"] = _candidate_has_review_crop(candidates[0])
                 return entry
-        return self._database_crop_entry_detail(entry_id)
+        return self._database_crop_entry_detail(
+            entry_id,
+            mark_estimated_viewed=mark_estimated_viewed,
+        )
 
     def crop_entries(self, crop_filter: str = "missing") -> list[dict[str, Any]]:
         if crop_filter not in {"all", "missing", "with_crop", "estimated", "confirmed"}:
@@ -462,7 +472,12 @@ class PickerState:
         return entries
 
     def pending_crop_commits(self) -> dict[str, Any]:
-        pending = sum(len(candidates) for candidates in self._crop_staging.values())
+        pending = sum(
+            1
+            for candidates in self._crop_staging.values()
+            for record in candidates.values()
+            if self._staged_crop_commit_pending(record)
+        )
         return {
             "pending_count": pending,
             "staging_path": str(self._crop_staging_path()),
@@ -571,6 +586,7 @@ class PickerState:
             "source_byte_size": entry.get("source_byte_size", ""),
             "source_file_type": entry.get("source_file_type", ""),
             "source_dimensions": entry.get("source_dimensions", ""),
+            "people_names": entry.get("people_names", []),
             "candidate_path": candidate.get("path", ""),
             "candidate_filename": candidate.get("filename", ""),
             "candidate_dimensions": candidate.get("dimensions", ""),
@@ -622,6 +638,7 @@ class PickerState:
             "status": "selected",
             "source_token": self._image_token(source_path) if source_path else "",
             "source_exists": bool(source_path and source_path.exists()),
+            "people_names": self._entry_people(entry_id),
         }
         return self._crop_summary(
             entry,
@@ -629,14 +646,25 @@ class PickerState:
             self._database_crop_source_state(entry_id, candidate_path_text),
         )
 
-    def _database_crop_entry_detail(self, entry_id: str) -> dict[str, Any] | None:
+    def _database_crop_entry_detail(
+        self,
+        entry_id: str,
+        mark_estimated_viewed: bool = True,
+    ) -> dict[str, Any] | None:
         for row in self._database_crop_rows(entry_id=entry_id):
-            detail = self._database_crop_entry_from_row(row)
+            detail = self._database_crop_entry_from_row(
+                row,
+                mark_estimated_viewed=mark_estimated_viewed,
+            )
             if detail is not None:
                 return detail
         return None
 
-    def _database_crop_entry_from_row(self, row: sqlite3.Row) -> dict[str, Any] | None:
+    def _database_crop_entry_from_row(
+        self,
+        row: sqlite3.Row,
+        mark_estimated_viewed: bool = True,
+    ) -> dict[str, Any] | None:
         candidate_path_text = str(row["candidate_path"] or "").strip()
         if not candidate_path_text or not _candidate_path_is_available(candidate_path_text):
             return None
@@ -686,7 +714,11 @@ class PickerState:
             "review_notes": "",
             "selected": True,
         }
-        self._apply_staged_crop_to_candidate(str(row["entry_id"]), candidate)
+        self._apply_staged_crop_to_candidate(
+            str(row["entry_id"]),
+            candidate,
+            mark_estimated_viewed=mark_estimated_viewed,
+        )
         crop_source_state = self._database_crop_source_state(str(row["entry_id"]), candidate_path_text)
         entry = {
             "entry_id": str(row["entry_id"]),
@@ -699,6 +731,7 @@ class PickerState:
             "source_byte_size": _file_byte_size(source_path),
             "source_file_type": _file_type_label(source_path),
             "source_dimensions": _image_dimensions(source_path),
+            "people_names": self._entry_people(str(row["entry_id"])),
             "current_match_status": "",
             "current_decision": "",
             "crop_source_state": crop_source_state,
@@ -753,6 +786,7 @@ class PickerState:
         candidate_path: str,
         crop: dict[str, Any],
         source: str,
+        commit_pending: bool | None = None,
     ) -> bool:
         path = Path(candidate_path)
         normalized = _normalized_review_crop(crop, path)
@@ -761,13 +795,18 @@ class PickerState:
         normalized["shape"] = "square"
         if not self._database_crop_candidate_exists(entry_id, candidate_path):
             return False
-        self._store_crop_staging(entry_id, candidate_path, normalized)
+        self._store_crop_staging(
+            entry_id,
+            candidate_path,
+            normalized,
+            commit_pending=(source != "estimated" if commit_pending is None else commit_pending),
+        )
         return True
 
     def _clear_database_crop(self, entry_id: str, candidate_path: str) -> bool:
         if not self._database_crop_candidate_exists(entry_id, candidate_path):
             return False
-        self._store_crop_staging(entry_id, candidate_path, None)
+        self._store_crop_staging(entry_id, candidate_path, None, commit_pending=True)
         return True
 
     def _database_crop_candidate_exists(self, entry_id: str, candidate_path: str) -> bool:
@@ -856,16 +895,20 @@ class PickerState:
         )
         return True
 
-    def commit_staged_crops(self) -> dict[str, Any]:
+    def commit_staged_crops(self, start_date: str = "", end_date: str = "") -> dict[str, Any]:
         with self._lock:
+            start_date = str(start_date or "").strip()
+            end_date = str(end_date or "").strip()
             staged = {
                 entry_id: {candidate_path: dict(record) for candidate_path, record in candidates.items()}
                 for entry_id, candidates in self._crop_staging.items()
+                if _entry_id_in_date_scope(entry_id, start_date, end_date)
             }
             saved_count = 0
             cleared_count = 0
             rejected_count = 0
             missing_count = 0
+            missing_staging: dict[str, dict[str, dict[str, Any]]] = {}
             rejected_rows_to_append: list[dict[str, str]] = []
             prune_summary: dict[str, Any] = {}
             db_path = self.config.canonical_root / "canonical.db"
@@ -876,11 +919,14 @@ class PickerState:
             try:
                 for entry_id, candidates in staged.items():
                     for candidate_path, record in candidates.items():
+                        if not self._staged_crop_commit_pending(record):
+                            continue
                         action = str(record.get("action", "")).strip().lower()
                         if action == "reject_original":
                             row = self._database_reference_row(connection, entry_id, candidate_path)
                             if row is None:
                                 missing_count += 1
+                                missing_staging.setdefault(entry_id, {})[candidate_path] = record
                                 continue
                             rejected_row = self._apply_database_crop_original_rejection(
                                 connection,
@@ -903,6 +949,7 @@ class PickerState:
                         )
                         if not applied:
                             missing_count += 1
+                            missing_staging.setdefault(entry_id, {})[candidate_path] = record
                             continue
                         if crop is None:
                             cleared_count += 1
@@ -917,6 +964,7 @@ class PickerState:
             for rejected_row in rejected_rows_to_append:
                 self._append_rejected_queue_row(rejected_row)
             if rejected_rows_to_append:
+                self._confirmed_original_entry_ids_cache = None
                 prune_summary = prune_applied_review_queue(
                     canonical_root=self.config.canonical_root,
                     queue_path=self.config.queue_path,
@@ -924,12 +972,19 @@ class PickerState:
                 )
                 self._entry_rows_cache = {}
                 self._queue_shards.invalidate()
+            missing_archive_path = self._archive_missing_crop_staging(missing_staging)
+            for entry_id, candidates in missing_staging.items():
+                for candidate_path in candidates:
+                    self._crop_staging.get(entry_id, {}).pop(candidate_path, None)
+                if not self._crop_staging.get(entry_id):
+                    self._crop_staging.pop(entry_id, None)
             self._persist_crop_staging()
         return {
             "saved_count": saved_count,
             "cleared_count": cleared_count,
             "rejected_count": rejected_count,
             "missing_count": missing_count,
+            "missing_archive_path": missing_archive_path,
             "remaining_count": self.pending_crop_commits()["pending_count"],
             "remaining_queue_rows": prune_summary.get("queue_rows", ""),
             "remaining_entries": prune_summary.get("entry_count", ""),
@@ -1130,41 +1185,77 @@ class PickerState:
         candidate_path: str,
         crop: dict[str, Any],
         source: str = "manual",
+        commit_pending: bool = True,
     ) -> dict[str, Any]:
         with self._lock:
             rows = self._entry_rows(entry_id)
             found = False
             for row in rows:
-                if row.get("entry_id") == entry_id and row.get("candidate_path") == candidate_path:
+                if (
+                    row.get("entry_id") == entry_id
+                    and row.get("candidate_path") == candidate_path
+                    and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                ):
                     _set_review_crop(row, crop, source=source)
                     found = True
                     break
             if found:
                 self._store_entry_overrides(entry_id, rows)
                 return self.crop_entry_detail(entry_id) or {}
-        if self._set_database_crop(entry_id, candidate_path, crop, source):
-            return self.crop_entry_detail(entry_id) or {}
+        if self._set_database_crop(entry_id, candidate_path, crop, source, commit_pending=commit_pending):
+            return self.crop_entry_detail(entry_id, mark_estimated_viewed=commit_pending) or {}
         raise ValueError("Unknown candidate")
 
     def reset_crop(
         self,
         entry_id: str,
         candidate_path: str,
+        preserve_estimate: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             rows = self._entry_rows(entry_id)
             found = False
             for row in rows:
-                if row.get("entry_id") == entry_id and row.get("candidate_path") == candidate_path:
+                if (
+                    row.get("entry_id") == entry_id
+                    and row.get("candidate_path") == candidate_path
+                    and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                ):
+                    if (
+                        preserve_estimate
+                        and str(row.get("review_crop_source", "")).strip().lower() == "estimated"
+                        and _candidate_has_review_crop(row)
+                    ):
+                        return self.crop_entry_detail(entry_id, mark_estimated_viewed=False) or {}
                     _clear_review_crop(row)
                     found = True
                     break
             if found:
                 self._store_entry_overrides(entry_id, rows)
                 return self.crop_entry_detail(entry_id) or {}
+        if preserve_estimate and self._restore_database_estimated_crop(entry_id, candidate_path):
+            return self.crop_entry_detail(entry_id, mark_estimated_viewed=False) or {}
         if self._clear_database_crop(entry_id, candidate_path):
             return self.crop_entry_detail(entry_id) or {}
         raise ValueError("Unknown candidate")
+
+    def _restore_database_estimated_crop(self, entry_id: str, candidate_path: str) -> bool:
+        detail = self._database_crop_entry_detail(entry_id, mark_estimated_viewed=False)
+        if detail is None:
+            return False
+        for candidate in detail.get("candidates", []):
+            if str(candidate.get("path", "")) != candidate_path:
+                continue
+            if str(candidate.get("review_crop_source", "")).strip().lower() != "estimated":
+                return False
+            crop = _review_crop_from_candidate(candidate)
+            if crop is None:
+                return False
+            crop["source"] = "estimated"
+            if self._staged_crop_record(entry_id, candidate_path) is not None:
+                self._store_crop_staging(entry_id, candidate_path, crop, commit_pending=False)
+            return True
+        return False
 
     def reject_crop_original(
         self,
@@ -1195,12 +1286,13 @@ class PickerState:
         for row in rows:
             if row.get("entry_id") != entry_id:
                 continue
-            if row.get("candidate_path") == candidate_path:
+            decision = row.get("review_decision", "").strip().lower()
+            if row.get("candidate_path") == candidate_path and decision in ACCEPT_DECISIONS:
                 row["review_decision"] = "rejected"
                 row["review_notes"] = notes or "Rejected from crop confirmation."
                 _clear_review_crop(row)
                 found = True
-            elif row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS:
+            elif decision in ACCEPT_DECISIONS:
                 row["review_decision"] = ""
                 row["review_notes"] = ""
                 _clear_review_crop(row)
@@ -1433,6 +1525,10 @@ class PickerState:
         return estimated_crop
 
     def start_crop_estimate_batch(self, apply_estimates: bool = False) -> dict[str, Any]:
+        with self._job_lock:
+            active_job = self._latest_crop_estimate_job_locked(active_only=True)
+            if active_job is not None:
+                return dict(active_job)
         targets = [
             {
                 "entry_id": entry["entry_id"],
@@ -1453,8 +1549,9 @@ class PickerState:
             "skipped_count": 0,
             "failed_count": 0,
             "current_entry_id": "",
-            "started_at": "",
+            "started_at": dt.datetime.now(dt.UTC).isoformat(),
             "finished_at": "",
+            "last_update_at": dt.datetime.now(dt.UTC).isoformat(),
             "errors": [],
             "apply_estimates": bool(apply_estimates),
             "message": "",
@@ -1481,6 +1578,27 @@ class PickerState:
         with self._job_lock:
             job = self._crop_estimate_jobs.get(job_id)
             return dict(job) if job else None
+
+    def crop_estimate_jobs(self, active_only: bool = False) -> list[dict[str, Any]]:
+        with self._job_lock:
+            return [
+                dict(job)
+                for job in self._crop_estimate_jobs.values()
+                if not active_only or job.get("status") in {"queued", "running"}
+            ]
+
+    def latest_crop_estimate_job(self, active_only: bool = False) -> dict[str, Any] | None:
+        with self._job_lock:
+            job = self._latest_crop_estimate_job_locked(active_only=active_only)
+            return dict(job) if job else None
+
+    def _latest_crop_estimate_job_locked(self, active_only: bool = False) -> dict[str, Any] | None:
+        jobs = [
+            job
+            for job in self._crop_estimate_jobs.values()
+            if not active_only or job.get("status") in {"queued", "running"}
+        ]
+        return jobs[-1] if jobs else None
 
     def add_linked_candidate(self, entry_id: str, candidate_path: str) -> dict[str, Any]:
         original_path = Path(candidate_path).expanduser()
@@ -1614,6 +1732,7 @@ class PickerState:
             )
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
+            self._confirmed_original_entry_ids_cache = None
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -1662,6 +1781,7 @@ class PickerState:
             )
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
+            self._confirmed_original_entry_ids_cache = None
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -2085,7 +2205,13 @@ class PickerState:
                     else:
                         estimated_crop = self._estimated_crop_for_candidate(entry_id, candidate_path)
                         if apply_estimates:
-                            self.save_crop(entry_id, candidate_path, estimated_crop, source="estimated")
+                            self.save_crop(
+                                entry_id,
+                                candidate_path,
+                                estimated_crop,
+                                source="estimated",
+                                commit_pending=False,
+                            )
                         self._increment_crop_estimate_job(job_id, "estimated_count")
                 except Exception as exc:  # noqa: BLE001 - batch should continue and report per-file errors.
                     self._append_crop_estimate_error(job_id, entry_id, candidate_path, str(exc))
@@ -2105,7 +2231,7 @@ class PickerState:
         )
 
     def _crop_candidate_has_review_crop(self, entry_id: str, candidate_path: str) -> bool:
-        detail = self.crop_entry_detail(entry_id)
+        detail = self.crop_entry_detail(entry_id, mark_estimated_viewed=False)
         if detail is None:
             return False
         for candidate in detail.get("candidates", []):
@@ -2117,11 +2243,13 @@ class PickerState:
         with self._job_lock:
             job = self._crop_estimate_jobs[job_id]
             job.update(updates)
+            job["last_update_at"] = dt.datetime.now(dt.UTC).isoformat()
 
     def _increment_crop_estimate_job(self, job_id: str, key: str) -> None:
         with self._job_lock:
             job = self._crop_estimate_jobs[job_id]
             job[key] = int(job.get(key, 0)) + 1
+            job["last_update_at"] = dt.datetime.now(dt.UTC).isoformat()
 
     def _append_crop_estimate_error(
         self,
@@ -2133,6 +2261,7 @@ class PickerState:
         with self._job_lock:
             job = self._crop_estimate_jobs[job_id]
             job["failed_count"] = int(job.get("failed_count", 0)) + 1
+            job["last_update_at"] = dt.datetime.now(dt.UTC).isoformat()
             errors = job.setdefault("errors", [])
             if len(errors) < 20:
                 errors.append(
@@ -2180,6 +2309,7 @@ class PickerState:
             "source_byte_size": _file_byte_size(source_path),
             "source_file_type": _file_type_label(source_path),
             "source_dimensions": _image_dimensions(source_path),
+            "people_names": self._entry_people(entry_id),
             "current_match_status": first.get("current_match_status", ""),
             "current_decision": first.get("current_decision", ""),
             "manual_search_message": manual_search_message,
@@ -2204,10 +2334,45 @@ class PickerState:
             "source_byte_size": _file_byte_size(source_path),
             "source_file_type": _file_type_label(source_path),
             "source_dimensions": _image_dimensions(source_path),
+            "people_names": self._entry_people(entry_id),
             "current_match_status": str(record.get("current_match_status", "")),
             "current_decision": str(record.get("current_decision", "")),
             "manual_search_message": str(record.get("manual_search_message", "")),
         }
+
+    def _entry_people(self, entry_id: str) -> list[str]:
+        db_path = self.config.canonical_root / "canonical.db"
+        try:
+            stat = db_path.stat()
+        except OSError:
+            return []
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if self._people_cache_signature != signature:
+            self._people_by_entry = self._load_people_by_entry(db_path)
+            self._people_cache_signature = signature
+        return list(self._people_by_entry.get(entry_id, []))
+
+    def _load_people_by_entry(self, db_path: Path) -> dict[str, list[str]]:
+        people: dict[str, list[str]] = {}
+        connection = sqlite3.connect(db_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT entry_id, canonical_name
+                FROM people
+                WHERE review_status IN ('suggested', 'confirmed', 'reviewed')
+                ORDER BY canonical_name
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return {}
+        finally:
+            connection.close()
+        for entry_id, canonical_name in rows:
+            name = str(canonical_name or "").strip()
+            if name:
+                people.setdefault(str(entry_id), []).append(name)
+        return people
 
     def _image_token(self, path: Path | None) -> str:
         if path is None:
@@ -2244,6 +2409,39 @@ class PickerState:
         finally:
             connection.close()
         return {entry_id: Path(storage_path) for entry_id, storage_path in rows}
+
+    def _entry_has_confirmed_external_original(self, entry_id: str) -> bool:
+        if self._confirmed_original_entry_ids_cache is None:
+            self._confirmed_original_entry_ids_cache = self._load_confirmed_external_original_entry_ids()
+        return entry_id in self._confirmed_original_entry_ids_cache
+
+    def _entry_has_active_review_state(self, entry_id: str) -> bool:
+        return (
+            entry_id in self._decision_overrides
+            or entry_id in self._added_candidate_rows
+            or entry_id in self._replacement_candidate_rows
+        )
+
+    def _load_confirmed_external_original_entry_ids(self) -> set[str]:
+        db_path = self.config.canonical_root / "canonical.db"
+        if not db_path.exists():
+            return set()
+        connection = sqlite3.connect(db_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT entry_id
+                FROM media_assets
+                WHERE role = 'external_original_reference'
+                    AND review_status = 'confirmed'
+                    AND COALESCE(storage_path, '') != ''
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return set()
+        finally:
+            connection.close()
+        return {str(row[0]) for row in rows if str(row[0] or "").strip()}
 
     def _read_rows(self) -> list[dict[str, str]]:
         _, rows = self._read_rows_with_fieldnames()
@@ -2296,15 +2494,42 @@ class PickerState:
         )
         temporary.replace(path)
 
+    def _archive_missing_crop_staging(
+        self,
+        entries: dict[str, dict[str, dict[str, Any]]],
+    ) -> str:
+        if not entries:
+            return ""
+        archive_dir = self.config.canonical_root / "exports" / "review_queue_backups"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d_%H%M%S_%f")
+        archive_path = archive_dir / (
+            f"{self.config.queue_path.stem}_crop_staging_missing_{timestamp}.json"
+        )
+        archive_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "reason": "canonical crop target no longer exists",
+                    "entries": entries,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return str(archive_path)
+
     def _store_crop_staging(
         self,
         entry_id: str,
         candidate_path: str,
         crop: dict[str, object] | None,
+        commit_pending: bool = True,
     ) -> None:
         entry = self._crop_staging.setdefault(entry_id, {})
         entry[candidate_path] = {
             "crop": crop,
+            "commit_pending": commit_pending,
             "updated_at": dt.datetime.now(dt.UTC).isoformat(),
         }
         self._persist_crop_staging()
@@ -2319,6 +2544,7 @@ class PickerState:
         entry = self._crop_staging.setdefault(entry_id, {})
         entry[candidate_path] = {
             "action": "reject_original",
+            "commit_pending": True,
             "notes": notes or "Rejected from crop confirmation.",
             "rejected_row": rejected_row,
             "updated_at": dt.datetime.now(dt.UTC).isoformat(),
@@ -2332,8 +2558,40 @@ class PickerState:
         record = self._staged_crop_record(entry_id, candidate_path)
         return bool(record and str(record.get("action", "")).strip().lower() == "reject_original")
 
-    def _apply_staged_crop_to_candidate(self, entry_id: str, candidate: dict[str, Any]) -> None:
-        record = self._staged_crop_record(entry_id, str(candidate.get("path", "")))
+    def _staged_crop_commit_pending(self, record: dict[str, Any]) -> bool:
+        if "commit_pending" in record:
+            return bool(record.get("commit_pending"))
+        action = str(record.get("action", "")).strip().lower()
+        if action:
+            return True
+        crop = record.get("crop")
+        if isinstance(crop, dict) and str(crop.get("source", "")).strip().lower() == "estimated":
+            return False
+        return True
+
+    def _mark_staged_crop_commit_pending(self, entry_id: str, candidate_path: str) -> None:
+        record = self._staged_crop_record(entry_id, candidate_path)
+        if record is None or self._staged_crop_commit_pending(record):
+            return
+        crop = record.get("crop")
+        if not isinstance(crop, dict):
+            return
+        if str(crop.get("source", "")).strip().lower() != "estimated":
+            return
+        record["commit_pending"] = True
+        record["viewed_at"] = dt.datetime.now(dt.UTC).isoformat()
+        self._persist_crop_staging()
+
+    def _apply_staged_crop_to_candidate(
+        self,
+        entry_id: str,
+        candidate: dict[str, Any],
+        mark_estimated_viewed: bool = False,
+    ) -> None:
+        candidate_path = str(candidate.get("path", ""))
+        if mark_estimated_viewed:
+            self._mark_staged_crop_commit_pending(entry_id, candidate_path)
+        record = self._staged_crop_record(entry_id, candidate_path)
         if record is None:
             return
         crop = record.get("crop")
@@ -2725,6 +2983,7 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         {
                             "entries": state.crop_entries(crop_filter=crop_filter),
                             "pending_crop_commits": state.pending_crop_commits(),
+                            "crop_estimate_batch": state.latest_crop_estimate_job() or {},
                         }
                     )
                 elif parsed.path.startswith("/api/entry/"):
@@ -2823,6 +3082,7 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     detail = state.reset_crop(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
+                        preserve_estimate=bool(payload.get("preserve_estimate")),
                     )
                     self._send_json(detail)
                     return
@@ -3644,6 +3904,20 @@ def _candidate_has_review_crop(candidate: dict[str, Any]) -> bool:
     )
 
 
+def _review_crop_from_candidate(candidate: dict[str, Any]) -> dict[str, object] | None:
+    if not _candidate_has_review_crop(candidate):
+        return None
+    return {
+        "x": candidate.get("review_crop_x", ""),
+        "y": candidate.get("review_crop_y", ""),
+        "size": candidate.get("review_crop_size", ""),
+        "candidate_width": candidate.get("review_crop_candidate_width", ""),
+        "candidate_height": candidate.get("review_crop_candidate_height", ""),
+        "fill_color": candidate.get("review_crop_fill_color", ""),
+        "rotation_degrees": candidate.get("review_crop_rotation_degrees", ""),
+    }
+
+
 def _crop_filter_matches(entry: dict[str, Any], crop_filter: str) -> bool:
     crop_source = str(entry.get("crop_source", "")).strip().lower()
     if crop_filter == "all":
@@ -3657,6 +3931,18 @@ def _crop_filter_matches(entry: dict[str, Any], crop_filter: str) -> bool:
     if crop_filter == "confirmed":
         return bool(entry.get("crop_has_crop")) and crop_source != "estimated"
     return False
+
+
+def _entry_id_in_date_scope(entry_id: str, start_date: str, end_date: str) -> bool:
+    if not start_date and not end_date:
+        return True
+    parts = str(entry_id or "").split(":")
+    entry_date = parts[1] if len(parts) >= 2 else ""
+    if start_date and entry_date < start_date:
+        return False
+    if end_date and entry_date > end_date:
+        return False
+    return bool(entry_date)
 
 
 def _crop_status_label(has_crop: bool, crop_source: str) -> str:
@@ -4197,6 +4483,14 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+.people-script {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .candidate-grid {
   display: grid;
@@ -4810,6 +5104,13 @@ function formatPriorMatcher(entry) {
   return `prior matcher: ${escapeHtml(parts.join(" · "))}`;
 }
 
+function peopleScript(names) {
+  const values = Array.isArray(names) ? names.filter(Boolean) : [];
+  if (!values.length) return "";
+  const text = values.join(", ");
+  return `<span class="people-script" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
+}
+
 async function loadSummary() {
   const summary = await fetchJson("/api/summary");
   if (summary.active_photo_index_folder) {
@@ -4951,6 +5252,7 @@ function renderEntries() {
 	      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
 	      : `<div class="entry-thumb"></div>`;
 	    const hasPendingLink = Number(entry.selected_count || 0) > 0;
+	    const people = peopleScript(entry.people_names);
 	    item.innerHTML = `
 	      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
 	      ${thumb}
@@ -4960,6 +5262,7 @@ function renderEntries() {
           <span class="badge ${entry.status}">${escapeHtml(statusLabel(entry.status))}</span>
 	        </div>
 	        <div class="summary">${entry.candidate_count} candidates</div>
+	        ${people}
 	      </button>
 	      <button class="action-button primary entry-commit" type="button" data-action="commit-entry" title="Commit this target's linked original to the database" ${hasPendingLink ? "" : 'disabled aria-hidden="true" tabindex="-1"'}>Commit</button>
 	    `;
@@ -5145,6 +5448,7 @@ function renderEntryDetail() {
   const sourceFacts = formatPhotoFacts(entry.source_file_type, entry.source_byte_size, entry.source_dimensions);
   const sourceParts = [escapeHtml(entry.entry_id)];
   if (sourceFacts) sourceParts.push(escapeHtml(sourceFacts));
+  if (entry.people_names?.length) sourceParts.push(peopleScript(entry.people_names));
   if (priorMatcher) sourceParts.push(priorMatcher);
   document.getElementById("sourceMeta").innerHTML = sourceParts.join("<br>");
   const grid = document.getElementById("candidateGrid");
@@ -6993,9 +7297,9 @@ h1 {
 }
 main {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
   min-height: 0;
   overflow: hidden;
 }
@@ -7096,6 +7400,16 @@ main {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.people-script {
+  display: block;
+  margin-top: 2px;
+  color: var(--subtle);
+  font-size: 11px;
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .entry-crop-status {
   display: inline-block;
   margin-top: 4px;
@@ -7111,10 +7425,10 @@ main {
 }
 .toolbar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto;
-  gap: 12px 18px;
+  grid-template-columns: 1fr;
+  gap: 12px;
   align-items: center;
-  padding: 12px 14px;
+  padding: 12px;
   border-bottom: 1px solid var(--line);
 }
 .heading {
@@ -7133,21 +7447,23 @@ main {
   text-overflow: ellipsis;
 }
 .controls {
-  display: grid;
-  grid-template-columns: max-content max-content;
-  gap: 12px;
+  display: flex;
+  gap: 8px;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: start;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .control-group {
   display: inline-flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
   min-height: 42px;
   white-space: nowrap;
 }
 .control-group + .control-group {
-  padding-left: 12px;
+  padding-left: 8px;
   border-left: 1px solid var(--line);
 }
 .item-actions button {
@@ -7157,10 +7473,10 @@ main {
 #suggestCropButton,
 #resetCropButton,
 #saveCropButton {
-  min-width: 118px;
+  min-width: 104px;
 }
 #commitCropButton {
-  min-width: 260px;
+  min-width: 236px;
 }
 button {
   appearance: none;
@@ -7213,7 +7529,7 @@ button.subtle-danger:hover {
 }
 .minimal-crop-control {
   min-height: 34px;
-  padding: 6px 9px;
+  padding: 6px 7px;
   color: var(--subtle);
   font-size: 12px;
   font-weight: 600;
@@ -7231,13 +7547,13 @@ button.subtle-danger:hover {
 }
 .crop-size-control input,
 .crop-rotation-control input {
-  width: 220px;
+  width: 165px;
 }
 .crop-size-slider-frame {
   position: relative;
   display: inline-flex;
   align-items: center;
-  width: 220px;
+  width: 165px;
   padding-bottom: 8px;
   margin-bottom: -8px;
 }
@@ -7310,6 +7626,9 @@ button.subtle-danger:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.photo-title .people-script {
+  font-size: 12px;
 }
 .photo-frame {
   min-height: 0;
@@ -7465,15 +7784,16 @@ button.subtle-danger:hover {
   display: none;
 }
 @media (max-width: 1680px) {
-  .toolbar,
-  .controls {
+  .toolbar {
     grid-template-columns: 1fr;
   }
   .controls {
-    justify-content: stretch;
+    justify-content: start;
   }
   .control-group {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
   }
   .control-group + .control-group {
     padding-left: 0;
@@ -7548,8 +7868,8 @@ button.subtle-danger:hover {
             <input id="cropFillColor" type="color" value="#000000">
           </label>
           <button id="fillColorSampleButton" class="color-sample-control" type="button" title="Sample a 3x3 average fill color from the actual original image pixels" disabled>Sample</button>
-          <button id="minimalFitButton" class="minimal-crop-control" type="button" title="Shrink the crop around its current center until it fits inside the original photo" disabled>Minimal fit</button>
-          <button id="minimalMoveButton" class="minimal-crop-control" type="button" title="Move the crop the shortest distance that fits it inside the original photo without resizing" disabled>Minimal move</button>
+          <button id="minimalFitButton" class="minimal-crop-control" type="button" title="Shortcut: f. Shrink the crop around its current center until it fits inside the original photo" disabled>Minimal fit (f)</button>
+          <button id="minimalMoveButton" class="minimal-crop-control" type="button" title="Shortcut: m. Move the crop the shortest distance that fits it inside the original photo without resizing" disabled>Minimal move (m)</button>
           <button id="rotateQuarterTurnButton" class="icon-control" type="button" title="Rotate 90 degrees clockwise" aria-label="Rotate 90 degrees clockwise">↻</button>
           <label class="crop-size-control">
             Crop size
@@ -7567,7 +7887,7 @@ button.subtle-danger:hover {
         <div class="control-group item-actions">
           <button id="suggestCropButton">Estimate crop</button>
           <button id="resetCropButton">Reset crop</button>
-          <button id="saveCropButton" class="primary">Save crop</button>
+          <button id="saveCropButton" class="primary" title="Shortcut: Return. Save crop offsets to staging">Save crop (Return)</button>
           <button id="commitCropButton" title="Commit staged crop-window changes to the canonical database">Commit crop changes <span id="pendingCropCommitCount" class="pending-count">0 pending</span></button>
         </div>
       </div>
@@ -7577,6 +7897,7 @@ button.subtle-danger:hover {
         <div class="photo-title">
           <strong>Original Project365 target</strong>
           <span id="targetFacts"></span>
+          <span id="targetPeople"></span>
         </div>
         <div class="photo-frame"><img id="targetImage" alt=""></div>
         <div class="crop-preview">
@@ -7610,13 +7931,15 @@ const state = {
   selectedEntryId: "",
   currentEntry: null,
   selectedCandidate: null,
-  cropDraft: null,
-  cropDrag: null,
-  fillColorSampling: false,
-  pendingCropCommits: {pending_count: 0},
-  openYears: new Set(),
-  openMonths: new Set()
-};
+	  cropDraft: null,
+	  cropDrag: null,
+	  fillColorSampling: false,
+	  pendingCropCommits: {pending_count: 0},
+	  cropEstimateBatch: {},
+	  cropFilterTouched: false,
+	  openYears: new Set(),
+	  openMonths: new Set()
+	};
 
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
@@ -7626,14 +7949,21 @@ async function fetchJson(url, options) {
 }
 
 async function loadEntries(preferredEntryId = "") {
-  const cropFilter = document.getElementById("cropFilter").value;
+  const filterControl = document.getElementById("cropFilter");
+  let cropFilter = filterControl.value;
   const body = await fetchJson(`/api/crop-entries?crop_filter=${encodeURIComponent(cropFilter)}`);
+  state.cropEstimateBatch = body.crop_estimate_batch || {};
+  if (shouldPreferSavedEstimateFilter(cropFilter, state.cropEstimateBatch)) {
+    filterControl.value = "estimated";
+    cropFilter = "estimated";
+    return loadEntries(preferredEntryId);
+  }
   state.entries = body.entries || [];
   state.pendingCropCommits = body.pending_crop_commits || {pending_count: 0};
   updatePendingCropCommitControl();
   const missingCount = state.entries.filter(entry => !entry.crop_has_crop).length;
   document.getElementById("summary").textContent =
-    cropSummaryText(cropFilter, state.entries, missingCount);
+    cropSummaryText(cropFilter, state.entries, missingCount) + cropEstimateBatchSummary(state.cropEstimateBatch);
   if (!state.entries.length) {
     state.selectedEntryId = "";
     state.currentEntry = null;
@@ -7653,12 +7983,28 @@ async function loadEntries(preferredEntryId = "") {
   await loadEntry(state.selectedEntryId);
 }
 
+function shouldPreferSavedEstimateFilter(cropFilter, job) {
+  if (state.cropFilterTouched || cropFilter !== "missing") return false;
+  if (!job || !job.apply_estimates) return false;
+  if (!["queued", "running"].includes(job.status || "")) return false;
+  return Number(job.estimated_count || 0) > 0;
+}
+
 function cropSummaryText(cropFilter, entries, missingCount) {
   const countText = `${entries.length} linked original${entries.length === 1 ? "" : "s"}`;
   if (cropFilter === "missing") return `${countText} without saved crop data.`;
   if (cropFilter === "estimated") return `${countText} with saved estimate crop data.`;
   if (cropFilter === "confirmed") return `${countText} with user saved crop data.`;
   return `${countText} · ${missingCount} without saved crop data.`;
+}
+
+function cropEstimateBatchSummary(job) {
+  if (!job || !job.id || !["queued", "running"].includes(job.status || "")) return "";
+  const processed = Number(job.processed_count || 0);
+  const total = Number(job.target_count || 0);
+  const estimated = Number(job.estimated_count || 0);
+  const mode = job.apply_estimates ? "saved" : "previewed";
+  return ` Batch estimate running: ${processed}/${total} checked, ${estimated} ${mode}.`;
 }
 
 async function loadEntry(entryId) {
@@ -7699,11 +8045,13 @@ function renderEntries() {
           ? `<img src="/image/${encodeURIComponent(entry.source_token)}" alt="">`
           : `<span></span>`;
         const statusClass = entry.crop_has_crop ? "" : "missing";
+        const people = peopleScript(entry.people_names);
         button.innerHTML = `
           ${image}
           <span>
             <span class="entry-date">${escapeHtml(entry.entry_date || entry.entry_id)}</span>
             <span class="entry-meta">${escapeHtml(entry.candidate_filename || entry.candidate_path || "linked original")}</span>
+            ${people}
             <span class="entry-crop-status ${statusClass}">${escapeHtml(entry.crop_status || "")} · ${escapeHtml(entry.crop_source_state || "")}</span>
           </span>
         `;
@@ -7792,6 +8140,7 @@ function renderEmpty() {
   candidatePath.textContent = "";
   candidatePath.removeAttribute("title");
   document.getElementById("targetFacts").textContent = "";
+  document.getElementById("targetPeople").innerHTML = "";
   document.getElementById("originalFacts").textContent = "";
   document.getElementById("targetImage").removeAttribute("src");
   const originalImage = document.getElementById("originalImage");
@@ -7824,6 +8173,7 @@ function renderCropEditor() {
   candidatePath.textContent = candidateFileLabel(candidate);
   candidatePath.title = candidate.path || candidate.filename || "";
   document.getElementById("targetFacts").textContent = formatPhotoFacts(entry.source_file_type, entry.source_byte_size, entry.source_dimensions);
+  document.getElementById("targetPeople").innerHTML = peopleScript(entry.people_names);
   document.getElementById("originalFacts").textContent = formatPhotoFacts(
     fileTypeLabel(candidate.filename || candidate.path || "", candidate.mime_type),
     candidate.byte_size,
@@ -7871,6 +8221,12 @@ function savedCropForCandidate(candidate) {
 
 function hasSavedCropForCandidate(candidate) {
   return Boolean(savedCropForCandidate(candidate));
+}
+
+function shouldPreserveEstimatedCropOnReset() {
+  const cropFilter = document.getElementById("cropFilter").value;
+  const source = String(state.selectedCandidate?.review_crop_source || "").trim().toLowerCase();
+  return cropFilter === "estimated" && source === "estimated" && hasSavedCropForCandidate(state.selectedCandidate);
 }
 
 function ensureCropDraftFromImage() {
@@ -8497,6 +8853,7 @@ async function saveCropForCurrentCandidate() {
 async function resetCropForCurrentCandidate() {
   if (!state.currentEntry || !state.selectedCandidate) return;
   const button = document.getElementById("resetCropButton");
+  const preserveEstimate = shouldPreserveEstimatedCropOnReset();
   button.disabled = true;
   try {
     state.currentEntry = await fetchJson("/api/crop-reset", {
@@ -8504,13 +8861,16 @@ async function resetCropForCurrentCandidate() {
       headers: {"content-type": "application/json"},
       body: JSON.stringify({
         entry_id: state.currentEntry.entry_id,
-        candidate_path: state.selectedCandidate.path
+        candidate_path: state.selectedCandidate.path,
+        preserve_estimate: preserveEstimate
       })
     });
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.selected) || state.selectedCandidate;
-    state.cropDraft = null;
+    state.cropDraft = preserveEstimate ? savedCropForCandidate(state.selectedCandidate) : null;
     renderCropEditor();
-    document.getElementById("cropStatus").textContent = "Crop reset staged.";
+    document.getElementById("cropStatus").textContent = preserveEstimate
+      ? "Saved estimate restored. Adjust it if needed."
+      : "Crop reset staged.";
     await loadEntries(state.currentEntry.entry_id);
   } catch (error) {
     document.getElementById("cropStatus").textContent = error.message;
@@ -8604,6 +8964,13 @@ function filenameFromPath(path) {
   return String(path || "").split(/[\\/]/).filter(Boolean).pop() || "";
 }
 
+function peopleScript(names) {
+  const values = Array.isArray(names) ? names.filter(Boolean) : [];
+  if (!values.length) return "";
+  const text = values.join(", ");
+  return `<span class="people-script" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
+}
+
 function fileTypeLabel(path, mimeType = "") {
   const lower = String(path || "").toLowerCase();
   if (mimeType) return mimeType;
@@ -8646,13 +9013,43 @@ function escapeHtml(value) {
   }[char]));
 }
 
+function isCropShortcutEditableTarget(target) {
+  if (!target) return false;
+  const focusedControl = target.closest?.("input, select, textarea, button, a, [contenteditable='true']");
+  return Boolean(focusedControl);
+}
+
+function runCropShortcutButton(buttonId, action) {
+  const button = document.getElementById(buttonId);
+  if (!button || button.disabled) return false;
+  action();
+  return true;
+}
+
+function handleCropKeyboardShortcut(event) {
+  if (event.repeat || event.metaKey || event.ctrlKey || event.altKey || isCropShortcutEditableTarget(event.target)) return;
+  const key = event.key.toLowerCase();
+  let handled = false;
+  if (key === "f") {
+    handled = runCropShortcutButton("minimalFitButton", minimalFitCurrentCrop);
+  } else if (key === "m") {
+    handled = runCropShortcutButton("minimalMoveButton", minimalMoveCurrentCrop);
+  } else if (event.key === "Enter") {
+    handled = runCropShortcutButton("saveCropButton", saveCropForCurrentCandidate);
+  }
+  if (handled) event.preventDefault();
+}
+
 document.getElementById("cropSizeSlider").oninput = event => resizeCropDraft(event.target.value);
 document.getElementById("cropRotationSlider").oninput = event => fineRotateCropDraft(event.target.value);
 document.getElementById("rotateQuarterTurnButton").onclick = rotateCropDraftByQuarterTurn;
 document.getElementById("fillColorSampleButton").onclick = toggleFillColorSampler;
 document.getElementById("minimalFitButton").onclick = minimalFitCurrentCrop;
 document.getElementById("minimalMoveButton").onclick = minimalMoveCurrentCrop;
-document.getElementById("cropFilter").onchange = () => loadEntries();
+document.getElementById("cropFilter").onchange = () => {
+  state.cropFilterTouched = true;
+  loadEntries();
+};
 document.getElementById("suggestCropButton").onclick = estimateCropForCurrentCandidate;
 document.getElementById("resetCropButton").onclick = resetCropForCurrentCandidate;
 document.getElementById("rejectOriginalButton").onclick = rejectOriginalForCurrentCrop;
@@ -8711,8 +9108,17 @@ document.getElementById("cropFillColor").oninput = event => {
   updateFillColorControl();
   updateCropPreview();
 };
+document.addEventListener("keydown", handleCropKeyboardShortcut);
 window.addEventListener("resize", positionCropBox);
 
+function applyInitialCropFilterFromUrl() {
+  const requested = new URLSearchParams(window.location.search).get("crop_filter") || "";
+  if (!["missing", "estimated", "confirmed", "all"].includes(requested)) return;
+  document.getElementById("cropFilter").value = requested;
+  state.cropFilterTouched = true;
+}
+
+applyInitialCropFilterFromUrl();
 loadEntries().catch(error => {
   document.getElementById("summary").textContent = error.message;
 });
