@@ -37,8 +37,12 @@ FILENAME_TIMESTAMP_PATTERNS = [
     ),
 ]
 DEFAULT_INDEX_FILENAME = "photo_library_index.sqlite"
+REEXPORT_SIDECAR_INDEX_FILENAME = "photo_library_reexport_index.sqlite"
+LEGACY_VIDEO_SIDECAR_INDEX_FILENAME = "video_library_legacy_index.sqlite"
 BROAD_VISUAL_INDEX_FILENAME = "broad_visual_match.sqlite"
-PHOTO_INDEX_METADATA_VERSION = "gps-sha-v1"
+PHOTO_INDEX_METADATA_VERSION = "gps-sha-date-sources-v2"
+VIDEO_EXTENSIONS = {".mov", ".mp4", ".m4v"}
+ICLOUD_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 BATCH_SIZE = 500
 METADATA_WORKERS = 4
 MAX_PENDING_METADATA_BATCHES = METADATA_WORKERS * 2
@@ -94,6 +98,9 @@ class ExiftoolPhotoMetadata:
     gps_latitude: float | None = None
     gps_longitude: float | None = None
     gps_source: str = ""
+    media_width: int | None = None
+    media_height: int | None = None
+    media_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Index external photo-library metadata for Project365 matching.")
     parser.add_argument("--canonical-root", default="Project365Canonical")
     parser.add_argument("--index-db", help="SQLite index path. Defaults inside the canonical root.")
+    parser.add_argument(
+        "--reexport-sidecar",
+        action="store_true",
+        help=(
+            "Use the re-export sidecar index inside the canonical root "
+            f"({REEXPORT_SIDECAR_INDEX_FILENAME}) instead of the main photo index."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-video-sidecar",
+        action="store_true",
+        help=(
+            "Use a legacy video sidecar index inside the canonical root "
+            f"({LEGACY_VIDEO_SIDECAR_INDEX_FILENAME}); defaults to roots from the main photo index."
+        ),
+    )
     parser.add_argument(
         "--index-root",
         action="append",
@@ -145,14 +168,34 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    index_db = default_index_db(Path(args.canonical_root), args.index_db)
-    if args.index_root:
+    sidecar_count = int(args.reexport_sidecar) + int(args.legacy_video_sidecar)
+    if sidecar_count > 1:
+        parser.error("choose only one sidecar index mode")
+    if sidecar_count and args.index_db:
+        parser.error("sidecar index modes cannot be combined with --index-db")
+    canonical_root = Path(args.canonical_root)
+    if args.reexport_sidecar:
+        index_db = default_reexport_sidecar_index_db(canonical_root)
+        media_extensions = ICLOUD_MEDIA_EXTENSIONS
+    elif args.legacy_video_sidecar:
+        index_db = default_legacy_video_sidecar_index_db(canonical_root)
+        media_extensions = VIDEO_EXTENSIONS
+    else:
+        index_db = default_index_db(canonical_root, args.index_db)
+        media_extensions = None
+    index_roots = [Path(root) for root in args.index_root]
+    if args.legacy_video_sidecar and not index_roots:
+        index_roots = main_photo_index_roots(canonical_root)
+        if not index_roots:
+            parser.error("legacy video sidecar requires --index-root or existing main photo-index roots")
+    if index_roots:
         summary = build_photo_library_index(
             index_db=index_db,
-            index_roots=[Path(root) for root in args.index_root],
+            index_roots=index_roots,
             reset=args.reset,
             reconcile_moves_only=args.reconcile_moves_only,
             progress_every=5000,
+            media_extensions=media_extensions,
         )
         print("Project365 photo-library index: PASS")
         print(f"Index DB: {summary.index_db_path}")
@@ -188,12 +231,34 @@ def default_index_db(canonical_root: Path, explicit_path: str | None = None) -> 
     return canonical_root / DEFAULT_INDEX_FILENAME
 
 
+def default_reexport_sidecar_index_db(canonical_root: Path) -> Path:
+    return canonical_root / REEXPORT_SIDECAR_INDEX_FILENAME
+
+
+def default_legacy_video_sidecar_index_db(canonical_root: Path) -> Path:
+    return canonical_root / LEGACY_VIDEO_SIDECAR_INDEX_FILENAME
+
+
+def main_photo_index_roots(canonical_root: Path) -> list[Path]:
+    index_db = default_index_db(canonical_root)
+    if not index_db.exists():
+        return []
+    connection = sqlite3.connect(index_db, timeout=60)
+    try:
+        if not _sqlite_table_exists(connection, "photo_library_files"):
+            return []
+        return [Path(root) for root in _indexed_roots(connection)]
+    finally:
+        connection.close()
+
+
 def build_photo_library_index(
     index_db: Path,
     index_roots: list[Path],
     reset: bool = False,
     reconcile_moves_only: bool = False,
     progress_every: int = 0,
+    media_extensions: set[str] | None = None,
 ) -> IndexSummary:
     if reset and reconcile_moves_only:
         raise ValueError("Move-only reconciliation cannot replace the photo index.")
@@ -225,7 +290,7 @@ def build_photo_library_index(
             for root in index_roots:
                 if progress_every:
                     print(f"Scanning photo index root: {root}", flush=True)
-                for scanned_file in _iter_image_files(root):
+                for scanned_file in _iter_image_files(root, media_extensions=media_extensions):
                     path = scanned_file.path
                     stat = scanned_file.stat
                     path_text = scanned_file.path_text
@@ -354,6 +419,7 @@ def query_index_candidates(
     folder_root: Path | None = None,
     include_filesystem_dates: bool = False,
     filename_dates_only: bool = False,
+    include_modified_dates: bool = False,
 ) -> dict[str, list[dict[str, object]]]:
     if not target_dates or not index_db.exists():
         return {date: [] for date in target_dates}
@@ -362,7 +428,9 @@ def query_index_candidates(
     folder_prefix = _folder_path_prefix(folder_root) if folder_root is not None else ""
     date_sources = ["filename_date"] if filename_dates_only else ["filename_date", "media_creation_date"]
     if include_filesystem_dates and not filename_dates_only:
-        date_sources.append("filesystem_date")
+        date_sources.append("filesystem_creation_date")
+    if include_modified_dates and not filename_dates_only:
+        date_sources.append("filesystem_modified_date")
     source_placeholders = ", ".join("?" for _ in date_sources)
     connection = sqlite3.connect(index_db, timeout=60)
     try:
@@ -405,6 +473,10 @@ def query_index_candidates(
                         files.gps_latitude,
                         files.gps_longitude,
                         files.gps_source,
+                        files.has_gps,
+                        files.media_width,
+                        files.media_height,
+                        files.media_duration_seconds,
                         files.quality_score,
                         files.quality_evidence,
                         GROUP_CONCAT(DISTINCT dates.source) AS evidence_sources,
@@ -487,7 +559,8 @@ def _path_is_within(path_text: str, parent_text: str) -> bool:
     return path_text.startswith(parent_prefix)
 
 
-def _iter_image_files(root: Path) -> Iterator[ScannedPhotoFile]:
+def _iter_image_files(root: Path, media_extensions: set[str] | None = None) -> Iterator[ScannedPhotoFile]:
+    extensions = tuple(sorted(media_extensions or IMAGE_EXTENSIONS))
     root_scan = root.expanduser()
     root_resolved = root_scan.resolve()
     pending = [(str(root_scan), str(root_resolved))]
@@ -500,7 +573,7 @@ def _iter_image_files(root: Path) -> Iterator[ScannedPhotoFile]:
                         if entry.is_dir(follow_symlinks=False):
                             pending.append((entry.path, os.path.join(resolved_dir, entry.name)))
                             continue
-                        if not entry.name.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                        if not entry.name.lower().endswith(extensions):
                             continue
                         if not entry.is_file():
                             continue
@@ -569,6 +642,10 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             gps_latitude REAL,
             gps_longitude REAL,
             gps_source TEXT NOT NULL DEFAULT '',
+            has_gps INTEGER NOT NULL DEFAULT 0,
+            media_width INTEGER,
+            media_height INTEGER,
+            media_duration_seconds REAL,
             sha256 TEXT NOT NULL DEFAULT '',
             metadata_version TEXT NOT NULL DEFAULT '',
             quality_score INTEGER NOT NULL DEFAULT 0,
@@ -585,6 +662,21 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "photo_library_files", "gps_latitude", "REAL")
     _ensure_column(connection, "photo_library_files", "gps_longitude", "REAL")
     _ensure_column(connection, "photo_library_files", "gps_source", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(connection, "photo_library_files", "has_gps", "INTEGER NOT NULL DEFAULT 0")
+    connection.execute(
+        """
+        UPDATE photo_library_files
+        SET has_gps = 1
+        WHERE has_gps != 1
+            AND gps_latitude IS NOT NULL
+            AND gps_longitude IS NOT NULL
+            AND gps_latitude BETWEEN -90 AND 90
+            AND gps_longitude BETWEEN -180 AND 180
+        """
+    )
+    _ensure_column(connection, "photo_library_files", "media_width", "INTEGER")
+    _ensure_column(connection, "photo_library_files", "media_height", "INTEGER")
+    _ensure_column(connection, "photo_library_files", "media_duration_seconds", "REAL")
     _ensure_column(connection, "photo_library_files", "sha256", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(connection, "photo_library_files", "metadata_version", "TEXT NOT NULL DEFAULT ''")
     connection.execute(
@@ -627,6 +719,10 @@ def _ensure_photo_library_file_indexes(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_photo_library_files_sha_size "
         "ON photo_library_files(sha256, byte_size)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photo_library_files_has_gps "
+        "ON photo_library_files(has_gps)"
     )
 
 
@@ -799,13 +895,17 @@ def _write_batch(
                 gps_latitude,
                 gps_longitude,
                 gps_source,
+                has_gps,
+                media_width,
+                media_height,
+                media_duration_seconds,
                 sha256,
                 metadata_version,
                 quality_score,
                 quality_evidence,
                 indexed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path)
             DO UPDATE SET
                 root = excluded.root,
@@ -822,6 +922,10 @@ def _write_batch(
                 gps_latitude = excluded.gps_latitude,
                 gps_longitude = excluded.gps_longitude,
                 gps_source = excluded.gps_source,
+                has_gps = excluded.has_gps,
+                media_width = excluded.media_width,
+                media_height = excluded.media_height,
+                media_duration_seconds = excluded.media_duration_seconds,
                 sha256 = excluded.sha256,
                 metadata_version = excluded.metadata_version,
                 quality_score = excluded.quality_score,
@@ -844,6 +948,10 @@ def _write_batch(
                 row["gps_latitude"],
                 row["gps_longitude"],
                 row["gps_source"],
+                row["has_gps"],
+                row["media_width"],
+                row["media_height"],
+                row["media_duration_seconds"],
                 row["sha256"],
                 row["metadata_version"],
                 row["quality_score"],
@@ -1132,7 +1240,9 @@ def _index_row(
         filename_dates = _filename_dates(path)
         filename_timestamps = _filename_timestamps(path)
         media_dates = _jpeg_exif_dates(path)
-        filesystem_dates = _filesystem_dates(stat)
+        filesystem_creation_dates = _filesystem_creation_dates(stat)
+        filesystem_modified_dates = _filesystem_modified_dates(stat)
+        filesystem_dates = filesystem_creation_dates | filesystem_modified_dates
         sha256 = _sha256_file(path)
     except OSError:
         return None
@@ -1154,6 +1264,10 @@ def _index_row(
         "gps_latitude": None,
         "gps_longitude": None,
         "gps_source": "",
+        "has_gps": 0,
+        "media_width": None,
+        "media_height": None,
+        "media_duration_seconds": None,
         "sha256": sha256,
         "metadata_version": PHOTO_INDEX_METADATA_VERSION,
         "quality_score": quality_score,
@@ -1162,7 +1276,8 @@ def _index_row(
         "date_sources": {
             "filename_date": filename_dates,
             "media_creation_date": media_dates,
-            "filesystem_date": filesystem_dates,
+            "filesystem_creation_date": filesystem_creation_dates,
+            "filesystem_modified_date": filesystem_modified_dates,
         },
     }
 
@@ -1335,8 +1450,21 @@ def _candidate_from_index_row(row: sqlite3.Row) -> dict[str, object]:
         "gps_latitude": row["gps_latitude"],
         "gps_longitude": row["gps_longitude"],
         "gps_source": row["gps_source"],
+        "has_gps": bool(row["has_gps"] or _valid_gps_coordinates(row["gps_latitude"], row["gps_longitude"])),
+        "media_width": row["media_width"],
+        "media_height": row["media_height"],
+        "media_duration_seconds": row["media_duration_seconds"],
         "evidence": ";".join(evidence),
     }
+
+
+def _valid_gps_coordinates(latitude: object, longitude: object) -> bool:
+    try:
+        lat = float(str(latitude).strip())
+        lon = float(str(longitude).strip())
+    except (TypeError, ValueError):
+        return False
+    return -90 <= lat <= 90 and -180 <= lon <= 180
 
 
 def _sha256_file(path: Path) -> str:
@@ -1351,13 +1479,15 @@ def _is_png_index_row(row: sqlite3.Row) -> bool:
     return str(row["extension"] or "").strip().lower() == ".png"
 
 
-def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> bool:
     columns = {
         row["name"] if isinstance(row, sqlite3.Row) else row[1]
         for row in connection.execute(f"PRAGMA table_info({table})")
     }
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return True
+    return False
 
 
 def _quality_rank(filename: str) -> tuple[int, list[str]]:
@@ -1428,6 +1558,13 @@ def _enrich_capture_metadata(rows: list[dict[str, object]]) -> None:
             row["gps_latitude"] = photo_metadata.gps_latitude
             row["gps_longitude"] = photo_metadata.gps_longitude
             row["gps_source"] = photo_metadata.gps_source
+            row["has_gps"] = int(
+                -90 <= photo_metadata.gps_latitude <= 90
+                and -180 <= photo_metadata.gps_longitude <= 180
+            )
+        row["media_width"] = photo_metadata.media_width
+        row["media_height"] = photo_metadata.media_height
+        row["media_duration_seconds"] = photo_metadata.media_duration_seconds
 
 
 def _exiftool_capture_metadata(paths: list[Path]) -> dict[str, tuple[str, str]]:
@@ -1462,6 +1599,9 @@ def _exiftool_photo_metadata(paths: list[Path]) -> dict[str, ExiftoolPhotoMetada
         "-GPSLongitude",
         "-GPSLatitudeRef",
         "-GPSLongitudeRef",
+        "-ImageWidth",
+        "-ImageHeight",
+        "-Duration",
         *[str(path) for path in paths],
     ]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -1477,14 +1617,25 @@ def _exiftool_photo_metadata(paths: list[Path]) -> dict[str, ExiftoolPhotoMetada
     for record in records:
         timestamp, source = _best_exiftool_capture_timestamp(record)
         latitude, longitude, gps_source = _gps_coordinates_from_exiftool_record(record)
+        width, height = _media_dimensions_from_exiftool_record(record)
+        duration = _media_duration_from_exiftool_record(record)
         source_file = str(record.get("SourceFile", ""))
-        if source_file and (timestamp or (latitude is not None and longitude is not None)):
+        if source_file and (
+            timestamp
+            or (latitude is not None and longitude is not None)
+            or width is not None
+            or height is not None
+            or duration is not None
+        ):
             result[str(Path(source_file).resolve())] = ExiftoolPhotoMetadata(
                 capture_timestamp=timestamp,
                 capture_timestamp_source=source,
                 gps_latitude=latitude,
                 gps_longitude=longitude,
                 gps_source=gps_source,
+                media_width=width,
+                media_height=height,
+                media_duration_seconds=duration,
             )
     return result
 
@@ -1541,6 +1692,93 @@ def _gps_coordinates_from_exiftool_record(record: dict[str, object]) -> tuple[fl
         return None, None, ""
     source = "composite_gps" if latitude_key.startswith("Composite:") or longitude_key.startswith("Composite:") else "embedded_gps"
     return latitude, longitude, source
+
+
+def _media_dimensions_from_exiftool_record(record: dict[str, object]) -> tuple[int | None, int | None]:
+    width = _first_positive_int(
+        record,
+        (
+            "Composite:ImageWidth",
+            "Composite:SourceImageWidth",
+            "File:ImageWidth",
+            "QuickTime:ImageWidth",
+            "Track1:ImageWidth",
+            "Track1:SourceImageWidth",
+            "EXIF:ImageWidth",
+            "ExifIFD:ExifImageWidth",
+        ),
+    )
+    height = _first_positive_int(
+        record,
+        (
+            "Composite:ImageHeight",
+            "Composite:SourceImageHeight",
+            "File:ImageHeight",
+            "QuickTime:ImageHeight",
+            "Track1:ImageHeight",
+            "Track1:SourceImageHeight",
+            "EXIF:ImageHeight",
+            "ExifIFD:ExifImageHeight",
+        ),
+    )
+    if width is None or height is None:
+        width, height = _media_dimensions_from_image_size(record.get("Composite:ImageSize"))
+    return width, height
+
+
+def _media_dimensions_from_image_size(value: object) -> tuple[int | None, int | None]:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    match = re.match(r"^\s*(\d+)\D+(\d+)\s*$", str(value or ""))
+    if not match:
+        return None, None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width <= 0 or height <= 0:
+        return None, None
+    return width, height
+
+
+def _media_duration_from_exiftool_record(record: dict[str, object]) -> float | None:
+    return _first_positive_float(
+        record,
+        (
+            "Composite:Duration",
+            "QuickTime:Duration",
+            "Track1:Duration",
+            "File:Duration",
+        ),
+    )
+
+
+def _first_positive_int(record: dict[str, object], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = _numeric_media_value(record.get(key))
+        if value and value > 0:
+            return int(round(value))
+    return None
+
+
+def _first_positive_float(record: dict[str, object], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _numeric_media_value(record.get(key))
+        if value and value > 0:
+            return value
+    return None
+
+
+def _numeric_media_value(value: object) -> float | None:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def _first_numeric_gps_value(record: dict[str, object], keys: tuple[str, ...]) -> tuple[str, float | None]:
@@ -1701,13 +1939,22 @@ def _exif_date(value: str) -> str | None:
         return None
 
 
-def _filesystem_dates(stat: os.stat_result) -> set[str]:
+def _filesystem_creation_dates(stat: os.stat_result) -> set[str]:
     dates = set()
-    for timestamp in (getattr(stat, "st_birthtime", None), stat.st_mtime):
-        if timestamp is None:
-            continue
+    timestamp = getattr(stat, "st_birthtime", None)
+    if timestamp is not None:
         dates.add(dt.datetime.fromtimestamp(timestamp).date().isoformat())
     return dates
+
+
+def _filesystem_modified_dates(stat: os.stat_result) -> set[str]:
+    dates = set()
+    dates.add(dt.datetime.fromtimestamp(stat.st_mtime).date().isoformat())
+    return dates
+
+
+def _filesystem_dates(stat: os.stat_result) -> set[str]:
+    return _filesystem_creation_dates(stat) | _filesystem_modified_dates(stat)
 
 
 def _filesystem_mtime_utc(stat: os.stat_result) -> str:
@@ -1737,6 +1984,10 @@ def _mime_type(path: Path) -> str:
         return "image/png"
     if suffix in {".tif", ".tiff"}:
         return "image/tiff"
+    if suffix == ".mov":
+        return "video/quicktime"
+    if suffix in {".mp4", ".m4v"}:
+        return "video/mp4"
     return "application/octet-stream"
 
 

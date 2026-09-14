@@ -462,7 +462,7 @@ class Project365ControlAppTests(unittest.TestCase):
                         "zip_sha256": "old",
                         "zip_bytes": 10,
                         "validation_status": "pass",
-                    }
+                    },
                 ],
             }
         }
@@ -863,7 +863,11 @@ class Project365ControlAppTests(unittest.TestCase):
         )
 
     def test_broad_visual_match_command_passes_target_candidate_and_resume_settings(self) -> None:
-        with mock.patch.object(control, "_latest_broad_match_run_id", return_value="broad-match:latest"):
+        with mock.patch.object(
+            control.broad_visual_match,
+            "current_match_run_id",
+            return_value="broad-match:current",
+        ) as current_run:
             command = control._commands_for_step(
                 "broad_visual_match",
                 {
@@ -882,6 +886,7 @@ class Project365ControlAppTests(unittest.TestCase):
                 },
             )[0]
 
+        current_run.assert_called_once_with(control.BROAD_VISUAL_DB, control.broad_visual_match.CURRENT_BROAD_MATCH_SLOT)
         self.assertIn("project365_broad_visual_match.py", command)
         self.assertIn("match", command)
         self.assertIn("--entry-id", command)
@@ -901,7 +906,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("--density", command)
         self.assertIn("13", command)
         self.assertIn("--resume-run", command)
-        self.assertIn("broad-match:latest", command)
+        self.assertIn("broad-match:current", command)
         self.assertIn("--include-low-quality", command)
         self.assertIn("--dry-run", command)
 
@@ -983,7 +988,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('id="broadResumeExisting"', control.CONTROL_HTML)
         self.assertIn('id="broadOverwriteFingerprints"', control.CONTROL_HTML)
         self.assertIn('id="broadDryRun"', control.CONTROL_HTML)
-        self.assertIn("Project365 entries to test/search", control.CONTROL_HTML)
+        self.assertIn("Project365 entries to search", control.CONTROL_HTML)
         self.assertIn("Original candidates to compare", control.CONTROL_HTML)
         self.assertIn("Candidate date window, +/- days", control.CONTROL_HTML)
         self.assertIn('id="broadDateWindowDays" type="number" min="0" value="30"', control.CONTROL_HTML)
@@ -994,33 +999,53 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("Overwrite existing fingerprints", control.CONTROL_HTML)
         self.assertIn("already-current fingerprints are skipped for speed", control.CONTROL_HTML)
         self.assertIn("1. Build fingerprints", control.CONTROL_HTML)
-        self.assertIn("2. Measure accuracy", control.CONTROL_HTML)
-        self.assertIn("3. Search unresolved photos", control.CONTROL_HTML)
+        self.assertIn("2. Search unresolved photos", control.CONTROL_HTML)
+        self.assertIn("3. Review unresolved results (loading)", control.CONTROL_HTML)
+        self.assertIn('id="broadVisualActionMessage"', control.CONTROL_HTML)
+        self.assertIn("Accuracy diagnostics", control.CONTROL_HTML)
+        self.assertIn(">Measure accuracy</button>", control.CONTROL_HTML)
+        self.assertIn("Open accuracy benchmark review", control.CONTROL_HTML)
+        self.assertIn('id="broadVisualBenchmarkMessage"', control.CONTROL_HTML)
+        self.assertNotIn('id="broadVisualMessage"', control.CONTROL_HTML)
+        self.assertNotIn("2. Measure accuracy", control.CONTROL_HTML)
+        self.assertNotIn("4. Review unresolved results (loading)", control.CONTROL_HTML)
         self.assertIn("Review options", control.CONTROL_HTML)
-        self.assertIn('id="broadReviewMode"', control.CONTROL_HTML)
-        self.assertIn('id="broadReviewRunId"', control.CONTROL_HTML)
+        self.assertNotIn('id="broadReviewMode"', control.CONTROL_HTML)
+        self.assertNotIn("Ready unresolved results", control.CONTROL_HTML)
+        self.assertNotIn("Accuracy benchmark (known originals)", control.CONTROL_HTML)
         self.assertIn('id="broadReviewEntryId"', control.CONTROL_HTML)
         self.assertIn("Jump to entry date", control.CONTROL_HTML)
         self.assertIn("YYYY-MM-DD or project365:YYYY-MM-DD", control.CONTROL_HTML)
-        self.assertIn('id="broadReviewLimit"', control.CONTROL_HTML)
+        self.assertNotIn('id="broadReviewLimit"', control.CONTROL_HTML)
+        self.assertIn("Opens one target and its candidates at a time.", control.CONTROL_HTML)
         self.assertIn('id="broadReviewResultsButton" class="button primary"', control.CONTROL_HTML)
         self.assertIn('data-review-mode="search"', control.CONTROL_HTML)
-        self.assertIn("4. Review results (loading)", control.CONTROL_HTML)
+        self.assertIn("3. Review unresolved results (loading)", control.CONTROL_HTML)
         self.assertIn("function updateBroadReviewButton", control.CONTROL_HTML)
+        self.assertIn('broad_visual_match: "broadVisualActionMessage"', control.CONTROL_HTML)
+        self.assertIn('broad_visual_index: "broadVisualActionMessage"', control.CONTROL_HTML)
+        self.assertIn('broad_visual_benchmark: "broadVisualBenchmarkMessage"', control.CONTROL_HTML)
         self.assertIn("button.dataset.reviewMode", control.CONTROL_HTML)
+        self.assertIn("button.dataset.reviewSet", control.CONTROL_HTML)
+        self.assertIn("button.dataset.unresolvedReadyCount", control.CONTROL_HTML)
+        self.assertIn("latestSearchRunId", control.CONTROL_HTML)
+        self.assertIn("No unresolved entries are currently review-ready.", control.CONTROL_HTML)
+        self.assertIn("Review unresolved results", control.CONTROL_HTML)
+        self.assertIn("Accuracy benchmark (diagnostic)", control.CONTROL_HTML)
+        self.assertNotIn("benchmark entries", control.CONTROL_HTML)
         self.assertIn("/broad-review?${params.toString()}", control.CONTROL_HTML)
         self.assertIn("function normalizeProject365EntryJump(value)", control.CONTROL_HTML)
         self.assertIn("`project365:${text}`", control.CONTROL_HTML)
-        self.assertIn("accuracyCount", control.CONTROL_HTML)
-        self.assertIn("searchCount", control.CONTROL_HTML)
-        self.assertIn("only searches entries without a confirmed original", control.CONTROL_HTML)
+        self.assertIn("unresolvedReadyCount", control.CONTROL_HTML)
+        self.assertIn("No unresolved Broad Visual results are ready yet.", control.CONTROL_HTML)
+        self.assertIn("searches entries without a confirmed original", control.CONTROL_HTML)
         self.assertIn("Fingerprint already confirmed originals is for Build fingerprints plus Measure accuracy", control.CONTROL_HTML)
         self.assertLess(
-            control.CONTROL_HTML.index("3. Search unresolved photos"),
-            control.CONTROL_HTML.index("4. Review results (loading)"),
+            control.CONTROL_HTML.index("2. Search unresolved photos"),
+            control.CONTROL_HTML.index("3. Review unresolved results (loading)"),
         )
         self.assertLess(
-            control.CONTROL_HTML.index("4. Review results (loading)"),
+            control.CONTROL_HTML.index("3. Review unresolved results (loading)"),
             control.CONTROL_HTML.index("Review options"),
         )
 
@@ -1047,19 +1072,44 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("Use Project365 photo", control.BROAD_REVIEW_HTML)
         self.assertIn("function keepProject365Photo", control.BROAD_REVIEW_HTML)
         self.assertIn("Keep the Project365 export for this entry", control.BROAD_REVIEW_HTML)
-        self.assertIn("Reject all", control.BROAD_REVIEW_HTML)
+        self.assertIn("Reject all (R)", control.BROAD_REVIEW_HTML)
+        self.assertIn("Previous entry (Left)", control.BROAD_REVIEW_HTML)
+        self.assertIn("Next entry (Right)", control.BROAD_REVIEW_HTML)
+        self.assertIn("function handleBroadReviewKeyboardShortcut(event)", control.BROAD_REVIEW_HTML)
+        self.assertIn('event.key === "ArrowLeft"', control.BROAD_REVIEW_HTML)
+        self.assertIn('event.key === "ArrowRight"', control.BROAD_REVIEW_HTML)
+        self.assertIn('event.key.toLowerCase() === "r"', control.BROAD_REVIEW_HTML)
+        self.assertIn('document.addEventListener("keydown", handleBroadReviewKeyboardShortcut);', control.BROAD_REVIEW_HTML)
         self.assertNotIn(">Clear all<", control.BROAD_REVIEW_HTML)
         self.assertIn(">Match<", control.BROAD_REVIEW_HTML)
         self.assertIn("candidate_url", control.BROAD_REVIEW_HTML)
         self.assertIn("<img", control.BROAD_REVIEW_HTML)
+        self.assertIn('id="imagePreviewModal"', control.BROAD_REVIEW_HTML)
+        self.assertIn('class="image-preview-modal"', control.BROAD_REVIEW_HTML)
+        self.assertIn("function openBroadImagePreviewFromTrigger(trigger)", control.BROAD_REVIEW_HTML)
+        self.assertIn("function closeBroadImagePreview()", control.BROAD_REVIEW_HTML)
+        self.assertIn("function handleImagePreviewBackdrop(event)", control.BROAD_REVIEW_HTML)
+        self.assertIn('params.set("max", "2048");', control.BROAD_REVIEW_HTML)
+        self.assertIn("image.src = largeBroadImageUrl(url);", control.BROAD_REVIEW_HTML)
+        self.assertIn('image.removeAttribute("src");', control.BROAD_REVIEW_HTML)
+        self.assertIn('event.key === "Escape"', control.BROAD_REVIEW_HTML)
+        self.assertIn("data-preview-url", control.BROAD_REVIEW_HTML)
+        self.assertIn('onclick="openBroadImagePreviewFromTrigger(this)"', control.BROAD_REVIEW_HTML)
+        self.assertIn(".image-preview-modal.is-open", control.BROAD_REVIEW_HTML)
+        self.assertIn("cursor: zoom-in", control.BROAD_REVIEW_HTML)
         self.assertIn('query.get("mode")', control.BROAD_REVIEW_HTML)
         self.assertIn('query.get("run_id")', control.BROAD_REVIEW_HTML)
         self.assertIn('query.get("entry_id")', control.BROAD_REVIEW_HTML)
-        self.assertIn('query.get("limit")', control.BROAD_REVIEW_HTML)
+        self.assertIn("const currentLimit = 1", control.BROAD_REVIEW_HTML)
+        self.assertNotIn('query.get("limit")', control.BROAD_REVIEW_HTML)
+        self.assertNotIn("Math.min(10", control.BROAD_REVIEW_HTML)
         self.assertIn("let currentEntryDate", control.BROAD_REVIEW_HTML)
         self.assertIn("function loadEntriesByDate(direction, entryDate)", control.BROAD_REVIEW_HTML)
         self.assertIn('params.set(direction === "before" ? "before_date" : "after_date", entryDate);', control.BROAD_REVIEW_HTML)
         self.assertIn('await loadEntriesAfterRemoval(payload.entry_date || "");', control.BROAD_REVIEW_HTML)
+        self.assertIn("function resetBroadReviewScrollToCandidateList()", control.BROAD_REVIEW_HTML)
+        self.assertIn('document.querySelector(".candidate-pane")', control.BROAD_REVIEW_HTML)
+        self.assertIn('target.scrollIntoView({block: "start", inline: "nearest"});', control.BROAD_REVIEW_HTML)
         self.assertIn("Undo last action", control.BROAD_REVIEW_HTML)
         self.assertIn("function undoLastBroadDecision()", control.BROAD_REVIEW_HTML)
         self.assertIn("function setLastBroadDecision(payload)", control.BROAD_REVIEW_HTML)
@@ -1070,8 +1120,9 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("confirmBroadMatch", control.BROAD_REVIEW_HTML)
         self.assertIn("rejectBroadEntry", control.BROAD_REVIEW_HTML)
         self.assertIn("function formatBroadPhotoFacts", control.BROAD_REVIEW_HTML)
-        self.assertIn("function syncCandidateImageFacts", control.BROAD_REVIEW_HTML)
-        self.assertIn('data-facts-target="${escapeHtml(factsId)}"', control.BROAD_REVIEW_HTML)
+        self.assertNotIn("function syncCandidateImageFacts", control.BROAD_REVIEW_HTML)
+        self.assertNotIn('data-facts-target=', control.BROAD_REVIEW_HTML)
+        self.assertNotIn("naturalWidth", control.BROAD_REVIEW_HTML)
         self.assertIn("function locationIndicator(hasLocation)", control.BROAD_REVIEW_HTML)
         self.assertIn(".entry-head { position: sticky; top: 0;", control.BROAD_REVIEW_HTML)
         self.assertIn(".review-layout { display: grid; grid-template-columns: minmax(380px, 520px) minmax(360px, 1fr);", control.BROAD_REVIEW_HTML)
@@ -1091,6 +1142,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("dimensions", control.BROAD_REVIEW_HTML)
         self.assertIn("byte_size", control.BROAD_REVIEW_HTML)
         self.assertIn("row.result_id && row.candidate_url", control.BROAD_REVIEW_HTML)
+        self.assertIn("max_size=640", control.__loader__.get_source(control.__name__))
         date_navigation_body = control.BROAD_REVIEW_HTML.split(
             "async function loadEntriesByDate(direction, entryDate)"
         )[1].split("async function loadEntriesAfterRemoval")[0]
@@ -1127,7 +1179,20 @@ class Project365ControlAppTests(unittest.TestCase):
                                 "candidate_filename": existing.name,
                             },
                         ],
-                    }
+                    },
+                    {
+                        "entry_id": "project365:1998-04-12",
+                        "entry_date": "1998-04-12",
+                        "source_path": "",
+                        "confirmed_path": "",
+                        "results": [
+                            {
+                                "result_id": 3,
+                                "candidate_path": str(existing),
+                                "candidate_filename": existing.name,
+                            },
+                        ],
+                    },
                 ],
                 "returned_count": 1,
                 "has_more": False,
@@ -1137,7 +1202,7 @@ class Project365ControlAppTests(unittest.TestCase):
             thread.start()
             try:
                 with (
-                    mock.patch.object(control.broad_visual_match, "review_entries", return_value=payload),
+                    mock.patch.object(control.broad_visual_match, "review_entries", return_value=payload) as review_entries,
                     mock.patch.object(
                         control,
                         "_broad_photo_facts",
@@ -1150,7 +1215,7 @@ class Project365ControlAppTests(unittest.TestCase):
                     ),
                 ):
                     with urllib.request.urlopen(
-                        f"http://127.0.0.1:{server.server_port}/broad/api/review-entries?limit=1",
+                        f"http://127.0.0.1:{server.server_port}/broad/api/review-entries?limit=10",
                         timeout=5,
                     ) as response:
                         result = json.loads(response.read().decode("utf-8"))
@@ -1160,6 +1225,10 @@ class Project365ControlAppTests(unittest.TestCase):
                 thread.join(timeout=5)
 
         rows = result["entries"][0]["results"]
+        self.assertEqual(len(result["entries"]), 1)
+        self.assertEqual(result["returned_count"], 1)
+        self.assertEqual(result["limit"], control.BROAD_REVIEW_ENTRY_LIMIT)
+        self.assertEqual(review_entries.call_args.kwargs["limit"], control.BROAD_REVIEW_ENTRY_LIMIT)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["candidate_path"], str(existing))
         self.assertRegex(rows[0]["candidate_url"], r"^/broad/image/[0-9a-f]{24}\?max=640$")
@@ -1206,6 +1275,194 @@ class Project365ControlAppTests(unittest.TestCase):
         broad_preview_path.assert_called_once_with(token, 640)
         self.assertEqual(payload, b"jpeg-preview")
         self.assertEqual(content_type, "image/jpeg")
+
+    def test_media_dedupe_review_page_and_control_link_are_available(self) -> None:
+        self.assertIn("media_dedupe_review", control.WORKFLOW_STEPS)
+        self.assertIn('data-step="media_dedupe_review"', control.CONTROL_HTML)
+        self.assertIn('href="/dedupe"', control.CONTROL_HTML)
+        self.assertIn("Open dedupe review", control.CONTROL_HTML)
+        self.assertIn("Media Dedupe Review", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("/dedupe/api/candidates", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("/dedupe/api/decision", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("<video controls", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("zoom-button", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("facts-grid", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("openDedupePreview", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("confirm_duplicate_delete_legacy", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("confirm_duplicate_delete_reexport", control.MEDIA_DEDUPE_HTML)
+        self.assertIn("reject_duplicate", control.MEDIA_DEDUPE_HTML)
+        self.assertIn('event.key === "ArrowRight"', control.MEDIA_DEDUPE_HTML)
+
+    def test_media_dedupe_api_adds_media_urls_and_records_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            new_video = base / "new" / "IMG_0001.MOV"
+            old_video = base / "old" / "IMG_0001.MOV"
+            new_video.parent.mkdir()
+            old_video.parent.mkdir()
+            new_video.write_bytes(b"new-video")
+            old_video.write_bytes(b"old-video")
+            _write_dedupe_index(
+                canonical_root / "photo_library_reexport_index.sqlite",
+                [
+                    _dedupe_row(
+                        new_video,
+                        root=new_video.parent,
+                        extension=".mov",
+                        capture_timestamp="2021-05-04T12:00:00",
+                        date_value="2021-05-04",
+                        duration=10.0,
+                    )
+                ],
+            )
+            _write_dedupe_index(
+                canonical_root / "video_library_legacy_index.sqlite",
+                [
+                    _dedupe_row(
+                        old_video,
+                        root=old_video.parent,
+                        extension=".mov",
+                        capture_timestamp="2021-05-04T12:00:01",
+                        date_value="2021-05-04",
+                        duration=10.4,
+                    )
+                ],
+            )
+            state = control.ControlState()
+            server = control.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.object(control, "CANONICAL_ROOT", canonical_root):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/dedupe/api/candidates?media_type=video",
+                        timeout=5,
+                    ) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    candidate = payload["candidates"][0]
+                    decision_request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/dedupe/api/decision",
+                        data=json.dumps(
+                            {
+                                "media_type": "video",
+                                "candidate_key": candidate["candidate_key"],
+                                "reexport_path": candidate["reexport"]["path"],
+                                "legacy_path": candidate["legacy"]["path"],
+                                "decision": "confirm_duplicate_delete_legacy",
+                                "notes": "reviewed",
+                            }
+                        ).encode("utf-8"),
+                        headers={"content-type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(decision_request, timeout=5) as response:
+                        decision = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(payload["media_type"], "video")
+        self.assertRegex(candidate["reexport"]["media_url"], r"^/dedupe/media/[0-9a-f]{24}$")
+        self.assertRegex(candidate["legacy"]["media_url"], r"^/dedupe/media/[0-9a-f]{24}$")
+        self.assertEqual(decision["decision"], "confirm_duplicate_delete_legacy")
+        self.assertFalse(decision["file_action_taken"])
+
+    def test_photo_dedupe_api_uses_local_preview_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            new_photo = base / "new" / "IMG_1000.HEIC"
+            old_photo = base / "old" / "IMG_1000.HEIC"
+            new_photo.parent.mkdir()
+            old_photo.parent.mkdir()
+            new_photo.write_bytes(b"same-photo")
+            old_photo.write_bytes(b"same-photo")
+            _write_dedupe_index(
+                canonical_root / "photo_library_reexport_index.sqlite",
+                [
+                    _dedupe_row(
+                        new_photo,
+                        root=new_photo.parent,
+                        extension=".heic",
+                        capture_timestamp="2021-06-01T09:00:00",
+                        date_value="2021-06-01",
+                    )
+                ],
+            )
+            _write_dedupe_index(
+                canonical_root / "photo_library_index.sqlite",
+                [
+                    _dedupe_row(
+                        old_photo,
+                        root=old_photo.parent,
+                        extension=".heic",
+                        capture_timestamp="2021-06-01T09:00:00",
+                        date_value="2021-06-01",
+                    )
+                ],
+            )
+            state = control.ControlState()
+            server = control.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.object(control, "CANONICAL_ROOT", canonical_root):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/dedupe/api/candidates?media_type=photo",
+                        timeout=5,
+                    ) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        candidate = payload["candidates"][0]
+        self.assertEqual(payload["media_type"], "photo")
+        self.assertRegex(candidate["reexport"]["media_url"], r"^/broad/image/[0-9a-f]{24}\?max=1280$")
+        self.assertRegex(candidate["legacy"]["media_url"], r"^/broad/image/[0-9a-f]{24}\?max=1280$")
+
+    def test_dedupe_media_route_supports_range_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media_path = Path(temp_dir) / "clip.mov"
+            media_path.write_bytes(b"0123456789")
+            state = control.ControlState()
+            token = state.broad_image_token(str(media_path))
+            server = control.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/dedupe/media/{token}",
+                    headers={"Range": "bytes=2-5"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = response.read()
+                    status = response.status
+                    content_range = response.headers.get("content-range")
+                    accept_ranges = response.headers.get("accept-ranges")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(status, 206)
+        self.assertEqual(payload, b"2345")
+        self.assertEqual(content_range, "bytes 2-5/10")
+        self.assertEqual(accept_ranges, "bytes")
 
     def test_control_html_delegates_original_review_to_picker(self) -> None:
         self.assertIn("Original-photo review", control.CONTROL_HTML)
@@ -1327,9 +1584,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('id="photoIndexBox"', control.CONTROL_HTML)
         self.assertIn('id="indexRoots"', control.CONTROL_HTML)
         self.assertIn("function renderPhotoIndexBox(payload)", control.CONTROL_HTML)
-        self.assertIn("function latestPhotoIndexWorkflowRecord(photoIndex)", control.CONTROL_HTML)
-        self.assertIn('owner === "build_photo_index" && !active && !records.length', control.CONTROL_HTML)
-        self.assertIn('loadStatus(initialOwnerStep ? [initialOwnerStep] : ["build_photo_index"])', control.CONTROL_HTML)
+        self.assertIn("_current_workflow_history(self.history, status)", control.__loader__.get_source(control.__name__))
+        self.assertNotIn("function latestPhotoIndexWorkflowRecord(photoIndex)", control.CONTROL_HTML)
+        self.assertIn('loadStatus(["workflow_overview"])', control.CONTROL_HTML)
+        self.assertIn("if (initialOwnerStep) return loadStatus([initialOwnerStep]);", control.CONTROL_HTML)
         self.assertIn("recent_runs", control.CONTROL_HTML)
         self.assertIn("Index run", control.CONTROL_HTML)
         self.assertIn("indexed ·", control.CONTROL_HTML)
@@ -1380,8 +1638,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("function toggleWorkflowStep(step)", control.CONTROL_HTML)
         self.assertIn('const initialStep = new URLSearchParams(window.location.search).get("step") || ""', control.CONTROL_HTML)
         self.assertIn('const manuallyExpandedSteps = new Set(initialOwnerStep ? [initialOwnerStep] : [])', control.CONTROL_HTML)
-        self.assertIn("function statusUrlFor(steps)", control.CONTROL_HTML)
-        self.assertIn('loadStatus(initialOwnerStep ? [initialOwnerStep] : ["build_photo_index"])', control.CONTROL_HTML)
+        self.assertIn("function statusUrlFor(steps, options = {})", control.CONTROL_HTML)
+        self.assertIn('params.set("include_broad_monthly_coverage", "1")', control.CONTROL_HTML)
+        self.assertIn('loadStatus(["workflow_overview"])', control.CONTROL_HTML)
+        self.assertIn("if (initialOwnerStep) return loadStatus([initialOwnerStep]);", control.CONTROL_HTML)
         self.assertIn("manuallyExpandedSteps.add(ownerStep(step))", control.CONTROL_HTML)
         self.assertIn("loadStatus(expandedStatusSteps()).catch", control.CONTROL_HTML)
         self.assertNotIn('Showing priority archive results', control.CONTROL_HTML)
@@ -1589,7 +1849,10 @@ class Project365ControlAppTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertEqual(result, {"ok": True})
-        state.status.assert_called_once_with(["broad_visual_match", "rough_visual_match"])
+        state.status.assert_called_once_with(
+            ["broad_visual_match", "rough_visual_match"],
+            include_broad_monthly_coverage=False,
+        )
 
     def test_control_routes_picker_apply_decisions_with_confirmation_token(self) -> None:
         state = mock.Mock()
@@ -2057,7 +2320,21 @@ class Project365ControlAppTests(unittest.TestCase):
             photo_index_folder="/Volumes/Archive Photos/Project 365",
             search_whole_index=False,
             whole_index_filename_only=False,
+            filename_dates_only=False,
+            include_modified_dates=False,
         )
+
+    def test_control_state_defaults_active_photo_index_folder_to_project_originals(self) -> None:
+        state = control.ControlState()
+
+        with mock.patch.object(
+            control.original_picker,
+            "project_originals_source_folder",
+            return_value="/Archive/Source Data/Original Photos matching Project365 Entries",
+        ):
+            folder = state.active_photo_index_folder()
+
+        self.assertEqual(folder, "/Archive/Source Data/Original Photos matching Project365 Entries")
 
     def test_control_routes_picker_reject_all_with_active_photo_index_folder(self) -> None:
         state = mock.Mock()
@@ -2122,7 +2399,8 @@ class Project365ControlAppTests(unittest.TestCase):
                     {
                         "entry_id": "project365:1998-04-11",
                         "search_whole_index": True,
-                        "whole_index_filename_only": True,
+                        "filename_dates_only": True,
+                        "include_modified_dates": True,
                     }
                 ).encode("utf-8"),
                 headers={"content-type": "application/json"},
@@ -2140,7 +2418,9 @@ class Project365ControlAppTests(unittest.TestCase):
             entry_id="project365:1998-04-11",
             photo_index_folder="/Volumes/Archive Photos/Project 365",
             search_whole_index=True,
-            whole_index_filename_only=True,
+            whole_index_filename_only=False,
+            filename_dates_only=True,
+            include_modified_dates=True,
         )
 
     def test_control_routes_picker_custom_date_search_with_whole_index_scope(self) -> None:
@@ -2167,7 +2447,8 @@ class Project365ControlAppTests(unittest.TestCase):
                         "start_date": "2010-08-15",
                         "end_date": "2010-08-18",
                         "search_whole_index": True,
-                        "whole_index_filename_only": True,
+                        "filename_dates_only": True,
+                        "include_modified_dates": True,
                     }
                 ).encode("utf-8"),
                 headers={"content-type": "application/json"},
@@ -2187,7 +2468,9 @@ class Project365ControlAppTests(unittest.TestCase):
             end_date="2010-08-18",
             search_whole_index=True,
             photo_index_folder="/Volumes/Archive Photos/Project 365",
-            whole_index_filename_only=True,
+            whole_index_filename_only=False,
+            filename_dates_only=True,
+            include_modified_dates=True,
         )
 
     def test_control_state_runs_step_as_pollable_job(self) -> None:
@@ -2273,29 +2556,39 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("date_coverage_json", control.CONTROL_HTML)
         self.assertIn("Monthly fingerprint coverage", control.CONTROL_HTML)
         self.assertIn("function renderBroadMonthlyCoverage(rows)", control.CONTROL_HTML)
+        self.assertIn("coverage-table-head", control.CONTROL_HTML)
+        self.assertIn('class="button primary small"', control.CONTROL_HTML)
+        self.assertIn('id="broadCoverageCheckStatus"', control.CONTROL_HTML)
+        self.assertIn("coverage-check-status", control.CONTROL_HTML)
+        self.assertIn("onclick=\"checkBroadVisualCoverage()\"", control.CONTROL_HTML)
         self.assertIn("missing_original_targets", control.CONTROL_HTML)
         self.assertIn("low-coverage", control.CONTROL_HTML)
         self.assertIn("function parseJsonObject(value)", control.CONTROL_HTML)
         self.assertIn("complete_start_date", control.CONTROL_HTML)
         self.assertIn("current_checked", control.CONTROL_HTML)
 
-    def test_broad_visual_card_shows_clear_previous_review_controls(self) -> None:
-        self.assertIn('status["review_runs"] = broad_visual_match.review_runs', control.__loader__.get_source(control.__name__))
-        self.assertIn("function renderBroadReviewRunControls(runs)", control.CONTROL_HTML)
-        self.assertIn("${renderBroadReviewRunControls(broad.review_runs || [])}", control.CONTROL_HTML)
-        self.assertIn("Previous reviews", control.CONTROL_HTML)
-        self.assertIn("function escapeJs(value)", control.CONTROL_HTML)
-        self.assertIn('replace(/\\\\/g, "\\\\\\\\")', control.CONTROL_HTML)
-        self.assertIn("clearBroadReviewRunFromControl", control.CONTROL_HTML)
-        self.assertIn("clearAllBroadReviewRunsFromControl", control.CONTROL_HTML)
-        self.assertIn("openBroadVisualReview('search'", control.CONTROL_HTML)
-        self.assertIn("/broad/api/clear-review-run", control.CONTROL_HTML)
-        self.assertIn("/broad/api/clear-all-review-runs", control.CONTROL_HTML)
+    def test_broad_visual_card_hides_previous_review_controls(self) -> None:
+        self.assertIn('status["review_runs"] = []', control.__loader__.get_source(control.__name__))
+        self.assertIn('status["review_ready_run"] =', control.__loader__.get_source(control.__name__))
+        self.assertIn("review_ready_summary", control.__loader__.get_source(control.__name__))
+        self.assertIn("Review readiness", control.CONTROL_HTML)
+        self.assertIn("function formatBroadReviewReadiness", control.CONTROL_HTML)
+        self.assertNotIn("already in Original-photo review", control.CONTROL_HTML)
+        self.assertNotIn("function renderBroadReviewRunControls(runs)", control.CONTROL_HTML)
+        self.assertNotIn("${renderBroadReviewRunControls(broad.review_runs || [])}", control.CONTROL_HTML)
+        self.assertNotIn("Previous reviews", control.CONTROL_HTML)
+        self.assertNotIn("clearBroadReviewRunFromControl", control.CONTROL_HTML)
+        self.assertNotIn("clearAllBroadReviewRunsFromControl", control.CONTROL_HTML)
+        self.assertNotIn("/broad/api/clear-review-run", control.CONTROL_HTML)
+        self.assertNotIn("/broad/api/clear-all-review-runs", control.CONTROL_HTML)
 
     def test_broad_visual_search_preflights_selected_coverage(self) -> None:
         self.assertIn("onclick=\"checkBroadVisualCoverage()\"", control.CONTROL_HTML)
         self.assertIn("async function checkBroadVisualCoverage()", control.CONTROL_HTML)
+        self.assertIn('setBroadCoverageStatus("Checking fingerprint coverage...", "running")', control.CONTROL_HTML)
+        self.assertIn("function setBroadCoverageStatus(message, state = \"\")", control.CONTROL_HTML)
         self.assertIn("Checking fingerprint coverage before search", control.CONTROL_HTML)
+        self.assertIn("includeBroadMonthlyCoverage: true", control.CONTROL_HTML)
         self.assertIn("function broadCoveragePreview(settings, status)", control.CONTROL_HTML)
         self.assertIn("const coverage = await checkBroadVisualCoverage();", control.CONTROL_HTML)
         self.assertIn('await runStep("broad_visual_match", settings, trigger)', control.CONTROL_HTML)
@@ -2318,9 +2611,9 @@ class Project365ControlAppTests(unittest.TestCase):
     def test_broad_visual_status_shows_match_progress_heartbeat(self) -> None:
         self.assertIn("<span>Search heartbeat</span>", control.CONTROL_HTML)
         self.assertIn("function formatBroadSearchHeartbeat(latestRun, active)", control.CONTROL_HTML)
-        self.assertIn("function broadVisualRunCompleteMessage(latestRun)", control.CONTROL_HTML)
+        self.assertIn("function broadVisualRunCompleteMessage(latestRun, reviewReadyRun = {})", control.CONTROL_HTML)
         self.assertIn("Broad visual search found no entries in the selected scope", control.CONTROL_HTML)
-        self.assertIn('setStepMessage("broad_visual_match", broadVisualRunCompleteMessage(latestRun))', control.CONTROL_HTML)
+        self.assertIn('setStepMessage("broad_visual_match", broadVisualRunCompleteMessage(latestRun, broad.review_ready_run || {}))', control.CONTROL_HTML)
         self.assertIn("function broadVisualIndexProgressDetail(job)", control.CONTROL_HTML)
         self.assertIn("function broadVisualMatchProgressDetail(job)", control.CONTROL_HTML)
         self.assertIn("function roughPrefilterProgressDetail(job)", control.CONTROL_HTML)
@@ -2674,6 +2967,240 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertNotIn("import_zips", status["workflow_history"])
         self.assertNotIn("photo_index_files", status["top_metrics"])
 
+    def test_current_workflow_history_uses_persisted_no_date_status_without_control_history(self) -> None:
+        status = {
+            "broad_visual_match": {
+                "rough_review_ready_run": {
+                    "run_id": "rough-no-date-match:current",
+                    "status": "pass",
+                    "started_at": "2026-09-12T01:00:00+00:00",
+                    "finished_at": "2026-09-12T01:05:00+00:00",
+                    "processed_target_count": 12,
+                    "target_count": 12,
+                    "scanned_count": 240,
+                    "matched_entries": 8,
+                    "result_count": 32,
+                    "error_count": 0,
+                    "prefilter_metrics": {"shortlist_size": 1000, "capped_band_count": 4},
+                }
+            }
+        }
+
+        history = control._current_workflow_history([], status, {"rough_visual_match"})
+
+        record = history["rough_visual_match"][0]
+        self.assertEqual(record["step"], "rough_visual_match")
+        self.assertEqual(record["started_at"], "2026-09-12T01:00:00+00:00")
+        self.assertIn(
+            {"label": "Entries searched", "value": "12/12"},
+            record["summary"]["metrics"],
+        )
+        self.assertIn(
+            {"label": "Saved candidate rows", "value": "32"},
+            record["summary"]["metrics"],
+        )
+
+    def test_current_workflow_history_includes_persisted_status_with_recorded_history(self) -> None:
+        recorded = {
+            "step": "rough_visual_match",
+            "status": "fail",
+            "started_at": "2026-09-12T02:00:00+00:00",
+            "finished_at": "2026-09-12T02:01:00+00:00",
+            "error": "kept",
+            "outputs": [],
+            "summary": {"metrics": [{"label": "Saved candidate rows", "value": "1"}]},
+        }
+        status = {
+            "broad_visual_match": {
+                "rough_review_ready_run": {
+                    "run_id": "rough-no-date-match:current",
+                    "started_at": "2026-09-12T03:00:00+00:00",
+                    "result_count": 99,
+                }
+            }
+        }
+
+        history = control._current_workflow_history([recorded], status, {"rough_visual_match"})
+
+        self.assertEqual(history["rough_visual_match"][0]["started_at"], "2026-09-12T03:00:00+00:00")
+        self.assertEqual(history["rough_visual_match"][1], recorded)
+
+    def test_current_workflow_history_synthesizes_persisted_tool_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            report_dir = canonical_root / "exports" / "verification_reports"
+            package_dir = canonical_root / "exports" / "diarium_import_batches"
+            report_dir.mkdir(parents=True)
+            package_dir.mkdir(parents=True)
+            db_path = canonical_root / "canonical.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE import_batches (
+                        id TEXT PRIMARY KEY,
+                        source_type TEXT NOT NULL,
+                        import_dir TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        source_file_count INTEGER NOT NULL DEFAULT 0,
+                        entry_count INTEGER NOT NULL DEFAULT 0,
+                        entry_source_count INTEGER NOT NULL DEFAULT 0,
+                        media_asset_count INTEGER NOT NULL DEFAULT 0,
+                        text_entry_count INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO import_batches (
+                        id, source_type, import_dir, started_at, finished_at,
+                        source_file_count, entry_count, entry_source_count,
+                        media_asset_count, text_entry_count, status
+                    )
+                    VALUES ('batch-1', 'project365_zip', 'zips',
+                        '2026-09-12T00:00:00+00:00',
+                        '2026-09-12T00:10:00+00:00',
+                        4, 40, 40, 40, 0, 'pass')
+                    """
+                )
+                connection.commit()
+            derivatives_report = report_dir / f"media_derivatives_{control.DERIVATIVE_POLICY}.csv"
+            derivatives_report.write_text("entry_id,path\nproject365:1998-04-12,out.jpg\n", encoding="utf-8")
+            tag_queue = report_dir / "tag_review_queue.csv"
+            tag_queue.write_text("entry_id,person\nproject365:1998-04-12,Mike\n", encoding="utf-8")
+            digikam_report = report_dir / "digikam_people_import_report.csv"
+            digikam_report.write_text("status\nsuggested\n", encoding="utf-8")
+            package_path = package_dir / "package.zip"
+            with zipfile.ZipFile(package_path, "w") as archive:
+                archive.writestr("Journal.json", json.dumps({"entries": []}))
+            status = {
+                "photo_library_index": {
+                    "date_count": 20,
+                    "recent_runs": [
+                        {
+                            "started_at": "2026-09-12T00:20:00+00:00",
+                            "finished_at": "2026-09-12T00:30:00+00:00",
+                            "roots": "Photos",
+                            "file_count_after": 500,
+                            "new_file_count": 5,
+                            "skipped_file_count": 2,
+                        }
+                    ],
+                },
+                "original_remainder_overview": {
+                    "exists": True,
+                    "review_ready_entry_count": 7,
+                },
+                "original_batch_plan": {"rows": 3},
+                "original_search_attempts": {
+                    "latest": {
+                        "finished_at": "2026-09-12T00:40:00+00:00",
+                        "search_roots": "Photos",
+                    }
+                },
+                "original_queue": {
+                    "exists": True,
+                    "rows": 70,
+                    "pending_apply": {"decision_count": 6},
+                },
+                "broad_visual_match": {
+                    "review_ready_run": {
+                        "run_id": "broad-match:current",
+                        "status": "pass",
+                        "started_at": "2026-09-12T00:50:00+00:00",
+                        "finished_at": "2026-09-12T00:55:00+00:00",
+                        "processed_target_count": 2,
+                        "target_count": 2,
+                        "scanned_count": 20,
+                        "matched_entries": 1,
+                        "result_count": 5,
+                        "error_count": 0,
+                    },
+                    "rough_review_ready_run": {
+                        "run_id": "rough-no-date-match:current",
+                        "status": "pass",
+                        "started_at": "2026-09-12T01:00:00+00:00",
+                        "finished_at": "2026-09-12T01:05:00+00:00",
+                        "processed_target_count": 3,
+                        "target_count": 3,
+                        "scanned_count": 30,
+                        "matched_entries": 2,
+                        "result_count": 6,
+                        "error_count": 0,
+                        "prefilter_metrics": {"shortlist_size": 1000},
+                    },
+                },
+                "crop_confirmation": {
+                    "queued_count": 8,
+                    "estimated_crop_count": 9,
+                    "confirmed_crop_count": 10,
+                    "pending_commit_count": 0,
+                },
+                "database": {
+                    "working_copy_source_count": 11,
+                    "working_copy_ready_count": 12,
+                    "working_copy_current_count": 13,
+                    "working_copy_not_ready_count": 14,
+                    "working_copy_needs_update_count": 15,
+                },
+                "diarium_package": {
+                    "path": str(package_path),
+                    "filename": package_path.name,
+                    "package_count": 1,
+                    "journal_entries": 16,
+                    "photo_files": 17,
+                    "manifest_rows": 18,
+                    "photo_ready": True,
+                },
+            }
+
+            with (
+                mock.patch.object(control, "CANONICAL_ROOT", canonical_root),
+                mock.patch.object(control, "VERIFY_REPORT_DIR", report_dir),
+                mock.patch.object(control, "ORIGINAL_UNCLEAR_GROUPS", report_dir / "original_photo_unclear_groups.csv"),
+                mock.patch.object(control, "ORIGINAL_QUEUE", report_dir / "original_photo_external_search_queue.csv"),
+                mock.patch.object(control, "TAG_QUEUE", tag_queue),
+                mock.patch.object(control, "DIGIKAM_PEOPLE_REPORT", digikam_report),
+                mock.patch.object(control, "DIARIUM_IMPORT_BATCH_DIR", package_dir),
+            ):
+                history = control._current_workflow_history([], status)
+
+        self.assertIn("import_zips", history)
+        self.assertIn("build_photo_index", history)
+        self.assertIn("search_originals", history)
+        self.assertIn("broad_visual_match", history)
+        self.assertIn("rough_visual_match", history)
+        self.assertIn("crop_confirmation", history)
+        self.assertIn("generate_derivatives", history)
+        self.assertIn("face_tagging", history)
+        self.assertIn("generate_diarium_package", history)
+
+    def test_workflow_overview_status_uses_lightweight_photo_index_summary(self) -> None:
+        state = control.ControlState()
+        with (
+            mock.patch.object(control, "_initial_top_metrics", return_value={}) as top_metrics,
+            mock.patch.object(control, "_photo_library_index_latest_run_status", return_value={}) as latest_index,
+            mock.patch.object(
+                control,
+                "_photo_library_index_status",
+                side_effect=AssertionError("overview should not read full photo index status"),
+            ),
+            mock.patch.object(control, "_queue_status", return_value={}),
+            mock.patch.object(control, "_remainder_overview", return_value={}),
+            mock.patch.object(control, "_batch_plan_status", return_value={}),
+            mock.patch.object(control, "_search_attempt_status", return_value={}),
+            mock.patch.object(control, "_broad_visual_overview_status", return_value={}),
+            mock.patch.object(control.ControlState, "crop_confirmation_status", return_value={}),
+            mock.patch.object(control, "_diarium_package_status", return_value={}),
+        ):
+            status = state.status(["workflow_overview"])
+
+        top_metrics.assert_called_once_with(include_photo_index=False)
+        latest_index.assert_called_once_with(control.PHOTO_LIBRARY_INDEX)
+        self.assertIn("workflow_history", status)
+
     def test_rough_scoped_status_uses_lightweight_broad_visual_status(self) -> None:
         state = control.ControlState()
         with state._job_lock:
@@ -2765,7 +3292,7 @@ class Project365ControlAppTests(unittest.TestCase):
             status = state.status(["broad_visual_match"])
 
         broad_status.assert_called_once_with(
-            include_monthly_coverage=True,
+            include_monthly_coverage=False,
             include_prefilter_stale_count=False,
             include_review_runs=True,
         )
@@ -2773,6 +3300,22 @@ class Project365ControlAppTests(unittest.TestCase):
         by_step = {job["step"]: job for job in status["active_jobs"]}
         self.assertEqual(by_step["broad_visual_index"]["broad_visual_index_run"]["scanned_count"], 50)
         self.assertEqual(by_step["broad_visual_match"]["broad_visual_run"]["processed_target_count"], 3)
+
+    def test_broad_scoped_status_loads_monthly_coverage_when_requested(self) -> None:
+        state = control.ControlState()
+        with mock.patch.object(
+            control,
+            "_broad_visual_status",
+            return_value={"latest_run": {}},
+        ) as broad_status:
+            status = state.status(["broad_visual_match"], include_broad_monthly_coverage=True)
+
+        broad_status.assert_called_once_with(
+            include_monthly_coverage=True,
+            include_prefilter_stale_count=False,
+            include_review_runs=True,
+        )
+        self.assertIn("broad_visual_match", status)
 
     def test_lightweight_rough_status_avoids_full_broad_status(self) -> None:
         with (
@@ -3723,6 +4266,54 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertEqual(len(status["recent_runs"]), 2)
         self.assertEqual({run["new_file_count"] for run in status["recent_runs"]}, {0, 1})
 
+    def test_status_prefers_photo_library_index_has_gps_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / "photo_library_index.sqlite"
+            with sqlite3.connect(index_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE photo_library_files (
+                        path TEXT PRIMARY KEY,
+                        root TEXT NOT NULL,
+                        has_gps INTEGER NOT NULL DEFAULT 0,
+                        gps_latitude REAL,
+                        gps_longitude REAL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE photo_library_dates (
+                        file_path TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        source TEXT NOT NULL
+                    )
+                    """
+                )
+                indexed_path = "/Volumes/Photos/a.heic"
+                indexed_path_with_stale_flag = "/Volumes/Photos/b.heic"
+                connection.execute(
+                    "INSERT INTO photo_library_files (path, root, has_gps) VALUES (?, ?, ?)",
+                    (indexed_path, "/Volumes/Photos", 1),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO photo_library_files
+                        (path, root, has_gps, gps_latitude, gps_longitude)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (indexed_path_with_stale_flag, "/Volumes/Photos", 0, 25.0833694444444, 121.593819444444),
+                )
+
+            status = control._photo_library_index_status(index_path)
+            geolocation_by_path = control._photo_index_geolocation_by_path(
+                index_path, [indexed_path, indexed_path_with_stale_flag]
+            )
+
+        self.assertEqual(status["gps_coordinate_count"], 2)
+        self.assertTrue(geolocation_by_path[indexed_path])
+        self.assertTrue(geolocation_by_path[indexed_path_with_stale_flag])
+
     def test_photo_library_index_status_omits_child_roots_covered_by_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -3776,6 +4367,101 @@ class Project365ControlAppTests(unittest.TestCase):
 
         self.assertTrue(status["busy"])
         self.assertIn("database is locked", status["error"])
+
+
+def _write_dedupe_index(index_db: Path, rows: list[dict[str, object]]) -> None:
+    connection = sqlite3.connect(index_db)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE photo_library_files (
+                path TEXT PRIMARY KEY,
+                root TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                extension TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL DEFAULT '',
+                capture_timestamp TEXT NOT NULL DEFAULT '',
+                has_gps INTEGER NOT NULL DEFAULT 0,
+                media_width INTEGER,
+                media_height INTEGER,
+                media_duration_seconds REAL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE photo_library_dates (
+                file_path TEXT NOT NULL,
+                date TEXT NOT NULL,
+                source TEXT NOT NULL,
+                PRIMARY KEY (file_path, date, source)
+            )
+            """
+        )
+        for row in rows:
+            connection.execute(
+                """
+                INSERT INTO photo_library_files (
+                    path,
+                    root,
+                    filename,
+                    extension,
+                    byte_size,
+                    sha256,
+                    capture_timestamp,
+                    has_gps,
+                    media_width,
+                    media_height,
+                    media_duration_seconds
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["path"],
+                    row["root"],
+                    row["filename"],
+                    row["extension"],
+                    row["byte_size"],
+                    row["sha256"],
+                    row["capture_timestamp"],
+                    row["has_gps"],
+                    row["media_width"],
+                    row["media_height"],
+                    row["media_duration_seconds"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO photo_library_dates (file_path, date, source) VALUES (?, ?, ?)",
+                (row["path"], row["date_value"], "media_creation_date"),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _dedupe_row(
+    path: Path,
+    root: Path,
+    extension: str,
+    capture_timestamp: str,
+    date_value: str,
+    duration: float | None = None,
+) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "root": str(root),
+        "filename": path.name,
+        "extension": extension,
+        "byte_size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "capture_timestamp": capture_timestamp,
+        "date_value": date_value,
+        "has_gps": 1,
+        "media_width": 1920,
+        "media_height": 1080,
+        "media_duration_seconds": duration,
+    }
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:

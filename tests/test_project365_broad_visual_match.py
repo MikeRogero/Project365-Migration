@@ -578,6 +578,344 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertEqual(page["returned_count"], 0)
         self.assertEqual(page["entries"], [])
 
+    def test_review_entries_default_to_current_run_without_timestamp_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "project365.bmp"
+            older_candidate = base / "older-candidate.bmp"
+            rejected_candidate = base / "rejected-candidate.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(older_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 240, 15)))
+            _write_bmp(rejected_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path)
+            _insert_rejected_original(canonical_root / "canonical.db", rejected_candidate)
+            connection = broad.connect_broad_db(db_path)
+            try:
+                for run_id, started_at, candidate_path in (
+                    ("older-run", "2026-08-23T00:00:00+00:00", older_candidate),
+                    ("newer-empty-run", "2026-08-23T00:10:00+00:00", rejected_candidate),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_runs (
+                            run_id, started_at, finished_at, status, phase,
+                            matched_entries, result_count, target_scope_json,
+                            candidate_scope_json, settings_json
+                        )
+                        VALUES (?, ?, ?, 'pass', 'finished', 1, 1, '{}', '{}', '{}')
+                        """,
+                        (run_id, started_at, started_at),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES (?, 'project365:1998-04-12', '1998-04-12',
+                            'project365:1998-04-12:project365_export_png', ?, ?, ?, ?,
+                            'image/bmp', 0, 0.1, 0, 1, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            run_id,
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+
+            broad.set_current_match_run(db_path, broad.CURRENT_BROAD_MATCH_SLOT, "older-run")
+            summary = broad.review_ready_summary(canonical_root, db_path)
+            page = broad.review_entries(canonical_root, db_path)
+            explicit_empty_page = broad.review_entries(canonical_root, db_path, run_id="newer-empty-run")
+
+        self.assertEqual(summary["run_id"], "older-run")
+        self.assertEqual(summary["review_ready_entry_count"], 1)
+        self.assertEqual(summary["preview_entry_id"], "project365:1998-04-12")
+        self.assertEqual(page["run_id"], "older-run")
+        self.assertEqual(page["entries"][0]["results"][0]["candidate_filename"], older_candidate.name)
+        self.assertEqual(explicit_empty_page["run_id"], "newer-empty-run")
+        self.assertEqual(explicit_empty_page["entries"], [])
+
+    def test_review_entries_current_run_does_not_fall_back_to_older_results_when_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "project365.bmp"
+            older_candidate = base / "older-candidate.bmp"
+            rejected_candidate = base / "rejected-candidate.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(older_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 240, 15)))
+            _write_bmp(rejected_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path)
+            _insert_rejected_original(canonical_root / "canonical.db", rejected_candidate)
+            connection = broad.connect_broad_db(db_path)
+            try:
+                for run_id, started_at, candidate_path in (
+                    ("older-run", "2026-08-23T00:00:00+00:00", older_candidate),
+                    ("newer-empty-run", "2026-08-23T00:10:00+00:00", rejected_candidate),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_runs (
+                            run_id, started_at, finished_at, status, phase,
+                            matched_entries, result_count, target_scope_json,
+                            candidate_scope_json, settings_json
+                        )
+                        VALUES (?, ?, ?, 'pass', 'finished', 1, 1, '{}', '{}', '{}')
+                        """,
+                        (run_id, started_at, started_at),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES (?, 'project365:1998-04-12', '1998-04-12',
+                            'project365:1998-04-12:project365_export_png', ?, ?, ?, ?,
+                            'image/bmp', 0, 0.1, 0, 1, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            run_id,
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+
+            broad.set_current_match_run(db_path, broad.CURRENT_BROAD_MATCH_SLOT, "newer-empty-run")
+            summary = broad.review_ready_summary(canonical_root, db_path)
+            page = broad.review_entries(canonical_root, db_path)
+
+        self.assertEqual(summary["run_id"], "newer-empty-run")
+        self.assertEqual(summary["review_ready_entry_count"], 0)
+        self.assertEqual(summary["preview_entry_id"], "")
+        self.assertEqual(page["run_id"], "newer-empty-run")
+        self.assertEqual(page["entries"], [])
+
+    def test_review_ready_summary_keeps_queued_undecided_entries_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "source.bmp"
+            queued_candidate = base / "queued.bmp"
+            decided_candidate = base / "decided.bmp"
+            queue_path = base / "queue.csv"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(queued_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 120, 15)))
+            _write_bmp(decided_candidate, 40, 40, _make_solid_pixels(40, 40, (120, 15, 15)))
+            _write_canonical_db(
+                canonical_root / "canonical.db",
+                source_path,
+                entry_id="project365:1998-04-12",
+                entry_date="1998-04-12",
+            )
+            _insert_unresolved_entry(
+                canonical_root / "canonical.db",
+                "project365:1998-04-13",
+                "1998-04-13",
+                source_path,
+            )
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_runs (
+                        run_id, started_at, finished_at, status, phase,
+                        matched_entries, result_count, target_scope_json,
+                        candidate_scope_json, settings_json
+                    )
+                    VALUES ('run-1', '2026-08-23T00:00:00+00:00',
+                        '2026-08-23T00:00:01+00:00', 'pass', 'finished',
+                        2, 2, '{}', '{}', '{}')
+                    """
+                )
+                for entry_id, entry_date, candidate_path, rank in (
+                    ("project365:1998-04-12", "1998-04-12", queued_candidate, 1),
+                    ("project365:1998-04-13", "1998-04-13", decided_candidate, 2),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES ('run-1', ?, ?, ?, ?, ?, ?, ?, 'image/bmp',
+                            0, 0.1, 0, ?, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            entry_id,
+                            entry_date,
+                            f"{entry_id}:project365_export_png",
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            rank,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_entry_decisions
+                        (run_id, entry_id, decision, candidate_path, created_at)
+                    VALUES ('run-1', 'project365:1998-04-13', 'keep_project365', '', '2026-08-23T00:00:02+00:00')
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            broad.set_current_match_run(db_path, broad.CURRENT_BROAD_MATCH_SLOT, "run-1")
+            with queue_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["entry_id", "candidate_path"])
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "entry_id": "project365:1998-04-12",
+                        "candidate_path": str(queued_candidate.resolve()),
+                    }
+                )
+
+            summary = broad.review_ready_summary(canonical_root, db_path, picker_queue_path=queue_path)
+            page = broad.review_entries(canonical_root, db_path, picker_queue_path=queue_path)
+
+        self.assertEqual(summary["review_ready_entry_count"], 1)
+        self.assertEqual(summary["review_total_entry_count"], 2)
+        self.assertEqual(summary["review_queued_entry_count"], 1)
+        self.assertEqual(summary["review_decision_entry_count"], 1)
+        self.assertEqual(summary["review_confirmed_entry_count"], 0)
+        self.assertEqual(summary["review_filtered_entry_count"], 0)
+        self.assertEqual([entry["entry_id"] for entry in page["entries"]], ["project365:1998-04-12"])
+
+    def test_review_ready_summary_does_not_double_count_decision_confirmed_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            first_source = base / "first-source.bmp"
+            second_source = base / "second-source.bmp"
+            third_source = base / "third-source.bmp"
+            first_candidate = base / "first-candidate.bmp"
+            second_candidate = base / "second-candidate.bmp"
+            third_candidate = base / "third-candidate.bmp"
+            for path in (first_source, second_source, third_source):
+                _write_bmp(path, 40, 40, _make_gradient_pixels(40, 40))
+            for index, path in enumerate((first_candidate, second_candidate, third_candidate), start=1):
+                _write_bmp(path, 40, 40, _make_solid_pixels(40, 40, (index * 40, 15, 240)))
+            _write_canonical_db(
+                canonical_root / "canonical.db",
+                first_source,
+                entry_id="project365:1998-04-12",
+                entry_date="1998-04-12",
+            )
+            _insert_unresolved_entry(canonical_root / "canonical.db", "project365:1998-04-13", "1998-04-13", second_source)
+            _insert_unresolved_entry(canonical_root / "canonical.db", "project365:1998-04-14", "1998-04-14", third_source)
+            with sqlite3.connect(canonical_root / "canonical.db") as canonical_connection:
+                canonical_connection.execute(
+                    """
+                    INSERT INTO media_assets
+                        (id, entry_id, role, internal_filename, storage_path, sha256, byte_size, mime_type, review_status)
+                    VALUES (
+                        'project365:1998-04-13:external_original_fallback',
+                        'project365:1998-04-13',
+                        'external_original_fallback',
+                        '',
+                        '',
+                        '',
+                        0,
+                        'application/x-project365-fallback',
+                        'confirmed'
+                    )
+                    """
+                )
+            connection = broad.connect_broad_db(db_path)
+            try:
+                _insert_run(connection, "run-1")
+                for entry_id, entry_date, candidate_path in (
+                    ("project365:1998-04-12", "1998-04-12", first_candidate),
+                    ("project365:1998-04-13", "1998-04-13", second_candidate),
+                    ("project365:1998-04-14", "1998-04-14", third_candidate),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES ('run-1', ?, ?, ?, ?, ?, ?, ?, 'image/bmp',
+                            0, 0.1, 0, 1, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            entry_id,
+                            entry_date,
+                            f"{entry_id}:project365_export_png",
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_entry_decisions
+                        (run_id, entry_id, decision, candidate_path, created_at)
+                    VALUES ('run-1', 'project365:1998-04-12', 'rejected_all', '', '2026-08-23T00:00:02+00:00')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_entry_decisions
+                        (run_id, entry_id, decision, candidate_path, created_at)
+                    VALUES ('run-1', 'project365:1998-04-13', 'keep_project365_export', '', '2026-08-23T00:00:03+00:00')
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            broad.set_current_match_run(db_path, broad.CURRENT_BROAD_MATCH_SLOT, "run-1")
+
+            summary = broad.review_ready_summary(canonical_root, db_path)
+            page = broad.review_entries(canonical_root, db_path, run_id="run-1")
+
+        self.assertEqual(summary["review_total_entry_count"], 3)
+        self.assertEqual(summary["review_decision_entry_count"], 2)
+        self.assertEqual(summary["review_confirmed_entry_count"], 1)
+        self.assertEqual(summary["review_ready_entry_count"], 1)
+        self.assertEqual(page["total_count"], 1)
+        self.assertEqual(page["entries"][0]["entry_id"], "project365:1998-04-14")
+
     def test_review_entries_skips_picker_confirmed_stale_result_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -589,8 +927,10 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
             first_candidate = base / "first-candidate.bmp"
             second_source = base / "second-source.bmp"
             second_candidate = base / "second-candidate.bmp"
-            for path in (first_source, first_confirmed, first_candidate, second_source, second_candidate):
+            for path in (first_source, first_confirmed, second_source):
                 _write_bmp(path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(first_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_bmp(second_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 15, 240)))
             _write_canonical_db(
                 canonical_root / "canonical.db",
                 first_source,
@@ -647,7 +987,7 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertEqual([entry["entry_id"] for entry in page["entries"]], ["project365:1998-04-13"])
         self.assertEqual(direct["entries"], [])
 
-    def test_review_entries_skips_entries_already_in_picker_queue(self) -> None:
+    def test_review_entries_do_not_hide_entries_already_in_picker_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = base / "Project365Canonical"
@@ -657,8 +997,10 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
             first_candidate = base / "first-candidate.bmp"
             second_source = base / "second-source.bmp"
             second_candidate = base / "second-candidate.bmp"
-            for path in (first_source, first_candidate, second_source, second_candidate):
+            for path in (first_source, second_source):
                 _write_bmp(path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(first_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_bmp(second_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 15, 240)))
             _write_canonical_db(
                 canonical_root / "canonical.db",
                 first_source,
@@ -720,8 +1062,174 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
                 picker_queue_path=queue_path,
             )
 
+        self.assertEqual(
+            [entry["entry_id"] for entry in page["entries"]],
+            ["project365:1998-04-12", "project365:1998-04-13"],
+        )
+        self.assertEqual(page["total_count"], 2)
+        self.assertEqual([entry["entry_id"] for entry in direct["entries"]], ["project365:1998-04-12"])
+        self.assertEqual(direct["total_count"], 1)
+
+    def test_review_entries_hide_pending_picker_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            first_source = base / "first-source.bmp"
+            first_candidate = base / "first-candidate.bmp"
+            second_source = base / "second-source.bmp"
+            second_candidate = base / "second-candidate.bmp"
+            for path in (first_source, second_source):
+                _write_bmp(path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(first_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_bmp(second_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 15, 240)))
+            _write_canonical_db(
+                canonical_root / "canonical.db",
+                first_source,
+                entry_id="project365:1998-04-12",
+                entry_date="1998-04-12",
+            )
+            _insert_unresolved_entry(canonical_root / "canonical.db", "project365:1998-04-13", "1998-04-13", second_source)
+            connection = broad.connect_broad_db(db_path)
+            try:
+                _insert_run(connection, "run-1")
+                for entry_id, entry_date, candidate_path in (
+                    ("project365:1998-04-12", "1998-04-12", first_candidate),
+                    ("project365:1998-04-13", "1998-04-13", second_candidate),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES ('run-1', ?, ?, ?, ?, ?, ?, ?, 'image/bmp',
+                            0, 0.1, 0, 1, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            entry_id,
+                            entry_date,
+                            f"{entry_id}:project365_export_png",
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            queue_path = base / "picker_queue.csv"
+            queue_path.write_text("entry_id,candidate_path\n", encoding="utf-8")
+            queue_path.with_name("picker_queue_picker_decisions.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "project365:1998-04-12": {
+                                f"candidate:{first_candidate.resolve()}": {
+                                    "review_decision": "use_external_original"
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            broad.set_current_match_run(db_path, broad.CURRENT_BROAD_MATCH_SLOT, "run-1")
+
+            summary = broad.review_ready_summary(canonical_root, db_path, picker_queue_path=queue_path)
+            page = broad.review_entries(canonical_root, db_path, run_id="run-1", picker_queue_path=queue_path)
+            direct = broad.review_entries(
+                canonical_root,
+                db_path,
+                run_id="run-1",
+                entry_id="project365:1998-04-12",
+                picker_queue_path=queue_path,
+            )
+
+        self.assertEqual(summary["review_ready_entry_count"], 1)
+        self.assertEqual(page["total_count"], 1)
         self.assertEqual([entry["entry_id"] for entry in page["entries"]], ["project365:1998-04-13"])
         self.assertEqual(direct["entries"], [])
+        self.assertEqual(direct["total_count"], 0)
+
+    def test_review_entries_hide_pending_picker_rejected_candidates_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "source.bmp"
+            rejected_candidate = base / "rejected-candidate.bmp"
+            remaining_candidate = base / "remaining-candidate.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(rejected_candidate, 40, 40, _make_solid_pixels(40, 40, (240, 15, 15)))
+            _write_bmp(remaining_candidate, 40, 40, _make_solid_pixels(40, 40, (15, 15, 240)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path)
+            connection = broad.connect_broad_db(db_path)
+            try:
+                _insert_run(connection, "run-1")
+                for rank, candidate_path in enumerate((rejected_candidate, remaining_candidate), start=1):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id,
+                            candidate_path, candidate_filename, candidate_sha256, byte_size,
+                            mime_type, date_distance, score, score_gap, rank, best_view,
+                            method_version, evidence, created_at
+                        )
+                        VALUES ('run-1', 'project365:1998-04-12', '1998-04-12',
+                            'project365:1998-04-12:project365_export_png', ?, ?, ?, ?,
+                            'image/bmp', 0, ?, 0, ?, 'full', ?, 'test',
+                            '2026-08-23T00:00:01+00:00')
+                        """,
+                        (
+                            str(candidate_path.resolve()),
+                            candidate_path.name,
+                            _sha256(candidate_path),
+                            candidate_path.stat().st_size,
+                            float(rank),
+                            rank,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            queue_path = base / "picker_queue.csv"
+            queue_path.write_text("entry_id,candidate_path\n", encoding="utf-8")
+            queue_path.with_name("picker_queue_picker_decisions.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": {
+                            "project365:1998-04-12": {
+                                f"candidate:{rejected_candidate.resolve()}": {
+                                    "review_decision": "rejected"
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            page = broad.review_entries(
+                canonical_root,
+                db_path,
+                run_id="run-1",
+                picker_queue_path=queue_path,
+            )
+            result_paths = [row["candidate_path"] for row in page["entries"][0]["results"]]
+
+        self.assertEqual(page["total_count"], 1)
+        self.assertEqual(result_paths, [str(remaining_candidate.resolve())])
 
     def test_review_entries_supports_date_adjacent_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -755,7 +1263,12 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
                     start=1,
                 ):
                     candidate_path = base / f"candidate-{index}.bmp"
-                    _write_bmp(candidate_path, 40, 40, _make_gradient_pixels(40, 40))
+                    _write_bmp(
+                        candidate_path,
+                        40,
+                        40,
+                        _make_solid_pixels(40, 40, (20 * index, 40, 240 - 20 * index)),
+                    )
                     connection.execute(
                         """
                         INSERT INTO broad_match_results (
@@ -834,6 +1347,77 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
 
         self.assertEqual(page["returned_count"], 0)
         self.assertEqual(page["entries"], [])
+
+    def test_review_entries_filters_stored_date_window_results_by_capture_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "project365.bmp"
+            old_candidate = base / "old.bmp"
+            good_candidate = base / "good.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(old_candidate, 40, 40, _make_solid_pixels(40, 40, (10, 20, 30)))
+            _write_bmp(good_candidate, 40, 40, _make_solid_pixels(40, 40, (30, 20, 10)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, entry_date="2025-05-05")
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_runs (
+                        run_id, started_at, finished_at, status, phase, target_scope_json,
+                        candidate_scope_json, settings_json
+                    )
+                    VALUES (
+                        'run-1', '2026-09-12T00:00:00+00:00', '2026-09-12T00:00:01+00:00',
+                        'pass', 'finished', '{}',
+                        '{"candidate_scope": "date_window_limited", "date_window_days": 4}',
+                        '{}'
+                    )
+                    """
+                )
+                for rank, path, filename_dates, media_creation_dates, filesystem_dates in (
+                    (1, old_candidate, "2008-01-20", "2008-01-20", "2025-05-08"),
+                    (2, good_candidate, "2025-05-02", "2025-05-02", "2025-05-02"),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO broad_match_results (
+                            run_id, entry_id, entry_date, project365_media_asset_id, candidate_path,
+                            candidate_filename, candidate_sha256, byte_size, mime_type,
+                            filename_dates, media_creation_dates, filesystem_dates, date_distance,
+                            score, score_gap, rank, best_view, method_version, evidence, created_at
+                        )
+                        VALUES (
+                            'run-1', 'project365:1998-04-12', '2025-05-05',
+                            'project365:1998-04-12:project365_export_png', ?, ?, ?, 1,
+                            'image/bmp', ?, ?, ?, 3, 1.0, 0.0, ?, 'square_x_01',
+                            ?, 'test', '2026-09-12T00:00:01+00:00'
+                        )
+                        """,
+                        (
+                            str(path),
+                            path.name,
+                            f"sha-{rank}",
+                            filename_dates,
+                            media_creation_dates,
+                            filesystem_dates,
+                            rank,
+                            broad.METHOD_VERSION,
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+
+            page = broad.review_entries(canonical_root, db_path, run_id="run-1")
+
+        self.assertEqual(len(page["entries"]), 1)
+        self.assertEqual(
+            [row["candidate_filename"] for row in page["entries"][0]["results"]],
+            [good_candidate.name],
+        )
 
     def test_clear_review_run_removes_results_and_decisions_but_keeps_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -989,6 +1573,46 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertEqual(january["fingerprint_count"], 1)
         self.assertEqual(january["coverage_ratio"], 0.5)
         self.assertEqual(january["missing_original_targets"], 2)
+
+    def test_monthly_fingerprint_coverage_ignores_descriptors_missing_from_photo_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "project365.bmp"
+            indexed_path = candidate_root / "indexed.bmp"
+            stale_path = candidate_root / "stale.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(indexed_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(stale_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, entry_date="2021-01-15")
+            broad.build_descriptor_index(canonical_root, db_path, [candidate_root])
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    "UPDATE broad_descriptors SET filename_dates = '2021-01-10' WHERE path = ?",
+                    (str(indexed_path.resolve()),),
+                )
+                connection.execute(
+                    "UPDATE broad_descriptors SET filename_dates = '2021-01-11' WHERE path = ?",
+                    (str(stale_path.resolve()),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            _write_photo_index(
+                canonical_root / "photo_library_index.sqlite",
+                [(indexed_path, candidate_root, "2021-01-10", "filename_date")],
+            )
+
+            rows = broad.monthly_fingerprint_coverage(canonical_root, db_path, months={"2021-01"})
+
+        self.assertEqual(rows[0]["photo_index_count"], 1)
+        self.assertEqual(rows[0]["fingerprint_count"], 1)
+        self.assertEqual(rows[0]["coverage_ratio"], 1.0)
 
     def test_monthly_fingerprint_coverage_hides_non_project365_months_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1336,6 +1960,144 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertIn("Fingerprint coverage too low", summary.coverage_warning)
         self.assertEqual(summary.target_count, 1)
         self.assertEqual(summary.error_count, 0)
+
+    def test_date_window_match_ignores_filesystem_date_when_capture_date_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            pixels = _make_gradient_pixels(40, 40)
+            source_path = base / "project365.bmp"
+            candidate_path = candidate_root / "IMG_20080120_old.bmp"
+            _write_bmp(source_path, 40, 40, pixels)
+            _write_bmp(candidate_path, 40, 40, _make_solid_pixels(40, 40, (10, 20, 30)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, entry_date="2025-05-05")
+            broad.build_descriptor_index(canonical_root, db_path, [candidate_root])
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE broad_descriptors
+                    SET filename_dates = '2008-01-20',
+                        media_creation_dates = '2008-01-20',
+                        filesystem_dates = '2025-05-08'
+                    WHERE path = ?
+                    """,
+                    (str(candidate_path.resolve()),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            summary = broad.run_match_batch(
+                canonical_root=canonical_root,
+                db_path=db_path,
+                target_scope={"entry_ids": ["project365:1998-04-12"]},
+                candidate_scope="date_window_limited",
+                date_window_days=4,
+                include_low_quality=True,
+            )
+
+        self.assertEqual(summary.scanned_count, 0)
+        self.assertEqual(summary.matched_entries, 0)
+        self.assertEqual(summary.result_count, 0)
+
+    def test_date_window_match_uses_filesystem_date_when_only_date_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            pixels = _make_gradient_pixels(40, 40)
+            source_path = base / "project365.bmp"
+            candidate_path = candidate_root / "candidate.bmp"
+            _write_bmp(source_path, 40, 40, pixels)
+            _write_bmp(candidate_path, 40, 40, _make_solid_pixels(40, 40, (10, 20, 30)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, entry_date="2025-05-05")
+            broad.build_descriptor_index(canonical_root, db_path, [candidate_root])
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE broad_descriptors
+                    SET filename_dates = '',
+                        media_creation_dates = '',
+                        filesystem_dates = '2025-05-08'
+                    WHERE path = ?
+                    """,
+                    (str(candidate_path.resolve()),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            summary = broad.run_match_batch(
+                canonical_root=canonical_root,
+                db_path=db_path,
+                target_scope={"entry_ids": ["project365:1998-04-12"]},
+                candidate_scope="date_window_limited",
+                date_window_days=4,
+                include_low_quality=True,
+            )
+            connection = broad.connect_broad_db(db_path)
+            try:
+                result = dict(connection.execute("SELECT date_distance FROM broad_match_results").fetchone())
+            finally:
+                connection.close()
+
+        self.assertEqual(summary.scanned_count, 1)
+        self.assertEqual(summary.matched_entries, 1)
+        self.assertEqual(summary.result_count, 1)
+        self.assertEqual(result["date_distance"], 3)
+
+    def test_date_window_match_ignores_filesystem_date_when_filename_has_invalid_date_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            pixels = _make_gradient_pixels(40, 40)
+            source_path = base / "project365.bmp"
+            candidate_path = candidate_root / "2005-02-31 235514 1.bmp"
+            _write_bmp(source_path, 40, 40, pixels)
+            _write_bmp(candidate_path, 40, 40, _make_solid_pixels(40, 40, (10, 20, 30)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, entry_date="2025-05-05")
+            broad.build_descriptor_index(canonical_root, db_path, [candidate_root])
+            connection = broad.connect_broad_db(db_path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE broad_descriptors
+                    SET filename_dates = '',
+                        media_creation_dates = '',
+                        filesystem_dates = '2025-05-07'
+                    WHERE path = ?
+                    """,
+                    (str(candidate_path.resolve()),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            summary = broad.run_match_batch(
+                canonical_root=canonical_root,
+                db_path=db_path,
+                target_scope={"entry_ids": ["project365:1998-04-12"]},
+                candidate_scope="date_window_limited",
+                date_window_days=2,
+                include_low_quality=True,
+            )
+
+        self.assertEqual(summary.scanned_count, 0)
+        self.assertEqual(summary.matched_entries, 0)
+        self.assertEqual(summary.result_count, 0)
 
     def test_benchmark_exports_metadata_only_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1976,6 +2738,65 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertEqual(confirm_summary["decision"], "matched")
         self.assertEqual(row, ("external_original_reference", str(candidate_path.resolve()), "confirmed"))
         self.assertEqual(remaining["returned_count"], 0)
+
+    def test_confirm_broad_match_refuses_to_overwrite_completed_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            source_path = base / "project365.bmp"
+            first_candidate = candidate_root / "first.bmp"
+            second_candidate = candidate_root / "second.bmp"
+            _write_bmp(source_path, 40, 40, _make_gradient_pixels(40, 40))
+            _write_bmp(first_candidate, 40, 40, _make_solid_pixels(40, 40, (20, 120, 20)))
+            _write_bmp(second_candidate, 40, 40, _make_solid_pixels(40, 40, (120, 20, 20)))
+            _write_canonical_db(canonical_root / "canonical.db", source_path, confirmed_path=first_candidate)
+            connection = broad.connect_broad_db(db_path)
+            try:
+                _insert_run(connection, "run-1")
+                connection.execute(
+                    """
+                    INSERT INTO broad_match_results (
+                        run_id, entry_id, entry_date, project365_media_asset_id, candidate_path,
+                        candidate_filename, candidate_sha256, byte_size, mime_type, date_distance,
+                        score, score_gap, rank, best_view, method_version, evidence, created_at
+                    )
+                    VALUES ('run-1', 'project365:1998-04-12', '1998-04-12',
+                        'project365:1998-04-12:project365_export_png',
+                        ?, ?, ?, ?, 'image/bmp', 0, 0.1, 0, 1, 'full', ?, 'test', '2026-08-23T00:00:01+00:00')
+                    """,
+                    (
+                        str(second_candidate.resolve()),
+                        second_candidate.name,
+                        _sha256(second_candidate),
+                        second_candidate.stat().st_size,
+                        broad.METHOD_VERSION,
+                    ),
+                )
+                result_id = int(connection.execute("SELECT result_id FROM broad_match_results").fetchone()[0])
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(ValueError, "already has a confirmed original-photo decision"):
+                broad.confirm_broad_match(canonical_root, db_path, result_id)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                paths = [
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT storage_path
+                        FROM media_assets
+                        WHERE role = 'external_original_reference'
+                        ORDER BY storage_path
+                        """
+                    )
+                ]
+
+        self.assertEqual(paths, [str(first_candidate)])
 
     def test_undo_broad_match_removes_decision_and_restores_review_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

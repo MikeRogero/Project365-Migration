@@ -276,18 +276,26 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             with sqlite3.connect(index_db) as connection:
                 row = connection.execute(
                     """
-                    SELECT gps_latitude, gps_longitude, gps_source
+                    SELECT gps_latitude, gps_longitude, gps_source, has_gps
                     FROM photo_library_files
                     WHERE path = ?
                     """,
                     (str(geotagged.resolve()),),
                 ).fetchone()
 
-            self.assertEqual(row, (25.033, 121.565, "composite_gps"))
+            self.assertEqual(row, (25.033, 121.565, "composite_gps", 1))
             candidate = photo_index.query_index_candidates(index_db, {"2004-01-01"})["2004-01-01"][0]
             self.assertEqual(candidate["gps_latitude"], 25.033)
             self.assertEqual(candidate["gps_longitude"], 121.565)
             self.assertEqual(candidate["gps_source"], "composite_gps")
+            self.assertTrue(candidate["has_gps"])
+
+            with sqlite3.connect(index_db) as connection:
+                connection.execute("UPDATE photo_library_files SET has_gps = 0")
+            stale_flag_candidate = photo_index.query_index_candidates(index_db, {"2004-01-01"})[
+                "2004-01-01"
+            ][0]
+            self.assertTrue(stale_flag_candidate["has_gps"])
 
     def test_photo_index_skips_unchanged_files_at_current_metadata_version(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -960,6 +968,7 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
                 index_db,
                 {"2004-01-01"},
                 include_filesystem_dates=True,
+                include_modified_dates=True,
             )["2004-01-01"]
             self.assertEqual(
                 {row["candidate_filename"] for row in filesystem_rows},
@@ -968,17 +977,18 @@ class Project365OriginalReferencePipelineTests(unittest.TestCase):
             filesystem_candidate = next(
                 row for row in filesystem_rows if row["candidate_filename"] == filesystem_only.name
             )
-            self.assertIn("filesystem_date", filesystem_candidate["evidence"])
+            self.assertIn("filesystem_modified_date", filesystem_candidate["evidence"])
 
             filename_only_rows = photo_index.query_index_candidates(
                 index_db,
                 {"2004-01-01"},
                 include_filesystem_dates=True,
                 filename_dates_only=True,
+                include_modified_dates=True,
             )["2004-01-01"]
             self.assertEqual([row["candidate_filename"] for row in filename_only_rows], [exact.name])
             self.assertIn("filename_date", filename_only_rows[0]["evidence"])
-            self.assertNotIn("filesystem_date", filename_only_rows[0]["evidence"])
+            self.assertNotIn("filesystem_modified_date", filename_only_rows[0]["evidence"])
 
     def test_source_scan_uses_first_nonempty_date_tier(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

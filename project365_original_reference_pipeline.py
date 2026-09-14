@@ -2026,6 +2026,21 @@ def record_reject_all_range_state(
     temporary.replace(path)
 
 
+def clear_reject_all_range_state(report_dir: Path, entry_id: str) -> None:
+    path = reject_all_range_state_path(report_dir)
+    state = load_reject_all_range_state(report_dir)
+    if entry_id not in state:
+        return
+    state.pop(entry_id, None)
+    if not state:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"version": 1, "entries": state}, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
 def _auto_expanded_reject_all_candidates(
     canonical_root: Path,
     photo_index_path: Path | None,
@@ -2430,6 +2445,10 @@ def _queue_row(export: dict[str, object], candidate: dict[str, object]) -> dict[
         "filesystem_dates": candidate["filesystem_dates"],
         "capture_timestamp": candidate.get("capture_timestamp", ""),
         "capture_timestamp_source": candidate.get("capture_timestamp_source", ""),
+        "gps_latitude": candidate.get("gps_latitude", ""),
+        "gps_longitude": candidate.get("gps_longitude", ""),
+        "gps_source": candidate.get("gps_source", ""),
+        "has_gps": candidate.get("has_gps", ""),
         "date_distance": candidate.get("date_distance", ""),
         "evidence": candidate["evidence"],
         "candidate_filter_reason": candidate.get("candidate_filter_reason", ""),
@@ -2678,6 +2697,10 @@ def _search_queue_fieldnames() -> list[str]:
         "filesystem_dates",
         "capture_timestamp",
         "capture_timestamp_source",
+        "gps_latitude",
+        "gps_longitude",
+        "gps_source",
+        "has_gps",
         "date_distance",
         "evidence",
         "candidate_filter_reason",

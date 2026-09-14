@@ -23,12 +23,19 @@ from typing import Any
 
 from project365_original_matcher import IMAGE_EXTENSIONS
 from project365_photo_library_index import (
+    FILENAME_DATE_PATTERNS,
     _filename_dates,
     _filesystem_dates,
     _filesystem_mtime_utc,
     _folder_path_prefix,
     _jpeg_exif_dates,
     _quality_rank,
+)
+from project365_original_reference_pipeline import (
+    ACCEPT_DECISIONS,
+    ASSOCIATED_PHOTO_DECISIONS,
+    FALLBACK_DECISIONS,
+    REJECT_DECISIONS,
 )
 from project365_original_picker import _image_dimensions as _actual_image_dimensions_text
 from project365_original_picker import _parse_dimensions_text
@@ -57,8 +64,12 @@ DEFAULT_MIN_COVERAGE_PHOTO_COUNT = 20
 VISUAL_SCORE_TIE_PRECISION = 6
 REPORT_DIR = Path("exports") / "verification_reports"
 BROAD_IMAGE_EXTENSIONS = set(IMAGE_EXTENSIONS) | {".bmp"}
+CURRENT_BROAD_MATCH_SLOT = "broad_visual_match"
+CURRENT_ROUGH_MATCH_SLOT = "rough_visual_match"
+CURRENT_MATCH_SLOTS = {CURRENT_BROAD_MATCH_SLOT, CURRENT_ROUGH_MATCH_SLOT}
 _STOP_REQUESTED = False
 _PICKER_QUEUE_ENTRY_IDS_CACHE: dict[str, tuple[tuple[int, int], set[str]]] = {}
+_PICKER_PENDING_DECISIONS_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
 
 @dataclass(frozen=True)
@@ -503,6 +514,11 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             notes TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             PRIMARY KEY (run_id, entry_id)
+        );
+        CREATE TABLE IF NOT EXISTS broad_current_runs (
+            slot TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_broad_results_run_entry_rank
             ON broad_match_results(run_id, entry_id, rank);
@@ -1265,6 +1281,8 @@ def run_no_date_match_batch(
                 },
                 len(targets),
             )
+            _set_current_match_run(connection, CURRENT_ROUGH_MATCH_SLOT, run_id)
+            connection.commit()
         try:
             for target_index, target in enumerate(targets, start=1):
                 if _STOP_REQUESTED:
@@ -1481,6 +1499,8 @@ def run_match_batch(
                 },
                 len(targets),
             )
+            _set_current_match_run(connection, CURRENT_BROAD_MATCH_SLOT, run_id)
+            connection.commit()
         candidate_availability_roots = _candidate_availability_roots(
             connection,
             candidate_scope=candidate_scope,
@@ -2206,7 +2226,12 @@ def monthly_fingerprint_coverage(
         canonical_root / "photo_library_index.sqlite",
         include_low_quality=include_low_quality,
     )
-    descriptor_counts = _descriptor_month_counts(db_path, method_version or _descriptor_method_version(DEFAULT_THUMBNAIL_SIZE))
+    descriptor_counts = _descriptor_month_counts(
+        db_path,
+        canonical_root / "photo_library_index.sqlite",
+        method_version or _descriptor_method_version(DEFAULT_THUMBNAIL_SIZE),
+        include_low_quality=include_low_quality,
+    )
     target_counts = _unresolved_target_month_counts(canonical_root / "canonical.db", target_scope or {})
     selected_months = months or _project365_entry_months(canonical_root / "canonical.db")
     if not selected_months:
@@ -2365,9 +2390,92 @@ def _project365_entry_months(db_path: Path) -> set[str]:
     return {str(month) for (month,) in rows if str(month or "").strip()}
 
 
-def _descriptor_month_counts(db_path: Path, method_version: str) -> dict[str, int]:
+def _descriptor_month_counts(
+    db_path: Path,
+    index_db: Path,
+    method_version: str,
+    include_low_quality: bool = False,
+) -> dict[str, int]:
     if not db_path.exists():
         return {}
+    if index_db.exists():
+        try:
+            connection = sqlite3.connect(f"file:{index_db}?mode=ro", uri=True, timeout=5)
+            try:
+                tables = {
+                    str(row[0])
+                    for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }
+                if "photo_library_dates" in tables and "photo_library_files" in tables:
+                    connection.execute("ATTACH DATABASE ? AS broad", (str(db_path),))
+                    file_columns = {
+                        str(row[1]) for row in connection.execute("PRAGMA table_info(photo_library_files)")
+                    }
+                    clauses = [
+                        "dates.date >= '0000-00-00'",
+                        "dates.date < '9999-99-99'",
+                        "descriptors.error = ''",
+                        "descriptors.method_version = ?",
+                    ]
+                    params: list[Any] = [method_version]
+                    if not include_low_quality:
+                        clauses.append("descriptors.quality_score >= 0")
+                        if "quality_score" in file_columns:
+                            clauses.append("files.quality_score >= 0")
+                    rows = connection.execute(
+                        f"""
+                        SELECT substr(dates.date, 1, 7) AS month, COUNT(DISTINCT dates.file_path)
+                        FROM photo_library_dates AS dates
+                        JOIN photo_library_files AS files
+                            ON files.path = dates.file_path
+                        JOIN broad.broad_descriptors AS descriptors
+                            ON descriptors.path = dates.file_path
+                        WHERE {" AND ".join(clauses)}
+                        GROUP BY month
+                        """,
+                        params,
+                    ).fetchall()
+                    return {str(month): int(count) for month, count in rows if str(month or "").strip()}
+                if "photo_library_files" in tables:
+                    connection.execute("ATTACH DATABASE ? AS broad", (str(db_path),))
+                    file_columns = {
+                        str(row[1]) for row in connection.execute("PRAGMA table_info(photo_library_files)")
+                    }
+                    date_columns = [
+                        column
+                        for column in ("media_creation_dates", "filename_dates", "filesystem_dates", "capture_timestamp")
+                        if column in file_columns
+                    ]
+                    if date_columns:
+                        expression = "COALESCE(" + ", ".join(
+                            f"NULLIF(substr(files.{column}, 1, 10), '')" for column in date_columns
+                        ) + ")"
+                        clauses = [
+                            f"{expression} IS NOT NULL",
+                            "descriptors.error = ''",
+                            "descriptors.method_version = ?",
+                        ]
+                        params = [method_version]
+                        if not include_low_quality:
+                            clauses.append("descriptors.quality_score >= 0")
+                            if "quality_score" in file_columns:
+                                clauses.append("files.quality_score >= 0")
+                        rows = connection.execute(
+                            f"""
+                            SELECT substr({expression}, 1, 7) AS month, COUNT(*)
+                            FROM photo_library_files AS files
+                            JOIN broad.broad_descriptors AS descriptors
+                                ON descriptors.path = files.path
+                            WHERE {" AND ".join(clauses)}
+                            GROUP BY month
+                            """,
+                            params,
+                        ).fetchall()
+                        return {str(month): int(count) for month, count in rows if str(month or "").strip()}
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            pass
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
     cursor: sqlite3.Cursor | None = None
     try:
@@ -2436,6 +2544,7 @@ def review_results(
     entry_id: str = "",
     limit: int = DEFAULT_RESULT_PAGE_SIZE,
     offset: int = 0,
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
 ) -> dict[str, Any]:
     if limit <= 0:
         raise ValueError("limit must be positive")
@@ -2443,7 +2552,7 @@ def review_results(
         raise ValueError("offset must be zero or greater")
     connection = connect_broad_db(db_path)
     try:
-        effective_run_id = run_id or _latest_match_run_id(connection)
+        effective_run_id = run_id or _current_match_run_id(connection, slot)
         if not effective_run_id:
             return {"run_id": "", "results": [], "returned_count": 0, "has_more": False, "offset": offset, "limit": limit}
         where = ["run_id = ?"]
@@ -2516,6 +2625,136 @@ def review_runs(db_path: Path, limit: int = 25) -> list[dict[str, Any]]:
         connection.close()
 
 
+def current_match_run_id(db_path: Path, slot: str = CURRENT_BROAD_MATCH_SLOT) -> str:
+    if not db_path.exists():
+        return ""
+    connection = connect_broad_db(db_path)
+    try:
+        return _current_match_run_id(connection, slot)
+    finally:
+        connection.close()
+
+
+def set_current_match_run(db_path: Path, slot: str, run_id: str) -> None:
+    run_text = str(run_id or "").strip()
+    if not run_text:
+        raise ValueError("run_id is required")
+    connection = connect_broad_db(db_path)
+    try:
+        _set_current_match_run(connection, slot, run_text)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def review_ready_summary(
+    canonical_root: Path,
+    db_path: Path,
+    picker_queue_path: Path | None = None,
+    search_limit: int = 25,
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
+) -> dict[str, Any]:
+    if search_limit <= 0:
+        raise ValueError("search_limit must be positive")
+    if not db_path.exists():
+        return {}
+    connection = connect_broad_db(db_path)
+    try:
+        run_id = _current_match_run_id(connection, slot)
+        run = _single_dict(
+            connection.execute(
+                "SELECT * FROM broad_match_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+    if not run:
+        return {}
+    page = review_entries(
+        canonical_root,
+        db_path,
+        run_id=run_id,
+        limit=1,
+        picker_queue_path=picker_queue_path,
+    )
+    entries = page.get("entries") or []
+    visibility = _review_visibility_summary(
+        canonical_root,
+        db_path,
+        run_id,
+        picker_queue_path,
+    )
+    reviewable_count = int(page.get("total_count", visibility.get("review_ready_entry_count", 0)) or 0)
+    run.update(visibility)
+    run["review_ready_entry_count"] = reviewable_count if entries else 0
+    run["preview_entry_id"] = str(entries[0].get("entry_id") or "") if entries else ""
+    run["preview_entry_date"] = str(entries[0].get("entry_date") or "") if entries else ""
+    run["review_filtered_entry_count"] = max(
+        int(visibility.get("review_ready_entry_count", 0)) - int(run["review_ready_entry_count"]),
+        0,
+    )
+    return run
+
+
+def _review_visibility_summary(
+    canonical_root: Path,
+    db_path: Path,
+    run_id: str,
+    picker_queue_path: Path | None,
+) -> dict[str, int]:
+    connection = connect_broad_db(db_path)
+    try:
+        result_entry_ids = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT entry_id FROM broad_match_results WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        }
+        decision_entry_ids = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT entry_id FROM broad_match_entry_decisions WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        }
+        confirmed_entry_ids: set[str] = set()
+        canonical_db = canonical_root / "canonical.db"
+        if canonical_db.exists() and result_entry_ids:
+            _attach_canonical_db(connection, canonical_db)
+            placeholders = ", ".join("?" for _ in result_entry_ids)
+            confirmed_entry_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT entry_id
+                    FROM canonical_db.media_assets
+                    WHERE entry_id IN ({placeholders})
+                        AND role IN ('external_original_reference', 'external_original_fallback')
+                        AND review_status = 'confirmed'
+                    """,
+                    sorted(result_entry_ids),
+                ).fetchall()
+            }
+    finally:
+        connection.close()
+    queued_entry_ids = (
+        result_entry_ids & _picker_queue_entry_ids(picker_queue_path)
+        if picker_queue_path is not None
+        else set()
+    )
+    unavailable_entry_ids = (decision_entry_ids | confirmed_entry_ids) & result_entry_ids
+    return {
+        "review_total_entry_count": len(result_entry_ids),
+        "review_queued_entry_count": len(queued_entry_ids),
+        "review_decision_entry_count": len(decision_entry_ids & result_entry_ids),
+        "review_confirmed_entry_count": len(confirmed_entry_ids),
+        "review_ready_entry_count": max(len(result_entry_ids) - len(unavailable_entry_ids), 0),
+        "review_filtered_entry_count": 0,
+    }
+
+
 def clear_review_run(db_path: Path, run_id: str) -> dict[str, Any]:
     run_id = str(run_id or "").strip()
     if not run_id:
@@ -2536,6 +2775,7 @@ def clear_review_run(db_path: Path, run_id: str) -> dict[str, Any]:
         )
         connection.execute("DELETE FROM broad_match_results WHERE run_id = ?", (run_id,))
         connection.execute("DELETE FROM broad_match_entry_decisions WHERE run_id = ?", (run_id,))
+        connection.execute("DELETE FROM broad_current_runs WHERE run_id = ?", (run_id,))
         connection.execute(
             """
             UPDATE broad_match_runs
@@ -2562,6 +2802,7 @@ def clear_all_review_runs(db_path: Path) -> dict[str, Any]:
         )
         connection.execute("DELETE FROM broad_match_results")
         connection.execute("DELETE FROM broad_match_entry_decisions")
+        connection.execute("DELETE FROM broad_current_runs")
         connection.execute("UPDATE broad_match_runs SET result_count = 0, matched_entries = 0")
         connection.commit()
         return {"cleared_runs": run_count, "cleared_results": result_count, "cleared_decisions": decision_count}
@@ -2579,16 +2820,26 @@ def review_entries(
     after_date: str = "",
     before_date: str = "",
     picker_queue_path: Path | None = None,
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
 ) -> dict[str, Any]:
     if limit <= 0:
         raise ValueError("limit must be positive")
     if offset < 0:
         raise ValueError("offset must be zero or greater")
+    effective_run_id = run_id
+    if not effective_run_id:
+        ready = review_ready_summary(
+            canonical_root,
+            db_path,
+            picker_queue_path=picker_queue_path,
+            slot=slot,
+        )
+        effective_run_id = str(ready.get("run_id") or "")
     connection = connect_broad_db(db_path)
     try:
-        effective_run_id = run_id or _latest_match_run_id(connection)
         if not effective_run_id:
             return {"run_id": "", "entries": [], "returned_count": 0, "has_more": False, "offset": offset, "limit": limit}
+        candidate_scope = _match_run_candidate_scope(connection, effective_run_id)
         _attach_canonical_db(connection, canonical_root / "canonical.db")
         where = ["run_id = ?"]
         params: list[Any] = [effective_run_id]
@@ -2602,13 +2853,7 @@ def review_entries(
             where.append("entry_date < ?")
             params.append(before_date)
         order_direction = "DESC" if before_date and not after_date else "ASC"
-        queued_entry_ids = _picker_queue_entry_ids(picker_queue_path) if picker_queue_path is not None else set()
-        if queued_entry_ids:
-            placeholders = ", ".join("?" for _ in queued_entry_ids)
-            where.append(f"entry_id NOT IN ({placeholders})")
-            params.extend(sorted(queued_entry_ids))
-        entry_rows = connection.execute(
-            f"""
+        entry_filter_sql = f"""
             SELECT entry_id, MIN(entry_date) AS entry_date
             FROM broad_match_results
             WHERE {" AND ".join(where)}
@@ -2649,34 +2894,53 @@ def review_entries(
                         AND decisions.entry_id = broad_match_results.entry_id
                 )
             GROUP BY entry_id
+        """
+        entry_rows = connection.execute(
+            f"""
+            {entry_filter_sql}
             ORDER BY entry_date {order_direction}, entry_id {order_direction}
-            LIMIT ? OFFSET ?
             """,
-            (*params, limit + 1, offset),
+            tuple(params),
         ).fetchall()
-        visible_entries = [_single_dict(row) for row in entry_rows[:limit]]
-        if not visible_entries:
+        candidate_entries = [_single_dict(row) for row in entry_rows]
+        if not candidate_entries:
             return {
                 "run_id": effective_run_id,
                 "entries": [],
                 "returned_count": 0,
-                "has_more": len(entry_rows) > limit,
+                "has_more": False,
                 "offset": offset,
                 "limit": limit,
+                "total_count": 0,
             }
-        entry_ids = [str(row["entry_id"]) for row in visible_entries]
+        entry_ids = [str(row["entry_id"]) for row in candidate_entries]
         result_rows = _results_for_entries(connection, effective_run_id, entry_ids)
     finally:
         connection.close()
     target_rows = _review_target_rows(canonical_root / "canonical.db", entry_ids)
     rejected_candidates = _rejected_candidates_by_entry(canonical_root / "canonical.db")
+    pending_picker_decisions = _pending_picker_decisions(picker_queue_path)
+    pending_completed_entry_ids = pending_picker_decisions["completed_entry_ids"]
+    rejected_candidates = _merge_rejected_candidates(
+        rejected_candidates,
+        pending_picker_decisions["rejected_candidates"],
+    )
     entries = []
-    for entry in visible_entries:
+    for entry in candidate_entries:
         entry_id_text = str(entry["entry_id"])
+        if entry_id_text in pending_completed_entry_ids:
+            continue
         target = target_rows.get(entry_id_text, {})
         results = _exclude_target_export_copies(target, result_rows.get(entry_id_text, []))
         results = _exclude_rejected_candidates({"entry_id": entry_id_text}, results, rejected_candidates)
-        entries.append(
+        results = _filter_review_results_by_candidate_scope(
+            results,
+            str(entry.get("entry_date") or target.get("entry_date") or ""),
+            candidate_scope,
+        )
+        if not results:
+            continue
+        entry_payload = (
             {
                 "entry_id": entry_id_text,
                 "entry_date": str(entry.get("entry_date") or target.get("entry_date") or ""),
@@ -2685,13 +2949,17 @@ def review_entries(
                 "results": results,
             }
         )
+        entries.append(entry_payload)
+    visible_entries = entries
+    entries = visible_entries[offset : offset + limit]
     return {
         "run_id": effective_run_id,
         "entries": entries,
         "returned_count": len(entries),
-        "has_more": len(entry_rows) > limit,
+        "has_more": offset + limit < len(visible_entries),
         "offset": offset,
         "limit": limit,
+        "total_count": len(visible_entries),
     }
 
 
@@ -2814,6 +3082,8 @@ def confirm_broad_match(
         )
         if not result:
             raise ValueError("Unknown broad visual result.")
+        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", str(result["entry_id"])):
+            raise ValueError("This entry already has a confirmed original-photo decision.")
         _upsert_canonical_media_decision(
             canonical_root / "canonical.db",
             result,
@@ -2851,15 +3121,18 @@ def reject_broad_entry(
     run_id: str = "",
     entry_id: str = "",
     notes: str = "Rejected in Broad Visual Review.",
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
 ) -> dict[str, Any]:
     entry_text = str(entry_id or "").strip()
     if not entry_text:
         raise ValueError("Choose an entry to reject.")
     connection = connect_broad_db(db_path)
     try:
-        effective_run_id = run_id.strip() or _latest_match_run_id(connection)
+        effective_run_id = run_id.strip() or _current_match_run_id(connection, slot)
         if not effective_run_id:
             raise ValueError("No broad visual search run is available.")
+        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", entry_text):
+            raise ValueError("This entry already has a confirmed original-photo decision.")
         rows = [
             _single_dict(row)
             for row in connection.execute(
@@ -2911,15 +3184,18 @@ def keep_project365_export_for_broad_entry(
     run_id: str = "",
     entry_id: str = "",
     notes: str = "No external original selected; keep Project365 export as fallback.",
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
 ) -> dict[str, Any]:
     entry_text = str(entry_id or "").strip()
     if not entry_text:
         raise ValueError("Choose an entry to keep as the Project365 photo.")
     connection = connect_broad_db(db_path)
     try:
-        effective_run_id = run_id.strip() or _latest_match_run_id(connection)
+        effective_run_id = run_id.strip() or _current_match_run_id(connection, slot)
         if not effective_run_id:
             raise ValueError("No broad visual search run is available.")
+        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", entry_text):
+            raise ValueError("This entry already has a confirmed original-photo decision.")
         row = _single_dict(
             connection.execute(
                 """
@@ -2964,13 +3240,14 @@ def undo_broad_entry_decision(
     db_path: Path,
     run_id: str = "",
     entry_id: str = "",
+    slot: str = CURRENT_BROAD_MATCH_SLOT,
 ) -> dict[str, Any]:
     entry_text = str(entry_id or "").strip()
     if not entry_text:
         raise ValueError("Choose an entry decision to undo.")
     connection = connect_broad_db(db_path)
     try:
-        effective_run_id = run_id.strip() or _latest_match_run_id(connection)
+        effective_run_id = run_id.strip() or _current_match_run_id(connection, slot)
         if not effective_run_id:
             raise ValueError("No broad visual search run is available.")
         decision = _single_dict(
@@ -3367,30 +3644,33 @@ def _review_target_rows(db_path: Path, entry_ids: list[str]) -> dict[str, dict[s
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     try:
-        placeholders = ", ".join("?" for _ in entry_ids)
-        rows = connection.execute(
-            f"""
-            SELECT
-                entries.id AS entry_id,
-                entries.entry_date AS entry_date,
-                exports.storage_path AS source_path,
-                exports.internal_filename AS source_filename,
-                exports.sha256 AS source_sha256,
-                COALESCE(confirmed.storage_path, '') AS confirmed_path
-            FROM entries
-            JOIN media_assets AS exports
-                ON exports.entry_id = entries.id
-                AND exports.role = 'project365_export_png'
-            LEFT JOIN media_assets AS confirmed
-                ON confirmed.entry_id = entries.id
-                AND confirmed.role = 'external_original_reference'
-                AND confirmed.review_status = 'confirmed'
-            WHERE entries.id IN ({placeholders})
-            ORDER BY entries.entry_date, entries.id
-            """,
-            entry_ids,
-        ).fetchall()
-        return {str(row["entry_id"]): _single_dict(row) for row in rows}
+        targets: dict[str, dict[str, str]] = {}
+        for chunk in _chunks(entry_ids, 500):
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""
+                SELECT
+                    entries.id AS entry_id,
+                    entries.entry_date AS entry_date,
+                    exports.storage_path AS source_path,
+                    exports.internal_filename AS source_filename,
+                    exports.sha256 AS source_sha256,
+                    COALESCE(confirmed.storage_path, '') AS confirmed_path
+                FROM entries
+                JOIN media_assets AS exports
+                    ON exports.entry_id = entries.id
+                    AND exports.role = 'project365_export_png'
+                LEFT JOIN media_assets AS confirmed
+                    ON confirmed.entry_id = entries.id
+                    AND confirmed.role = 'external_original_reference'
+                    AND confirmed.review_status = 'confirmed'
+                WHERE entries.id IN ({placeholders})
+                ORDER BY entries.entry_date, entries.id
+                """,
+                chunk,
+            ).fetchall()
+            targets.update({str(row["entry_id"]): _single_dict(row) for row in rows})
+        return targets
     finally:
         connection.close()
 
@@ -3402,27 +3682,66 @@ def _results_for_entries(
 ) -> dict[str, list[dict[str, Any]]]:
     if not entry_ids:
         return {}
-    placeholders = ", ".join("?" for _ in entry_ids)
-    rows = connection.execute(
-        f"""
-        SELECT
-            broad_match_results.*,
-            COALESCE(descriptors.original_width, 0) AS candidate_width,
-            COALESCE(descriptors.original_height, 0) AS candidate_height
-        FROM broad_match_results
-        LEFT JOIN broad_descriptors AS descriptors
-            ON descriptors.path = broad_match_results.candidate_path
-        WHERE broad_match_results.run_id = ?
-            AND broad_match_results.entry_id IN ({placeholders})
-        ORDER BY broad_match_results.entry_date, broad_match_results.entry_id, broad_match_results.rank, broad_match_results.candidate_path
-        """,
-        (run_id, *entry_ids),
-    ).fetchall()
     grouped: dict[str, list[dict[str, Any]]] = {entry_id: [] for entry_id in entry_ids}
-    for row in rows:
-        result = _single_dict(row)
-        grouped.setdefault(str(result["entry_id"]), []).append(result)
+    for chunk in _chunks(entry_ids, 500):
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"""
+            SELECT
+                broad_match_results.*,
+                COALESCE(descriptors.original_width, 0) AS candidate_width,
+                COALESCE(descriptors.original_height, 0) AS candidate_height
+            FROM broad_match_results
+            LEFT JOIN broad_descriptors AS descriptors
+                ON descriptors.path = broad_match_results.candidate_path
+            WHERE broad_match_results.run_id = ?
+                AND broad_match_results.entry_id IN ({placeholders})
+            ORDER BY broad_match_results.entry_date, broad_match_results.entry_id, broad_match_results.rank, broad_match_results.candidate_path
+            """,
+            (run_id, *chunk),
+        ).fetchall()
+        for row in rows:
+            result = _single_dict(row)
+            grouped.setdefault(str(result["entry_id"]), []).append(result)
     return grouped
+
+
+def _match_run_candidate_scope(connection: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT candidate_scope_json FROM broad_match_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        payload = json.loads(str(row["candidate_scope_json"] or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _filter_review_results_by_candidate_scope(
+    results: list[dict[str, Any]],
+    entry_date: str,
+    candidate_scope: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if candidate_scope.get("candidate_scope") != "date_window_limited":
+        return results
+    try:
+        target_date = dt.date.fromisoformat(entry_date)
+    except ValueError:
+        return results
+    try:
+        date_window_days = int(candidate_scope.get("date_window_days") or 0)
+    except (TypeError, ValueError):
+        return results
+    if date_window_days <= 0:
+        return results
+    return [
+        row
+        for row in results
+        if _row_within_date_window(row, target_date, date_window_days)
+    ]
 
 
 def _candidate_descriptor_rows(
@@ -3451,8 +3770,9 @@ def _candidate_descriptor_rows(
         month_clauses = []
         for month in _months_between(target_date - window, target_date + window):
             month_clauses.append(
-                "(instr(filename_dates, ?) > 0 OR instr(media_creation_dates, ?) > 0 "
-                "OR instr(filesystem_dates, ?) > 0)"
+                "((instr(filename_dates, ?) > 0 OR instr(media_creation_dates, ?) > 0) "
+                "OR (COALESCE(filename_dates, '') = '' AND COALESCE(media_creation_dates, '') = '' "
+                "AND instr(filesystem_dates, ?) > 0))"
             )
             params.extend([month, month, month])
         if month_clauses:
@@ -4210,12 +4530,7 @@ def _ensure_candidate_roots_available(roots: list[Path]) -> None:
 
 
 def _row_within_date_window(row: dict[str, Any], target_date: dt.date, window_days: int) -> bool:
-    values = []
-    for field in ("filename_dates", "media_creation_dates", "filesystem_dates"):
-        values.extend(str(row.get(field, "") or "").split(";"))
-    for value in values:
-        if not value:
-            continue
+    for value in _candidate_date_values(row):
         try:
             candidate_date = dt.date.fromisoformat(value[:10])
         except ValueError:
@@ -4783,6 +5098,27 @@ def _delete_canonical_broad_decision(
         connection.close()
 
 
+def _canonical_entry_has_completed_external_decision(canonical_db: Path, entry_id: str) -> bool:
+    if not canonical_db.exists():
+        return False
+    connection = sqlite3.connect(canonical_db)
+    try:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM media_assets
+            WHERE entry_id = ?
+                AND role IN ('external_original_reference', 'external_original_fallback')
+                AND review_status = 'confirmed'
+            LIMIT 1
+            """,
+            (entry_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return row is not None
+
+
 def _upsert_canonical_media_decision(
     canonical_db: Path,
     result: dict[str, Any],
@@ -4959,15 +5295,39 @@ def _date_distance(entry_date: str, result: dict[str, Any]) -> int:
     except ValueError:
         return -1
     distances = []
-    for field in ("filename_dates", "media_creation_dates", "filesystem_dates"):
-        for value in str(result.get(field, "") or "").split(";"):
-            if not value:
-                continue
-            try:
-                distances.append(abs((dt.date.fromisoformat(value[:10]) - target).days))
-            except ValueError:
-                pass
+    for value in _candidate_date_values(result):
+        try:
+            distances.append(abs((dt.date.fromisoformat(value[:10]) - target).days))
+        except ValueError:
+            pass
     return min(distances) if distances else -1
+
+
+def _candidate_date_values(row: dict[str, Any]) -> list[str]:
+    capture_values = _date_values_from_fields(row, ("filename_dates", "media_creation_dates"))
+    if capture_values:
+        return capture_values
+    if _filename_has_date_token(row):
+        return []
+    return _date_values_from_fields(row, ("filesystem_dates",))
+
+
+def _filename_has_date_token(row: dict[str, Any]) -> bool:
+    filename = str(
+        row.get("filename")
+        or row.get("candidate_filename")
+        or Path(str(row.get("path") or row.get("candidate_path") or "")).name
+    )
+    return any(pattern.search(filename) for pattern in FILENAME_DATE_PATTERNS)
+
+
+def _date_values_from_fields(row: dict[str, Any], fields: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for field in fields:
+        for value in str(row.get(field, "") or "").split(";"):
+            if value:
+                values.append(value)
+    return values
 
 
 def _start_match_run(
@@ -5365,6 +5725,106 @@ def _picker_queue_entry_ids(path: Path) -> set[str]:
     return entry_ids
 
 
+def _pending_picker_decisions(queue_path: Path | None) -> dict[str, Any]:
+    empty = {"completed_entry_ids": set(), "rejected_candidates": {}}
+    if queue_path is None:
+        return empty
+    path = queue_path.with_name(f"{queue_path.stem}_picker_decisions.json")
+    if not path.exists():
+        return empty
+    try:
+        stat = path.stat()
+    except OSError:
+        return empty
+    cache_key = str(path)
+    signature = (stat.st_size, stat.st_mtime_ns)
+    cached = _PICKER_PENDING_DECISIONS_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return {
+            "completed_entry_ids": set(cached[1]["completed_entry_ids"]),
+            "rejected_candidates": _copy_rejected_candidates(cached[1]["rejected_candidates"]),
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+    if not isinstance(entries, dict):
+        return empty
+    completed_entry_ids: set[str] = set()
+    rejected_candidates: dict[str, dict[str, set[str]]] = {}
+    for entry_id, candidate_decisions in entries.items():
+        entry_id_text = str(entry_id)
+        if not isinstance(candidate_decisions, dict):
+            continue
+        for candidate_key, record in candidate_decisions.items():
+            if not isinstance(record, dict):
+                continue
+            decision = str(record.get("review_decision", "")).strip().lower()
+            if not decision:
+                continue
+            if decision in ACCEPT_DECISIONS or decision in FALLBACK_DECISIONS:
+                completed_entry_ids.add(entry_id_text)
+                continue
+            if decision in REJECT_DECISIONS or decision in ASSOCIATED_PHOTO_DECISIONS:
+                candidate_path = _candidate_path_from_picker_decision_key(str(candidate_key))
+                if candidate_path:
+                    _add_rejected_candidate_path(rejected_candidates, entry_id_text, candidate_path)
+    value = {
+        "completed_entry_ids": set(completed_entry_ids),
+        "rejected_candidates": _copy_rejected_candidates(rejected_candidates),
+    }
+    _PICKER_PENDING_DECISIONS_CACHE[cache_key] = (signature, value)
+    return {
+        "completed_entry_ids": set(completed_entry_ids),
+        "rejected_candidates": rejected_candidates,
+    }
+
+
+def _candidate_path_from_picker_decision_key(key: str) -> str:
+    if key.startswith("candidate:"):
+        return key[len("candidate:") :]
+    return ""
+
+
+def _add_rejected_candidate_path(
+    rejected_candidates: dict[str, dict[str, set[str]]],
+    entry_id: str,
+    candidate_path: str,
+) -> None:
+    path_text = str(candidate_path or "").strip()
+    if not path_text:
+        return
+    entry = rejected_candidates.setdefault(str(entry_id), {"sha256": set(), "paths": set(), "resolved_paths": set()})
+    entry["paths"].add(path_text)
+    entry["resolved_paths"].add(str(Path(path_text).resolve()))
+
+
+def _merge_rejected_candidates(
+    first: dict[str, dict[str, set[str]]],
+    second: dict[str, dict[str, set[str]]],
+) -> dict[str, dict[str, set[str]]]:
+    merged = _copy_rejected_candidates(first)
+    for entry_id, candidates in second.items():
+        entry = merged.setdefault(str(entry_id), {"sha256": set(), "paths": set(), "resolved_paths": set()})
+        for key in ("sha256", "paths", "resolved_paths"):
+            entry[key].update(set(candidates.get(key, set())))
+    return merged
+
+
+def _copy_rejected_candidates(
+    source: dict[str, dict[str, set[str]]],
+) -> dict[str, dict[str, set[str]]]:
+    return {
+        str(entry_id): {
+            "sha256": set(candidates.get("sha256", set())),
+            "paths": set(candidates.get("paths", set())),
+            "resolved_paths": set(candidates.get("resolved_paths", set())),
+        }
+        for entry_id, candidates in source.items()
+    }
+
+
 def _write_picker_queue(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as handle:
@@ -5419,9 +5879,66 @@ def _result_exists_for_entry(connection: sqlite3.Connection, run_id: str, entry_
     return row is not None
 
 
-def _latest_match_run_id(connection: sqlite3.Connection) -> str:
+def _validate_current_match_slot(slot: str) -> str:
+    slot_text = str(slot or "").strip()
+    if slot_text not in CURRENT_MATCH_SLOTS:
+        raise ValueError(f"Unsupported current match slot: {slot}")
+    return slot_text
+
+
+def _set_current_match_run(connection: sqlite3.Connection, slot: str, run_id: str) -> None:
+    slot_text = _validate_current_match_slot(slot)
+    run_text = str(run_id or "").strip()
+    if not run_text:
+        raise ValueError("run_id is required")
+    connection.execute(
+        """
+        INSERT INTO broad_current_runs (slot, run_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(slot)
+        DO UPDATE SET run_id = excluded.run_id,
+            updated_at = excluded.updated_at
+        """,
+        (slot_text, run_text, _now()),
+    )
+
+
+def _current_match_run_id(connection: sqlite3.Connection, slot: str) -> str:
+    slot_text = _validate_current_match_slot(slot)
     row = connection.execute(
-        "SELECT run_id FROM broad_match_runs ORDER BY started_at DESC LIMIT 1"
+        "SELECT run_id FROM broad_current_runs WHERE slot = ?",
+        (slot_text,),
+    ).fetchone()
+    run_id = str(row["run_id"]) if row else ""
+    if run_id and _run_matches_current_slot(connection, run_id, slot_text):
+        return run_id
+    fallback = _latest_match_run_id(connection, slot_text)
+    if fallback:
+        _set_current_match_run(connection, slot_text, fallback)
+        connection.commit()
+    return fallback
+
+
+def _run_matches_current_slot(connection: sqlite3.Connection, run_id: str, slot: str) -> bool:
+    row = connection.execute(
+        "SELECT candidate_scope_json FROM broad_match_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return False
+    is_rough = "rough_prefilter_no_date" in str(row["candidate_scope_json"] or "")
+    return is_rough if slot == CURRENT_ROUGH_MATCH_SLOT else not is_rough
+
+
+def _latest_match_run_id(connection: sqlite3.Connection, slot: str = "") -> str:
+    slot_text = str(slot or "").strip()
+    where = ""
+    if slot_text == CURRENT_BROAD_MATCH_SLOT:
+        where = "WHERE COALESCE(candidate_scope_json, '') NOT LIKE '%rough_prefilter_no_date%'"
+    elif slot_text == CURRENT_ROUGH_MATCH_SLOT:
+        where = "WHERE candidate_scope_json LIKE '%rough_prefilter_no_date%'"
+    row = connection.execute(
+        f"SELECT run_id FROM broad_match_runs {where} ORDER BY started_at DESC LIMIT 1"
     ).fetchone()
     return str(row["run_id"]) if row else ""
 

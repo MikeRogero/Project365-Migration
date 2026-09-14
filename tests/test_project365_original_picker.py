@@ -207,6 +207,140 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertEqual(rows[0]["associated_entry_date"], "1998-04-13T08:09:10")
             self.assertEqual(state.summary()["pending_decisions"]["associated"], 1)
 
+    def test_picker_links_multiple_associated_photos_without_replacing_selected_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            source_root.joinpath("1998-04-12 original.jpg").write_bytes(_jpeg_with_dimensions(80, 60))
+            source_root.joinpath("1998-04-12 extra 1.jpg").write_bytes(_jpeg_with_dimensions(81, 60))
+            source_root.joinpath("1998-04-12 extra 2.jpg").write_bytes(_jpeg_with_dimensions(82, 60))
+            search_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=Path(search_summary.search_queue_path))
+            )
+            detail = state.entry_detail("project365:1998-04-12")
+            candidates_by_name = {candidate["filename"]: candidate for candidate in detail["candidates"]}
+
+            state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 original.jpg"]["path"],
+                decision="use_external_original",
+                notes="primary",
+            )
+            state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 extra 1.jpg"]["path"],
+                decision="external_original_associated_photo",
+                notes="extra",
+                associated_entry_date=detail["entry_date"],
+                associated_date_source="entry",
+            )
+            updated = state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 extra 2.jpg"]["path"],
+                decision="external_original_associated_photo",
+                notes="extra",
+                associated_entry_date=detail["entry_date"],
+                associated_date_source="entry",
+            )
+
+            rows_by_name = {Path(row["candidate_path"]).name: row for row in state._entry_rows(detail["entry_id"])}
+            self.assertEqual(rows_by_name["1998-04-12 original.jpg"]["review_decision"], "use_external_original")
+            self.assertEqual(
+                rows_by_name["1998-04-12 extra 1.jpg"]["review_decision"],
+                "external_original_associated_photo",
+            )
+            self.assertEqual(
+                rows_by_name["1998-04-12 extra 2.jpg"]["review_decision"],
+                "external_original_associated_photo",
+            )
+            self.assertEqual(updated["selected_count"], 1)
+            self.assertEqual(updated["associated_count"], 2)
+            self.assertEqual(
+                state.summary()["pending_decisions"],
+                {"accepted": 1, "rejected": 0, "associated": 2},
+            )
+
+            result = state.apply_decisions()
+
+            self.assertEqual(result["selected_count"], 1)
+            self.assertEqual(result["associated_count"], 2)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                roles = connection.execute(
+                    """
+                    SELECT role, COUNT(*)
+                    FROM media_assets
+                    WHERE entry_id = ?
+                        AND role IN ('external_original_reference', 'external_original_associated_photo')
+                    GROUP BY role
+                    """,
+                    (detail["entry_id"],),
+                ).fetchall()
+            self.assertEqual(dict(roles), {"external_original_associated_photo": 2, "external_original_reference": 1})
+
+    def test_picker_unlinks_associated_photo_without_clearing_selected_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            source_root.joinpath("1998-04-12 original.jpg").write_bytes(_jpeg_with_dimensions(80, 60))
+            source_root.joinpath("1998-04-12 extra.jpg").write_bytes(_jpeg_with_dimensions(81, 60))
+            search_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=Path(search_summary.search_queue_path))
+            )
+            detail = state.entry_detail("project365:1998-04-12")
+            candidates_by_name = {candidate["filename"]: candidate for candidate in detail["candidates"]}
+
+            state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 original.jpg"]["path"],
+                decision="use_external_original",
+                notes="primary",
+            )
+            linked = state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 extra.jpg"]["path"],
+                decision="external_original_associated_photo",
+                notes="extra",
+                associated_entry_date=detail["entry_date"],
+                associated_date_source="entry",
+            )
+            unlinked = state.save_decision(
+                entry_id=detail["entry_id"],
+                candidate_path=candidates_by_name["1998-04-12 extra.jpg"]["path"],
+                decision="unlink_associated_photo",
+                notes="",
+            )
+
+            rows_by_name = {Path(row["candidate_path"]).name: row for row in state._entry_rows(detail["entry_id"])}
+            self.assertEqual(linked["associated_count"], 1)
+            self.assertEqual(unlinked["selected_count"], 1)
+            self.assertEqual(unlinked["associated_count"], 0)
+            self.assertEqual(rows_by_name["1998-04-12 original.jpg"]["review_decision"], "use_external_original")
+            self.assertEqual(rows_by_name["1998-04-12 extra.jpg"]["review_decision"], "")
+            self.assertEqual(rows_by_name["1998-04-12 extra.jpg"]["associated_entry_date"], "")
+            self.assertEqual(rows_by_name["1998-04-12 extra.jpg"]["associated_date_source"], "")
+            self.assertEqual(
+                state.summary()["pending_decisions"],
+                {"accepted": 1, "rejected": 0, "associated": 0},
+            )
+
     def test_associated_date_choices_only_offer_capture_date(self) -> None:
         choices = picker._associated_date_choices_from_row(
             {
@@ -296,6 +430,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            default_photo_index_folder = base / "Source Data" / "Original Photos matching Project365 Entries"
+            default_photo_index_folder.mkdir(parents=True)
             source_root = base / "external"
             source_root.mkdir()
             source_root.joinpath("1998-04-12 first.png").write_bytes(_tiny_png())
@@ -322,6 +458,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
 
             self.assertEqual(summary["pending_decisions"]["accepted"], 2)
             self.assertEqual(summary["pending_entry_counts"]["accepted"], 1)
+            self.assertEqual(summary["default_photo_index_folder"], str(default_photo_index_folder.resolve()))
             self.assertEqual(accepted_page["returned_count"], 1)
 
     def test_picker_persists_review_crop_offsets_with_selection(self) -> None:
@@ -586,8 +723,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 report_dir=canonical_root / "exports" / "verification_reports",
                 scan_metadata_dates=False,
             )
-            library_root = base / "library"
-            library_root.mkdir()
+            library_root = _project_originals_root(base)
             nearby_payload = _jpeg_with_dimensions(18, 12)
             library_root.joinpath("1998-04-15 nearby.jpg").write_bytes(nearby_payload)
             from project365_photo_library_index import build_photo_library_index, default_index_db
@@ -614,7 +750,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 if candidate["filename"] == "1998-04-15 nearby.jpg"
             )
             self.assertIn("manual_range_3_days", nearby["evidence"])
-            self.assertIn("manual_range_scope_whole_index", nearby["evidence"])
+            self.assertIn("manual_range_scope_filename_index", nearby["evidence"])
             self.assertEqual(nearby["date_distance"], "3")
             nearby_row = next(
                 row
@@ -637,11 +773,10 @@ class Project365OriginalPickerTests(unittest.TestCase):
             source_root = base / "source"
             source_root.mkdir()
             source_root.joinpath("1998-04-12 exact.jpg").write_bytes(_jpeg_with_dimensions(12, 9))
-            library_root = base / "library"
-            library_root.mkdir()
+            library_root = _project_originals_root(base)
             library_root.joinpath("1998-04-15 nearby.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
             library_root.joinpath("1998-04-17 wider.jpg").write_bytes(_jpeg_with_dimensions(20, 14))
-            from project365_photo_library_index import build_photo_library_index, default_index_db
+            from project365_photo_library_index import ExiftoolPhotoMetadata, build_photo_library_index, default_index_db
 
             build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
             report_dir = canonical_root / "exports" / "verification_reports"
@@ -670,11 +805,10 @@ class Project365OriginalPickerTests(unittest.TestCase):
             source_root = base / "source"
             source_root.mkdir()
             source_root.joinpath("1998-04-12 exact.jpg").write_bytes(_jpeg_with_dimensions(12, 9))
-            library_root = base / "library"
-            library_root.mkdir()
+            library_root = _project_originals_root(base)
             library_root.joinpath("1998-04-15 rejected-nearby.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
             library_root.joinpath("1998-04-17 next-range.jpg").write_bytes(_jpeg_with_dimensions(20, 14))
-            from project365_photo_library_index import build_photo_library_index, default_index_db
+            from project365_photo_library_index import ExiftoolPhotoMetadata, build_photo_library_index, default_index_db
 
             build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
             report_dir = canonical_root / "exports" / "verification_reports"
@@ -716,13 +850,21 @@ class Project365OriginalPickerTests(unittest.TestCase):
             source_root.mkdir()
             first_library = base / "first-library"
             second_library = base / "second-library"
+            project_originals_root = _project_originals_root(base)
             first_library.mkdir()
             second_library.mkdir()
+            project_originals_root.joinpath("1998-04-15 rejected-nearby.jpg").write_bytes(
+                _jpeg_with_dimensions(18, 12)
+            )
             first_library.joinpath("1998-04-15 rejected-nearby.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
             second_library.joinpath("1998-04-17 different-album.jpg").write_bytes(_jpeg_with_dimensions(20, 14))
             from project365_photo_library_index import build_photo_library_index, default_index_db
 
-            build_photo_library_index(default_index_db(canonical_root), [first_library, second_library], reset=True)
+            build_photo_library_index(
+                default_index_db(canonical_root),
+                [project_originals_root, first_library, second_library],
+                reset=True,
+            )
             report_dir = canonical_root / "exports" / "verification_reports"
             search_summary = pipeline.build_external_original_search_queue(
                 canonical_root=canonical_root,
@@ -766,8 +908,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             source_root = base / "source"
             source_root.mkdir()
             source_root.joinpath("1998-04-12 exact.jpg").write_bytes(_jpeg_with_dimensions(12, 9))
-            library_root = base / "library"
-            library_root.mkdir()
+            library_root = _project_originals_root(base)
             library_root.joinpath("1998-04-27 rejected-fifteen.jpg").write_bytes(_jpeg_with_dimensions(24, 18))
             library_root.joinpath("1998-05-12 should-stay-manual.jpg").write_bytes(_jpeg_with_dimensions(28, 20))
             from project365_photo_library_index import build_photo_library_index, default_index_db
@@ -818,7 +959,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 report_dir=canonical_root / "exports" / "verification_reports",
                 scan_metadata_dates=False,
             )
-            selected_root = base / "Project 365"
+            selected_root = _project_originals_root(base)
             selected_nested = selected_root / "1998" / "April"
             selected_nested.mkdir(parents=True)
             selected_nested.joinpath("1998-04-27 selected.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
@@ -834,11 +975,11 @@ class Project365OriginalPickerTests(unittest.TestCase):
 
             result = state.expand_date_range("project365:1998-04-12", 15, photo_index_folder=selected_root)
 
-            self.assertEqual(result["added_count"], 1)
-            self.assertEqual(result["photo_index_folder"], str(selected_root))
+            self.assertEqual(result["added_count"], 2)
+            self.assertEqual(result["photo_index_folder"], "")
             self.assertEqual(
                 {candidate["filename"] for candidate in result["entry"]["candidates"]},
-                {"1998-04-12 exact.jpg", "1998-04-27 selected.jpg"},
+                {"1998-04-12 exact.jpg", "1998-04-27 selected.jpg", "1998-04-27 outside.jpg"},
             )
             nearby = next(
                 candidate
@@ -846,7 +987,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 if candidate["filename"] == "1998-04-27 selected.jpg"
             )
             self.assertIn("manual_range_15_days", nearby["evidence"])
-            self.assertIn("manual_range_scope_folder", nearby["evidence"])
+            self.assertIn("manual_range_scope_filename_index", nearby["evidence"])
 
             whole_index = state.expand_date_range(
                 "project365:1998-04-12",
@@ -880,7 +1021,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertFalse(constrained_again["replace_candidates"])
             self.assertEqual(
                 {candidate["filename"] for candidate in constrained_again["entry"]["candidates"]},
-                {"1998-04-12 exact.jpg", "1998-04-27 selected.jpg"},
+                {"1998-04-12 exact.jpg", "1998-04-27 selected.jpg", "1998-04-27 outside.jpg"},
             )
 
     def test_picker_default_index_search_respects_folder_and_whole_index_scope(self) -> None:
@@ -897,8 +1038,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 report_dir=canonical_root / "exports" / "verification_reports",
                 scan_metadata_dates=False,
             )
-            selected_root = base / "Project 365"
-            selected_root.mkdir()
+            selected_root = _project_originals_root(base)
             selected_root.joinpath("1998-04-12 selected.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
             other_root = base / "Other Photos"
             other_root.mkdir()
@@ -920,9 +1060,9 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 search_whole_index=True,
             )
 
-            self.assertEqual(constrained["added_count"], 1)
+            self.assertEqual(constrained["added_count"], 2)
             self.assertFalse(constrained["search_whole_index"])
-            self.assertEqual(constrained["photo_index_folder"], str(selected_root))
+            self.assertEqual(constrained["photo_index_folder"], "")
             self.assertEqual(whole_index["added_count"], 2)
             self.assertTrue(whole_index["search_whole_index"])
             self.assertTrue(whole_index["replace_candidates"])
@@ -941,7 +1081,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 for candidate in whole_index["entry"]["candidates"]
                 if candidate["filename"] == "1998-04-12 outside.jpg"
             )
-            self.assertNotIn("manual_default_scope_folder", selected["evidence"])
+            self.assertNotIn("manual_default_scope_filename_index", selected["evidence"])
             self.assertIn("manual_default_scope_whole_index", selected["evidence"])
             self.assertIn("manual_default_scope_whole_index", outside["evidence"])
 
@@ -953,6 +1093,69 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertEqual(
                 {candidate["filename"] for candidate in restarted_detail["candidates"]},
                 {"1998-04-12 selected.jpg", "1998-04-12 outside.jpg"},
+            )
+
+    def test_picker_reset_decisions_restores_queue_after_whole_index_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "source"
+            source_root.mkdir()
+            source_root.joinpath("1998-04-12 exact.jpg").write_bytes(_jpeg_with_dimensions(12, 9))
+            search_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            library_root = base / "library"
+            library_root.mkdir()
+            library_root.joinpath("1998-04-12 indexed.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
+            library_root.joinpath("1998-04-13 indexed.jpg").write_bytes(_jpeg_with_dimensions(20, 14))
+            from project365_photo_library_index import build_photo_library_index, default_index_db
+
+            build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+            queue_path = Path(search_summary.search_queue_path)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+
+            whole_index = state.expand_date_range(
+                "project365:1998-04-12",
+                1,
+                search_whole_index=True,
+            )
+            reset = state.save_decision(
+                "project365:1998-04-12",
+                "",
+                "clear",
+                "",
+            )
+
+            self.assertTrue(whole_index["replace_candidates"])
+            self.assertEqual(
+                {candidate["filename"] for candidate in whole_index["entry"]["candidates"]},
+                {"1998-04-12 indexed.jpg", "1998-04-13 indexed.jpg"},
+            )
+            self.assertEqual(
+                [candidate["filename"] for candidate in reset["candidates"]],
+                ["1998-04-12 indexed.jpg", "1998-04-12 exact.jpg"],
+            )
+            self.assertNotIn(
+                "project365:1998-04-12",
+                pipeline.load_reject_all_range_state(queue_path.parent),
+            )
+
+            restarted = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            restarted_detail = restarted.entry_detail("project365:1998-04-12", rank_if_needed=False)
+
+            self.assertIsNotNone(restarted_detail)
+            self.assertEqual(
+                [candidate["filename"] for candidate in restarted_detail["candidates"]],
+                ["1998-04-12 indexed.jpg", "1998-04-12 exact.jpg"],
             )
 
     def test_picker_index_expansions_do_not_block_on_visual_ranking(self) -> None:
@@ -976,7 +1179,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
             library_root.joinpath("1998-05-01 manual.jpg").write_bytes(_jpeg_with_dimensions(22, 16))
             from project365_photo_library_index import build_photo_library_index, default_index_db
 
-            build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+            index_db = default_index_db(canonical_root)
+            build_photo_library_index(index_db, [library_root], reset=True)
             state = picker.PickerState(
                 picker.PickerConfig(canonical_root=canonical_root, queue_path=Path(search_summary.search_queue_path))
             )
@@ -1037,7 +1241,54 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertEqual(len(paths), len(set(paths)))
             self.assertEqual(plus_three["candidate_count"], 2)
 
-    def test_picker_default_whole_index_filename_only_uses_filename_dates_only(self) -> None:
+    def test_picker_marks_project_originals_source_candidates_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            project_originals_root = base / "Source Data" / "Original Photos matching Project365 Entries"
+            project_originals_root.mkdir(parents=True)
+            project_candidate = project_originals_root / "1998-04-12 z-source.jpg"
+            project_candidate.write_bytes(_jpeg_with_dimensions(12, 9))
+            search_summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[project_originals_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            library_root = base / "library"
+            library_root.mkdir()
+            library_candidate = library_root / "1998-04-12 a-index.jpg"
+            library_candidate.write_bytes(_jpeg_with_dimensions(18, 12))
+            from project365_photo_library_index import build_photo_library_index, default_index_db
+
+            build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=Path(search_summary.search_queue_path))
+            )
+
+            result = state.expand_default_date_range(
+                "project365:1998-04-12",
+                photo_index_folder=library_root,
+            )
+
+            candidates = result["entry"]["candidates"]
+            self.assertEqual([candidate["filename"] for candidate in candidates], [project_candidate.name, library_candidate.name])
+            self.assertTrue(candidates[0]["project_originals_source"])
+            self.assertFalse(candidates[1]["project_originals_source"])
+            self.assertEqual(result["added_count"], 1)
+
+            manual_candidate = base / "manually-linked.jpg"
+            manual_candidate.write_bytes(_jpeg_with_dimensions(22, 14))
+            linked_detail = state.add_linked_candidate("project365:1998-04-12", str(manual_candidate))
+            self.assertEqual(
+                [candidate["filename"] for candidate in linked_detail["candidates"]],
+                [manual_candidate.name, project_candidate.name, library_candidate.name],
+            )
+            self.assertEqual(linked_detail["candidates"][0]["evidence"], "manual_link")
+            self.assertTrue(linked_detail["candidates"][1]["project_originals_source"])
+
+    def test_picker_default_filename_only_uses_filename_dates_only_without_whole_index_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
@@ -1051,8 +1302,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 report_dir=canonical_root / "exports" / "verification_reports",
                 scan_metadata_dates=False,
             )
-            library_root = base / "library"
-            library_root.mkdir()
+            library_root = _project_originals_root(base)
             filename_date = library_root / "1998-04-12 filename.jpg"
             filename_date.write_bytes(_jpeg_with_dimensions(18, 12))
             filesystem_only = library_root / "unrelated.jpg"
@@ -1068,13 +1318,14 @@ class Project365OriginalPickerTests(unittest.TestCase):
 
             result = state.expand_default_date_range(
                 "project365:1998-04-12",
-                search_whole_index=True,
-                whole_index_filename_only=True,
+                photo_index_folder=library_root,
+                filename_dates_only=True,
             )
 
             self.assertEqual(result["added_count"], 1)
-            self.assertTrue(result["search_whole_index"])
-            self.assertTrue(result["whole_index_filename_only"])
+            self.assertFalse(result["search_whole_index"])
+            self.assertTrue(result["filename_dates_only"])
+            self.assertFalse(result["whole_index_filename_only"])
             self.assertNotIn(
                 filesystem_only.name,
                 {candidate["filename"] for candidate in result["entry"]["candidates"]},
@@ -1087,7 +1338,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertIn("filename_date", candidate["evidence"])
             self.assertIn("manual_default_date_source_filename_only", candidate["evidence"])
 
-    def test_picker_whole_index_date_range_includes_filesystem_only_dates(self) -> None:
+    def test_picker_whole_index_date_range_excludes_modified_dates_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
@@ -1109,7 +1360,14 @@ class Project365OriginalPickerTests(unittest.TestCase):
             os.utime(filesystem_only, (filesystem_timestamp, filesystem_timestamp))
             from project365_photo_library_index import build_photo_library_index, default_index_db
 
-            build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+            index_db = default_index_db(canonical_root)
+            build_photo_library_index(index_db, [library_root], reset=True)
+            with sqlite3.connect(index_db) as connection:
+                connection.execute("DELETE FROM photo_library_dates WHERE file_path = ?", (str(filesystem_only.resolve()),))
+                connection.execute(
+                    "INSERT INTO photo_library_dates (file_path, date, source) VALUES (?, ?, ?)",
+                    (str(filesystem_only.resolve()), "1998-04-15", "filesystem_modified_date"),
+                )
             state = picker.PickerState(
                 picker.PickerConfig(canonical_root=canonical_root, queue_path=Path(search_summary.search_queue_path))
             )
@@ -1120,14 +1378,30 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 search_whole_index=True,
             )
 
-            self.assertEqual(result["added_count"], 1)
+            self.assertEqual(result["added_count"], 0)
             self.assertTrue(result["search_whole_index"])
+            self.assertFalse(result["include_modified_dates"])
+            self.assertNotIn(
+                filesystem_only.name,
+                {candidate["filename"] for candidate in result["entry"]["candidates"]},
+            )
+
+            with_modified = state.expand_date_range(
+                "project365:1998-04-12",
+                3,
+                search_whole_index=True,
+                include_modified_dates=True,
+            )
+
+            self.assertEqual(with_modified["added_count"], 1)
+            self.assertTrue(with_modified["include_modified_dates"])
             candidate = next(
                 candidate
-                for candidate in result["entry"]["candidates"]
+                for candidate in with_modified["entry"]["candidates"]
                 if candidate["filename"] == filesystem_only.name
             )
-            self.assertIn("filesystem_date", candidate["evidence"])
+            self.assertIn("filesystem_modified_date", candidate["evidence"])
+            self.assertIn("manual_range_date_source_modified_date", candidate["evidence"])
             self.assertIn("manual_range_scope_whole_index", candidate["evidence"])
 
     def test_picker_whole_index_date_range_filename_only_excludes_filesystem_dates(self) -> None:
@@ -1163,10 +1437,11 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 "project365:1998-04-12",
                 3,
                 search_whole_index=True,
-                whole_index_filename_only=True,
+                filename_dates_only=True,
             )
 
             self.assertEqual(result["added_count"], 1)
+            self.assertTrue(result["filename_dates_only"])
             self.assertTrue(result["whole_index_filename_only"])
             self.assertNotIn(
                 filesystem_only.name,
@@ -1193,8 +1468,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 report_dir=canonical_root / "exports" / "verification_reports",
                 scan_metadata_dates=False,
             )
-            selected_root = base / "Project 365"
-            selected_root.mkdir()
+            selected_root = _project_originals_root(base)
             selected_root.joinpath("1998-05-01 selected.jpg").write_bytes(_jpeg_with_dimensions(18, 12))
             other_root = base / "Other Photos"
             other_root.mkdir()
@@ -1220,8 +1494,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 photo_index_folder=selected_root,
             )
 
-            self.assertEqual(constrained["added_count"], 1)
-            self.assertEqual(constrained["photo_index_folder"], str(selected_root))
+            self.assertEqual(constrained["added_count"], 2)
+            self.assertEqual(constrained["photo_index_folder"], "")
             self.assertFalse(constrained["search_whole_index"])
             self.assertEqual(whole_index["added_count"], 2)
             self.assertEqual(whole_index["photo_index_folder"], "")
@@ -1239,7 +1513,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertIn("manual_index_date_search", outside["evidence"])
             self.assertEqual(outside["date_distance"], "19")
 
-    def test_picker_custom_index_date_search_includes_filesystem_only_dates(self) -> None:
+    def test_picker_custom_index_date_search_includes_modified_dates_when_selected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
@@ -1271,15 +1545,18 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 "1998-05-01",
                 "1998-05-01",
                 search_whole_index=True,
+                include_modified_dates=True,
             )
 
             self.assertEqual(result["added_count"], 1)
+            self.assertTrue(result["include_modified_dates"])
             candidate = next(
                 candidate
                 for candidate in result["entry"]["candidates"]
                 if candidate["filename"] == filesystem_only.name
             )
-            self.assertIn("filesystem_date", candidate["evidence"])
+            self.assertIn("filesystem_modified_date", candidate["evidence"])
+            self.assertIn("manual_index_date_source_modified_date", candidate["evidence"])
             self.assertIn("manual_index_date_search", candidate["evidence"])
 
     def test_picker_custom_index_date_search_filename_only_excludes_filesystem_dates(self) -> None:
@@ -1316,10 +1593,11 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 "1998-05-01",
                 "1998-05-01",
                 search_whole_index=True,
-                whole_index_filename_only=True,
+                filename_dates_only=True,
             )
 
             self.assertEqual(result["added_count"], 1)
+            self.assertTrue(result["filename_dates_only"])
             self.assertTrue(result["whole_index_filename_only"])
             self.assertNotIn(
                 filesystem_only.name,
@@ -1513,6 +1791,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             )
             state._write_rows(fieldnames, [stale_row])
             self.assertEqual(state.entries(status="needs_action"), [])
+            self.assertEqual(_read_csv(Path(summary.search_queue_path)), [])
             self.assertIsNone(state.entry_detail("project365:1998-04-12"))
             missing_crop_entries = state.crop_entries(crop_filter="missing")
             self.assertEqual([entry["entry_id"] for entry in missing_crop_entries], ["project365:1998-04-12"])
@@ -1534,6 +1813,115 @@ class Project365OriginalPickerTests(unittest.TestCase):
 
             reset = state.reset_crop("project365:1998-04-12", candidate_path)
             self.assertFalse(reset["crop_has_crop"])
+
+    def test_picker_prunes_target_confirmed_by_external_process_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(
+                base,
+                {
+                    "1998-04-12.png": _tiny_png(),
+                    "1998-04-13.png": _tiny_png(),
+                },
+            )
+            source_root = base / "external"
+            source_root.mkdir()
+            source_root.joinpath("1998-04-12 original.png").write_bytes(_tiny_png())
+            source_root.joinpath("1998-04-13 original.png").write_bytes(_tiny_png())
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            queue_path = Path(summary.search_queue_path)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            fieldnames, queue_rows = state._read_rows_with_fieldnames()
+            external_rows = [dict(row) for row in queue_rows if row["entry_id"] == "project365:1998-04-12"]
+            external_rows[0]["review_decision"] = "use_external_original"
+            reviewed_path = base / "external_decision.csv"
+            with reviewed_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(external_rows)
+            pipeline.apply_reviewed_external_references(
+                canonical_root=canonical_root,
+                reviewed_csv=reviewed_path,
+            )
+
+            self.assertIn("project365:1998-04-12", {row["entry_id"] for row in _read_csv(queue_path)})
+            detail = state.entry_detail("project365:1998-04-12")
+
+            self.assertIsNone(detail)
+            self.assertEqual(
+                {row["entry_id"] for row in _read_csv(queue_path)},
+                {"project365:1998-04-13"},
+            )
+            self.assertEqual(
+                [entry["entry_id"] for entry in state.entries(status="needs_action")],
+                ["project365:1998-04-13"],
+            )
+
+    def test_picker_apply_prunes_stale_pending_selection_after_external_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            stale_path = source_root / "1998-04-12 stale.png"
+            winner_path = source_root / "1998-04-12 winner.png"
+            stale_path.write_bytes(_tiny_png())
+            winner_path.write_bytes(_tiny_png() + b"winner")
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            queue_path = Path(summary.search_queue_path)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            detail = state.entry_detail("project365:1998-04-12")
+            stale_candidate = next(candidate for candidate in detail["candidates"] if candidate["path"] == str(stale_path))
+            state.save_decision(
+                entry_id="project365:1998-04-12",
+                candidate_path=stale_candidate["path"],
+                decision="use_external_original",
+                notes="stale local selection",
+            )
+            fieldnames, queue_rows = state._read_rows_with_fieldnames()
+            winner_rows = [dict(row) for row in queue_rows if row["candidate_path"] == str(winner_path)]
+            winner_rows[0]["review_decision"] = "use_external_original"
+            reviewed_path = base / "external_decision.csv"
+            with reviewed_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(winner_rows)
+            pipeline.apply_reviewed_external_references(
+                canonical_root=canonical_root,
+                reviewed_csv=reviewed_path,
+            )
+
+            result = state.apply_decisions()
+
+            self.assertEqual(result["selected_count"], 0)
+            self.assertEqual(_read_csv(queue_path), [])
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                row = connection.execute(
+                    """
+                    SELECT storage_path
+                    FROM media_assets
+                    WHERE entry_id = ?
+                        AND role = 'external_original_reference'
+                    """,
+                    ("project365:1998-04-12",),
+                ).fetchone()
+            self.assertEqual(row, (str(winner_path),))
 
     def test_picker_commit_entry_decision_applies_only_that_linked_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3158,6 +3546,19 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("entry-thumb", picker.PICKER_HTML)
         self.assertIn("shiftKey", picker.PICKER_HTML)
         self.assertIn('aria-label="Open ${escapeHtml(entry.entry_date)}"', picker.PICKER_HTML)
+        self.assertIn('id="imagePreviewModal"', picker.PICKER_HTML)
+        self.assertIn('class="image-preview-modal"', picker.PICKER_HTML)
+        self.assertIn("function openImagePreviewFromTrigger(trigger)", picker.PICKER_HTML)
+        self.assertIn("function closeImagePreview()", picker.PICKER_HTML)
+        self.assertIn("function handleImagePreviewBackdrop(event)", picker.PICKER_HTML)
+        self.assertIn('params.set("max", "2048");', picker.PICKER_HTML)
+        self.assertIn("image.src = largeImageUrl(url);", picker.PICKER_HTML)
+        self.assertIn('image.removeAttribute("src");', picker.PICKER_HTML)
+        self.assertIn('event.key === "Escape"', picker.PICKER_HTML)
+        self.assertIn("data-preview-url", picker.PICKER_HTML)
+        self.assertIn('onclick="openImagePreviewFromTrigger(this)"', picker.PICKER_HTML)
+        self.assertIn(".image-preview-modal.is-open", picker.PICKER_HTML)
+        self.assertIn("cursor: zoom-in", picker.PICKER_HTML)
         self.assertIn("grid-template-columns: 360px minmax(0, 1fr)", picker.PICKER_HTML)
         self.assertIn("white-space: nowrap", picker.PICKER_HTML)
         self.assertIn('id="searchPanelToggle"', picker.PICKER_HTML)
@@ -3194,13 +3595,18 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertNotIn("function pollCropEstimateBatch(jobId)", picker.PICKER_HTML)
         self.assertNotIn('fetchJson("/api/crop-estimate-batch"', picker.PICKER_HTML)
         self.assertIn("async function rejectAllCandidates()", picker.PICKER_HTML)
-        self.assertIn('>Use Project365 photo</button>', picker.PICKER_HTML)
+        self.assertIn("Reject all (R)", picker.PICKER_HTML)
+        self.assertIn('Shortcut: P. Use the photo already stored in the Project365 entry instead of an external original', picker.PICKER_HTML)
+        self.assertIn('>Use Project365 photo (P)</button>', picker.PICKER_HTML)
         self.assertIn('>Reset decisions</button>', picker.PICKER_HTML)
         self.assertIn('data-action="link"', picker.PICKER_HTML)
-        self.assertIn('Matches the origional to the target, but does NOT refresh the page', picker.PICKER_HTML)
-        self.assertIn('${candidate.selected ? "linked" : ""}', picker.PICKER_HTML)
-        self.assertIn('aria-pressed="${candidate.selected ? "true" : "false"}"', picker.PICKER_HTML)
-        self.assertIn('${candidate.selected ? "Linked" : "Link"}', picker.PICKER_HTML)
+        self.assertIn('Link as an additional attachment for this target', picker.PICKER_HTML)
+        self.assertIn('Click to unlink it.', picker.PICKER_HTML)
+        self.assertIn('saveDecision(candidate, "unlink_associated_photo"', picker.PICKER_HTML)
+        self.assertIn('${candidateLinked(candidate) ? "linked" : ""}', picker.PICKER_HTML)
+        self.assertIn('aria-pressed="${candidateLinked(candidate) ? "true" : "false"}"', picker.PICKER_HTML)
+        self.assertIn('${escapeHtml(linkButtonLabel(candidate))}', picker.PICKER_HTML)
+        self.assertIn('card.querySelector(\'[data-action="link"]\').onclick = () => linkAssociatedPhoto(candidate, card);', picker.PICKER_HTML)
         self.assertIn("background: #7f1d1d;", picker.PICKER_HTML)
         self.assertNotIn('data-action="reject">Reject</button>', picker.PICKER_HTML)
         self.assertIn('data-action="commit-entry"', picker.PICKER_HTML)
@@ -3213,7 +3619,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("state.entries = state.entries.filter(entry => entry.entry_id !== entryId);", picker.PICKER_HTML)
         self.assertIn("await loadEntries(nextEntryId, true, committedEntryDate);", picker.PICKER_HTML)
         self.assertNotIn("Commit the linked original for", picker.PICKER_HTML)
-        self.assertIn('confirm(`Reset all pending selections, rejections, and notes for ${state.currentEntry.entry_date}?`)', picker.PICKER_HTML)
+        self.assertIn('confirm(`Reset pending selections, rejections, notes, and candidate expansions for ${state.currentEntry.entry_date}?`)', picker.PICKER_HTML)
         self.assertIn('decision: "keep_project365_export"', picker.PICKER_HTML)
         self.assertIn('fallback: "fallback"', picker.PICKER_HTML)
         self.assertIn("function formatPriorMatcher(entry)", picker.PICKER_HTML)
@@ -3231,11 +3637,18 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertNotIn('id="pendingDecisionCount"', picker.PICKER_HTML)
         self.assertNotIn("#applyDecisionsButton {\n  max-width:", picker.PICKER_HTML)
         self.assertIn('fetchJson("/api/apply-decisions"', picker.PICKER_HTML)
-        self.assertNotIn('id="previousEntryButton"', picker.PICKER_HTML)
-        self.assertNotIn('id="nextEntryButton"', picker.PICKER_HTML)
+        self.assertIn('id="previousEntryButton"', picker.PICKER_HTML)
+        self.assertIn('id="nextEntryButton"', picker.PICKER_HTML)
         self.assertIn('id="entryPosition"', picker.PICKER_HTML)
         self.assertIn("function currentEntryPositionLabel()", picker.PICKER_HTML)
-        self.assertNotIn("function selectAdjacentEntry(direction)", picker.PICKER_HTML)
+        self.assertIn("function selectAdjacentEntry(direction)", picker.PICKER_HTML)
+        self.assertIn("function handlePickerKeyboardShortcut(event)", picker.PICKER_HTML)
+        self.assertIn('event.key === "ArrowLeft"', picker.PICKER_HTML)
+        self.assertIn('event.key === "ArrowRight"', picker.PICKER_HTML)
+        self.assertIn('event.key.toLowerCase() === "r"', picker.PICKER_HTML)
+        self.assertIn('event.key.toLowerCase() === "p"', picker.PICKER_HTML)
+        self.assertIn('handled = runPickerShortcutButton("fallbackButton", () => document.getElementById("fallbackButton").click());', picker.PICKER_HTML)
+        self.assertIn('document.addEventListener("keydown", handlePickerKeyboardShortcut);', picker.PICKER_HTML)
         self.assertIn('id="candidateFilter"', picker.PICKER_HTML)
         self.assertIn('id="candidateEvidenceFilter"', picker.PICKER_HTML)
         self.assertIn('id="candidateFolderFilter"', picker.PICKER_HTML)
@@ -3243,6 +3656,30 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('id="candidateLocationOnly"', picker.PICKER_HTML)
         self.assertIn("const candidates = Array.isArray(entry?.candidates) ? entry.candidates : [];", picker.PICKER_HTML)
         self.assertIn("function candidateMatchesLocation(candidate)", picker.PICKER_HTML)
+        self.assertIn("activeCandidateTimeFilters: new Set()", picker.PICKER_HTML)
+        self.assertIn("function activeCandidateTimeFilterLabels()", picker.PICKER_HTML)
+        self.assertIn("function candidateMatchesActiveTimeFilters(candidate)", picker.PICKER_HTML)
+        self.assertIn("function candidateTimeOfDayMinutes(candidate)", picker.PICKER_HTML)
+        self.assertIn("function candidateTimeMatchesFilter(minutes, filter)", picker.PICKER_HTML)
+        self.assertIn('if (filter === "morning") return minutes >= 4 * 60 && minutes < 8 * 60;', picker.PICKER_HTML)
+        self.assertIn('if (filter === "midday") return minutes >= 8 * 60 && minutes < 12 * 60;', picker.PICKER_HTML)
+        self.assertIn('if (filter === "early-afternoon") return minutes >= 12 * 60 && minutes < 16 * 60;', picker.PICKER_HTML)
+        self.assertIn('if (filter === "late-afternoon") return minutes >= 16 * 60 && minutes < 20 * 60;', picker.PICKER_HTML)
+        self.assertIn('if (filter === "early-evening") return minutes >= 20 * 60;', picker.PICKER_HTML)
+        self.assertIn('if (filter === "late-evening") return minutes < 4 * 60;', picker.PICKER_HTML)
+        self.assertIn("function toggleCandidateTimeFilter(button)", picker.PICKER_HTML)
+        self.assertIn("function resetCandidateTimeFilters()", picker.PICKER_HTML)
+        self.assertIn("resetCandidateTimeFilters();", picker.PICKER_HTML)
+        self.assertIn("function updateCandidateTimeFilterButtons()", picker.PICKER_HTML)
+        self.assertIn("candidateMatchesActiveTimeFilters(candidate)", picker.PICKER_HTML)
+        self.assertIn('document.querySelectorAll("[data-time-filter]").forEach(button => {', picker.PICKER_HTML)
+        self.assertIn("function candidateScopeCandidates(candidates)", picker.PICKER_HTML)
+        self.assertIn("function candidateMatchesCurrentIndexDefaultScope(candidate)", picker.PICKER_HTML)
+        self.assertIn("function candidateInProjectOriginalsFolder(candidate)", picker.PICKER_HTML)
+        self.assertIn("function candidateFilenameStartsWithCurrentScopeDate(candidate)", picker.PICKER_HTML)
+        self.assertIn("function currentFilenameDateScopeDates()", picker.PICKER_HTML)
+        self.assertIn("const scopedCandidates = candidateScopeCandidates(candidates);", picker.PICKER_HTML)
+        self.assertIn("renderCandidateFolderFilter(scopedCandidates);", picker.PICKER_HTML)
         self.assertIn("candidate.has_embedded_geolocation", picker.PICKER_HTML)
         self.assertIn('<option value="capture_time">Capture time</option>', picker.PICKER_HTML)
         self.assertIn('function candidateCaptureTime(candidate)', picker.PICKER_HTML)
@@ -3313,23 +3750,43 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('data-range-days="5"', picker.PICKER_HTML)
         self.assertIn('data-range-days="15"', picker.PICKER_HTML)
         self.assertIn('data-range-days="30"', picker.PICKER_HTML)
+        self.assertIn('class="time-filter-controls" role="group" aria-label="Filter candidates by time of day"', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="morning" aria-pressed="false" title="Morning, 4:00 AM to 7:59 AM">4-8a</button>', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="midday" aria-pressed="false" title="Midday, 8:00 AM to 11:59 AM">8-12p</button>', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="early-afternoon" aria-pressed="false" title="Early afternoon, 12:00 PM to 3:59 PM">12-4p</button>', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="late-afternoon" aria-pressed="false" title="Late afternoon, 4:00 PM to 7:59 PM">4-8p</button>', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="early-evening" aria-pressed="false" title="Early evening, 8:00 PM to 11:59 PM">8-12a</button>', picker.PICKER_HTML)
+        self.assertIn('data-time-filter="late-evening" aria-pressed="false" title="Late evening, 12:00 AM to 3:59 AM">12-4a</button>', picker.PICKER_HTML)
         self.assertLess(
             picker.PICKER_HTML.index('id="defaultDateRange"'),
             picker.PICKER_HTML.index('data-range-days="1"'),
         )
+        self.assertLess(
+            picker.PICKER_HTML.index('data-range-days="30"'),
+            picker.PICKER_HTML.index('class="time-filter-controls"'),
+        )
+        self.assertLess(
+            picker.PICKER_HTML.index('class="time-filter-controls"'),
+            picker.PICKER_HTML.index('class="manual-date-search"'),
+        )
         self.assertIn(".date-range-controls .action-button.used-range", picker.PICKER_HTML)
+        self.assertIn('.time-filter-controls .action-button[aria-pressed="true"]', picker.PICKER_HTML)
         self.assertIn(".crawl-status.is-running", picker.PICKER_HTML)
         self.assertIn("async function expandDefaultDateRange()", picker.PICKER_HTML)
-        self.assertIn('id="indexSearchFilenameOnly"', picker.PICKER_HTML)
+        self.assertNotIn('id="indexSearchFilenameOnly"', picker.PICKER_HTML)
+        self.assertIn('id="indexSearchModifiedDate"', picker.PICKER_HTML)
         self.assertIn('class="index-search-options"', picker.PICKER_HTML)
-        self.assertIn("> file name only</label>", picker.PICKER_HTML)
-        self.assertIn("grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) max-content auto", picker.PICKER_HTML)
+        self.assertIn("> Include modified dates</label>", picker.PICKER_HTML)
+        self.assertNotIn("> Other filename dates only</label>", picker.PICKER_HTML)
+        self.assertIn("grid-template-columns: 104px 104px max-content auto", picker.PICKER_HTML)
+        self.assertIn(".manual-date-search input[type=\"date\"]", picker.PICKER_HTML)
+        self.assertIn("box-sizing: border-box;", picker.PICKER_HTML)
         self.assertIn('fetchJson("/api/expand-default-date-range"', picker.PICKER_HTML)
         self.assertIn('document.getElementById("defaultDateRange").onclick = expandDefaultDateRange', picker.PICKER_HTML)
-        self.assertIn('document.getElementById("indexSearchFilenameOnly").onchange = event => {', picker.PICKER_HTML)
-        self.assertIn('if (event.currentTarget.checked) {', picker.PICKER_HTML)
-        self.assertIn('wholeIndex.checked = true;', picker.PICKER_HTML)
-        self.assertIn('wholeIndex.dataset.userChanged = "1";', picker.PICKER_HTML)
+        self.assertNotIn('document.getElementById("indexSearchFilenameOnly").onchange', picker.PICKER_HTML)
+        self.assertNotIn('wholeIndex.checked = true;', picker.PICKER_HTML)
+        self.assertIn('document.getElementById("indexSearchModifiedDate").onchange = () => {', picker.PICKER_HTML)
+        self.assertIn("renderCandidateGrid();", picker.PICKER_HTML)
         self.assertIn('setCrawlStatus(`Searching ${scopeLabel} from ${startDate} to ${endDate}.`, true);', picker.PICKER_HTML)
         self.assertIn('setCrawlStatus(`Expanding ${scopeLabel} candidates to ±${days} days.`, true);', picker.PICKER_HTML)
         self.assertIn("function updateDateRangeButtons(entry)", picker.PICKER_HTML)
@@ -3338,12 +3795,15 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("function defaultEvidenceMatchesCurrentIndexScope(evidence)", picker.PICKER_HTML)
         self.assertIn("function rangeEvidenceMatchesCurrentIndexScope(evidence)", picker.PICKER_HTML)
         self.assertIn("function currentIndexSearchWholeIndex()", picker.PICKER_HTML)
-        self.assertIn("function currentIndexFilenameOnly()", picker.PICKER_HTML)
+        self.assertNotIn("function currentIndexFilenameOnly()", picker.PICKER_HTML)
+        self.assertIn("function currentIndexIncludeModifiedDates()", picker.PICKER_HTML)
+        self.assertIn("function currentIndexRangeDateSourceLabel()", picker.PICKER_HTML)
+        self.assertIn("function currentIndexDateSourceLabel()", picker.PICKER_HTML)
         self.assertIn("wholeIndexCheckbox.checked = false;", picker.PICKER_HTML)
-        self.assertIn("filenameOnlyCheckbox.checked = false;", picker.PICKER_HTML)
-        self.assertIn("filenameOnlyCheckbox.disabled = !state.currentEntry;", picker.PICKER_HTML)
-        self.assertNotIn("filenameOnlyCheckbox.disabled = !checkbox.checked || !state.currentEntry;", picker.PICKER_HTML)
-        self.assertIn("const includeUnscopedRangeState = !state.activePhotoIndexFolder && currentIndexSearchWholeIndex();", picker.PICKER_HTML)
+        self.assertIn("modifiedDateCheckbox.checked = false;", picker.PICKER_HTML)
+        self.assertNotIn("checkbox.checked = !constrained;", picker.PICKER_HTML)
+        self.assertIn("modifiedDateCheckbox.disabled = !state.currentEntry || !wholeIndex;", picker.PICKER_HTML)
+        self.assertIn("const includeUnscopedRangeState = currentIndexSearchWholeIndex();", picker.PICKER_HTML)
         self.assertIn("if (!rangeEvidenceMatchesCurrentIndexScope(evidence)) continue;", picker.PICKER_HTML)
         self.assertIn("updateDateRangeButtons(state.currentEntry);", picker.PICKER_HTML)
         self.assertIn('button.classList.toggle("used-range", used);', picker.PICKER_HTML)
@@ -3352,19 +3812,34 @@ class Project365OriginalPickerTests(unittest.TestCase):
             picker.PICKER_HTML.index('id="photoDropTarget"'),
         )
         self.assertIn('fetchJson("/api/expand-date-range"', picker.PICKER_HTML)
-        self.assertIn("activePhotoIndexFolder", picker.PICKER_HTML)
+        self.assertIn("defaultPhotoIndexFolder", picker.PICKER_HTML)
         self.assertIn('params.get("photo_index_folder")', picker.PICKER_HTML)
+        self.assertIn('params.has("photo_index_folder")', picker.PICKER_HTML)
+        self.assertIn('Object.prototype.hasOwnProperty.call(summary, "default_photo_index_folder")', picker.PICKER_HTML)
+        self.assertIn('Object.prototype.hasOwnProperty.call(summary, "active_photo_index_folder")', picker.PICKER_HTML)
         self.assertIn('window.localStorage.setItem("project365.activePhotoIndexFolder"', picker.PICKER_HTML)
-        self.assertIn('window.localStorage.getItem("project365.activePhotoIndexFolder")', picker.PICKER_HTML)
+        self.assertNotIn('window.localStorage.getItem("project365.activePhotoIndexFolder")', picker.PICKER_HTML)
         self.assertIn(
-            "const payload = {entry_id: entryId, days, search_whole_index: wholeIndex, whole_index_filename_only: filenameOnly};",
+            "const payload = {entry_id: entryId, days, search_whole_index: wholeIndex, filename_dates_only: filenameOnly, include_modified_dates: includeModifiedDates};",
             picker.PICKER_HTML,
         )
-        self.assertIn("whole_index_filename_only: filenameOnly", picker.PICKER_HTML)
-        self.assertIn("if (state.activePhotoIndexFolder && !wholeIndex) payload.photo_index_folder = state.activePhotoIndexFolder;", picker.PICKER_HTML)
+        self.assertEqual(picker.PICKER_HTML.count("const filenameOnly = !wholeIndex;"), 3)
+        self.assertNotIn("currentIndexFilenameOnly", picker.PICKER_HTML)
+        self.assertIn("function ensureIndexSearchScopeAvailable()", picker.PICKER_HTML)
+        self.assertIn("filename_dates_only: filenameOnly", picker.PICKER_HTML)
+        self.assertIn("include_modified_dates: includeModifiedDates", picker.PICKER_HTML)
+        self.assertNotIn("payload.photo_index_folder = state.activePhotoIndexFolder", picker.PICKER_HTML)
         self.assertIn("state.entryDetailCache.set(entryId, result.entry);", picker.PICKER_HTML)
         self.assertNotIn('png-candidate', picker.PICKER_HTML)
-        self.assertIn('className = `candidate-card ${candidate.selected ? "selected" : ""}`', picker.PICKER_HTML)
+        self.assertIn('className = `candidate-card ${candidate.selected ? "selected" : ""} ${candidateProjectOriginalsSource(candidate) ? "project-originals-source" : ""}`', picker.PICKER_HTML)
+        self.assertIn("function candidateMatchesTargetDate(candidate)", picker.PICKER_HTML)
+        self.assertIn("function candidateTargetDateRank(candidate)", picker.PICKER_HTML)
+        self.assertIn("const targetDateCompare = candidateTargetDateRank(left) - candidateTargetDateRank(right);", picker.PICKER_HTML)
+        self.assertNotIn(".candidate-card.entry-date-match", picker.PICKER_HTML)
+        self.assertIn("function candidateProjectOriginalsSource(candidate)", picker.PICKER_HTML)
+        self.assertIn(".candidate-card.project-originals-source", picker.PICKER_HTML)
+        self.assertIn("#b42318", picker.PICKER_HTML)
+        self.assertIn("Original Photos matching Project365 Entries", picker.PICKER_HTML)
         self.assertIn('<button class="action-button primary" data-action="select">Select</button>', picker.PICKER_HTML)
         self.assertIn('class="action-button ${candidate.associated ? "flagged" : ""}" data-action="flag"', picker.PICKER_HTML)
         self.assertNotIn('data-action="toggle-notes"', picker.PICKER_HTML)
@@ -3388,6 +3863,11 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('fetchJson("/api/link-candidate"', picker.PICKER_HTML)
         self.assertIn('fetchJson("/api/import-dropped-candidate"', picker.PICKER_HTML)
         self.assertIn("Photo copied and accepted", picker.PICKER_HTML)
+        self.assertIn(".photo-drop-row", picker.PICKER_HTML)
+        self.assertIn("grid-template-columns: minmax(0, 4fr) minmax(76px, 1fr)", picker.PICKER_HTML)
+        self.assertIn('id="photoLinkDropTarget"', picker.PICKER_HTML)
+        self.assertIn("photo-link-drag-lane", picker.PICKER_HTML)
+        self.assertIn("Drag here to link instead", picker.PICKER_HTML)
         self.assertIn("candidateRenderLimit: 40", picker.PICKER_HTML)
         self.assertIn("candidateRenderObserver: null", picker.PICKER_HTML)
         self.assertIn("function observeCandidateRenderSentinel", picker.PICKER_HTML)
@@ -3398,6 +3878,25 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("renderedTimestampKeys.has(candidateTimestampGroupKey(candidate))", picker.PICKER_HTML)
         self.assertNotIn("Load More Candidates", picker.PICKER_HTML)
         self.assertIn('dropTarget.addEventListener("drop", handlePhotoDrop)', picker.PICKER_HTML)
+        self.assertIn('linkDropTarget.addEventListener("drop", handleLinkDrop)', picker.PICKER_HTML)
+        self.assertIn("let photoDropDragDepth = 0;", picker.PICKER_HTML)
+        self.assertIn("let photoLinkDragDepth = 0;", picker.PICKER_HTML)
+        self.assertIn("photoDropDragDepth += 1;", picker.PICKER_HTML)
+        self.assertIn("photoLinkDragDepth += 1;", picker.PICKER_HTML)
+        self.assertIn("photoDropDragDepth = Math.max(0, photoDropDragDepth - 1);", picker.PICKER_HTML)
+        self.assertIn("photoLinkDragDepth = Math.max(0, photoLinkDragDepth - 1);", picker.PICKER_HTML)
+        self.assertIn('dropTarget.addEventListener("dragend"', picker.PICKER_HTML)
+        self.assertIn('linkDropTarget.addEventListener("dragend"', picker.PICKER_HTML)
+        self.assertIn('event.dataTransfer.dropEffect = "link";', picker.PICKER_HTML)
+        self.assertIn("function handleLinkDrop(event)", picker.PICKER_HTML)
+        self.assertIn("function droppedLinkPath(event)", picker.PICKER_HTML)
+        self.assertIn("Use Choose photo to link without copying", picker.PICKER_HTML)
+        self.assertIn("previousEntryStack: []", picker.PICKER_HTML)
+        self.assertIn("function rememberPreviousEntry(entry)", picker.PICKER_HTML)
+        self.assertIn("function loadRememberedPreviousEntry()", picker.PICKER_HTML)
+        self.assertIn("!state.previousEntryStack.length", picker.PICKER_HTML)
+        self.assertIn("function candidateManualLinkRank(candidate)", picker.PICKER_HTML)
+        self.assertIn("manualLinkCompare", picker.PICKER_HTML)
         self.assertNotIn('document.addEventListener("drop", handlePhotoDrop)', picker.PICKER_HTML)
         self.assertIn('function clearUrlEntryScope(status = "needs_action")', picker.PICKER_HTML)
         self.assertIn("function changeStatusFilter()", picker.PICKER_HTML)
@@ -3411,9 +3910,14 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("clearUrlEntryScope(filter);", picker.PICKER_HTML)
         self.assertIn("return loadEntries(\"\", false, scopedEntryDate);", picker.PICKER_HTML)
         self.assertIn("const laterEntry = state.entries.find(entry => entry.entry_date > preferredEntryDate);", picker.PICKER_HTML)
+        self.assertIn("function scheduleCandidateScrollReset()", picker.PICKER_HTML)
         self.assertIn("function resetCandidateScroll()", picker.PICKER_HTML)
-        self.assertIn("if (entryChanged) resetCandidateScroll();", picker.PICKER_HTML)
+        self.assertIn("if (entryChanged) {", picker.PICKER_HTML)
+        self.assertIn("scheduleCandidateScrollReset();", picker.PICKER_HTML)
+        self.assertIn("window.requestAnimationFrame(() => {", picker.PICKER_HTML)
+        self.assertIn("window.setTimeout(resetCandidateScroll, 0);", picker.PICKER_HTML)
         self.assertIn('document.querySelector(".workspace")', picker.PICKER_HTML)
+        self.assertIn("window.scrollTo(0, 0);", picker.PICKER_HTML)
         self.assertIn('id="commitCropButton"', picker.CROP_HTML)
         self.assertIn('id="pendingCropCommitCount"', picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop-commit"', picker.CROP_HTML)
@@ -3468,6 +3972,67 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertFalse(picker._has_embedded_geolocation(plain_path))
             self.assertFalse(picker._has_embedded_geolocation(base / "missing.jpg"))
 
+    def test_picker_uses_photo_index_geolocation_for_existing_heic_queue_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            library_root = base / "library"
+            library_root.mkdir()
+            candidate_path = library_root / "1998-04-12 indexed.heic"
+            candidate_path.write_bytes(_tiny_png())
+            from project365_photo_library_index import ExiftoolPhotoMetadata, build_photo_library_index, default_index_db
+
+            with mock.patch.object(
+                picker,
+                "_has_embedded_geolocation",
+                return_value=False,
+            ), mock.patch(
+                "project365_photo_library_index._exiftool_photo_metadata",
+                return_value={
+                    str(candidate_path.resolve()): ExiftoolPhotoMetadata(
+                        capture_timestamp="1998-04-12T08:09:10",
+                        capture_timestamp_source="exif_datetime_original",
+                        gps_latitude=25.0962305555556,
+                        gps_longitude=121.587294444444,
+                        gps_source="composite_gps",
+                    )
+                },
+            ):
+                build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+                with sqlite3.connect(default_index_db(canonical_root)) as connection:
+                    connection.execute("UPDATE photo_library_files SET has_gps = 0")
+                queue_path = canonical_root / "exports" / "verification_reports" / "queue.csv"
+                _write_queue(queue_path)
+                with queue_path.open(newline="") as handle:
+                    fieldnames = list(csv.DictReader(handle).fieldnames or [])
+                with queue_path.open("a", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writerow(
+                        {
+                            "entry_id": "project365:1998-04-12",
+                            "entry_date": "1998-04-12",
+                            "project365_media_asset_id": "project365:1998-04-12:project365_export_png",
+                            "candidate_path": str(candidate_path),
+                            "candidate_filename": candidate_path.name,
+                            "candidate_sha256": hashlib.sha256(_tiny_png()).hexdigest(),
+                            "byte_size": str(candidate_path.stat().st_size),
+                            "mime_type": "image/heic",
+                            "filename_dates": "1998-04-12",
+                            "media_creation_dates": "1998-04-12",
+                            "evidence": "photo_library_index",
+                        }
+                    )
+
+                state = picker.PickerState(
+                    picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+                )
+                detail = state.entry_detail("project365:1998-04-12")
+                candidate = detail["candidates"][0]
+                facts = state.candidate_facts([candidate["token"]])
+
+            self.assertTrue(candidate["has_embedded_geolocation"])
+            self.assertTrue(facts[candidate["token"]]["has_embedded_geolocation"])
+
     def test_picker_links_original_image_without_copying_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -3515,34 +4080,43 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
             )
 
-            detail = state.add_copied_candidate(
-                "project365:1998-04-12",
-                "known-original.png",
-                "image/png",
-                _tiny_png(),
-            )
+            with mock.patch.object(picker, "_set_project_addition_timestamps") as timestamp_mock:
+                detail = state.add_copied_candidate(
+                    "project365:1998-04-12",
+                    "known-original.png",
+                    "image/png",
+                    _tiny_png(),
+                )
 
             copied_path = (
                 base
                 / "Source Data"
                 / "Original Photos matching Project365 Entries"
                 / "1998-04"
-                / "known-original.png"
+                / "1998-04-12 000001 (Project365 project file addition).png"
+            )
+            timestamp_mock.assert_called_once_with(
+                mock.ANY,
+                dt.datetime(1998, 4, 12, 0, 0, 1),
             )
             self.assertEqual(detail["candidate_count"], 1)
             self.assertEqual(detail["status"], "selected")
             self.assertTrue(detail["candidates"][0]["selected"])
             self.assertEqual(detail["candidates"][0]["evidence"], "manual_drop_copy")
             self.assertEqual(Path(detail["candidates"][0]["path"]), copied_path.resolve())
+            self.assertEqual(detail["candidates"][0]["filename_dates"], "1998-04-12")
+            self.assertEqual(detail["candidates"][0]["media_creation_dates"], "")
+            self.assertEqual(detail["candidates"][0]["filesystem_dates"], "1998-04-12")
             self.assertEqual(copied_path.read_bytes(), _tiny_png())
             self.assertEqual(queue_path.read_bytes(), before_queue)
 
-            repeated = state.add_copied_candidate(
-                "project365:1998-04-12",
-                "known-original.png",
-                "image/png",
-                _tiny_png(),
-            )
+            with mock.patch.object(picker, "_set_project_addition_timestamps"):
+                repeated = state.add_copied_candidate(
+                    "project365:1998-04-12",
+                    "known-original.png",
+                    "image/png",
+                    _tiny_png(),
+                )
             self.assertEqual(repeated["candidate_count"], 1)
 
     def test_picker_preserves_both_dropped_files_with_same_name(self) -> None:
@@ -3556,15 +4130,46 @@ class Project365OriginalPickerTests(unittest.TestCase):
                 picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
             )
 
-            state.add_copied_candidate(
-                "project365:1998-04-12", "photo.jpg", "image/jpeg", _jpeg_with_dimensions(12, 9)
-            )
-            detail = state.add_copied_candidate(
-                "project365:1998-04-12", "photo.jpg", "image/jpeg", _jpeg_with_dimensions(20, 15)
-            )
+            with mock.patch.object(picker, "_set_project_addition_timestamps"):
+                state.add_copied_candidate(
+                    "project365:1998-04-12", "photo.jpg", "image/jpeg", _jpeg_with_dimensions(12, 9)
+                )
+                detail = state.add_copied_candidate(
+                    "project365:1998-04-12", "photo.jpg", "image/jpeg", _jpeg_with_dimensions(20, 15)
+                )
 
             self.assertEqual(detail["candidate_count"], 2)
             self.assertEqual(len({candidate["path"] for candidate in detail["candidates"]}), 2)
+            self.assertTrue(
+                all(
+                    Path(candidate["path"]).name.startswith(
+                        "1998-04-12 000001 (Project365 project file addition)"
+                    )
+                    for candidate in detail["candidates"]
+                )
+            )
+
+    def test_project_addition_timestamps_only_set_file_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "photo.jpg"
+            path.write_bytes(_jpeg_with_dimensions(12, 9))
+            completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+            with (
+                mock.patch.object(picker.shutil, "which", return_value="/usr/local/bin/exiftool"),
+                mock.patch.object(picker.subprocess, "run", return_value=completed) as run_mock,
+                mock.patch.object(picker.os, "utime") as utime_mock,
+            ):
+                picker._set_project_addition_timestamps(path, dt.datetime(1998, 4, 12, 0, 0, 1))
+
+            command = run_mock.call_args.args[0]
+            self.assertIn("-FileCreateDate=1998:04:12 00:00:01", command)
+            self.assertIn("-FileModifyDate=1998:04:12 00:00:01", command)
+            self.assertNotIn("-AllDates=1998:04:12 00:00:01", command)
+            self.assertFalse(any("DateTimeOriginal" in part for part in command))
+            self.assertFalse(any(part.startswith("-CreateDate=") for part in command))
+            self.assertFalse(any(part.startswith("-ModifyDate=") for part in command))
+            utime_mock.assert_called_once()
 
     def test_picker_rejects_non_image_drop_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3679,7 +4284,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("entryDetailCache: new Map()", picker.PICKER_HTML)
         self.assertIn("function preloadNextEntry()", picker.PICKER_HTML)
         self.assertIn("new IntersectionObserver", picker.PICKER_HTML)
-        self.assertIn('data-src="/image/${candidate.token}?max=640"', picker.PICKER_HTML)
+        self.assertIn('const candidateImageUrl = `/image/${candidate.token}?max=640`;', picker.PICKER_HTML)
+        self.assertIn('data-src="${escapeHtml(candidateImageUrl)}"', picker.PICKER_HTML)
         self.assertIn('?max=96', picker.PICKER_HTML)
         self.assertIn('?max=640', picker.PICKER_HTML)
         self.assertIn("function nextEntryIdAfterCurrent()", picker.PICKER_HTML)
@@ -3687,7 +4293,9 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('decision === "use_external_original"', picker.PICKER_HTML)
         self.assertIn("const currentEntryBeforeSave = state.currentEntry;", picker.PICKER_HTML)
         self.assertIn("Array.isArray(updatedEntry.candidates) ? updatedEntry.candidates : currentCandidates", picker.PICKER_HTML)
-        self.assertIn("item.selected = item.path === candidate.path;", picker.PICKER_HTML)
+        self.assertIn('decision === "external_original_associated_photo"', picker.PICKER_HTML)
+        self.assertIn('async function linkAssociatedPhoto(candidate, card)', picker.PICKER_HTML)
+        self.assertIn('associated_date_source: "entry"', picker.PICKER_HTML)
         self.assertIn('decision === "keep_project365_export"', picker.PICKER_HTML)
         self.assertIn('updatedEntry.status === "rejected"', picker.PICKER_HTML)
 
@@ -3794,6 +4402,15 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('handled = runCropShortcutButton("minimalFitButton", minimalFitCurrentCrop);', picker.CROP_HTML)
         self.assertIn('} else if (key === "m") {', picker.CROP_HTML)
         self.assertIn('handled = runCropShortcutButton("minimalMoveButton", minimalMoveCurrentCrop);', picker.CROP_HTML)
+        self.assertIn('id="previousCropEntryButton"', picker.CROP_HTML)
+        self.assertIn('id="nextCropEntryButton"', picker.CROP_HTML)
+        self.assertIn("Previous entry (Left)", picker.CROP_HTML)
+        self.assertIn("Next entry (Right)", picker.CROP_HTML)
+        self.assertIn("function selectAdjacentCropEntry(direction)", picker.CROP_HTML)
+        self.assertIn('} else if (event.key === "ArrowLeft") {', picker.CROP_HTML)
+        self.assertIn('handled = runCropShortcutButton("previousCropEntryButton", () => selectAdjacentCropEntry(-1));', picker.CROP_HTML)
+        self.assertIn('} else if (event.key === "ArrowRight") {', picker.CROP_HTML)
+        self.assertIn('handled = runCropShortcutButton("nextCropEntryButton", () => selectAdjacentCropEntry(1));', picker.CROP_HTML)
         self.assertIn('} else if (event.key === "Enter") {', picker.CROP_HTML)
         self.assertIn('handled = runCropShortcutButton("saveCropButton", saveCropForCurrentCandidate);', picker.CROP_HTML)
         self.assertIn('document.addEventListener("keydown", handleCropKeyboardShortcut);', picker.CROP_HTML)
@@ -3953,6 +4570,10 @@ def _write_queue(path: Path) -> None:
         "filename_dates",
         "media_creation_dates",
         "filesystem_dates",
+        "gps_latitude",
+        "gps_longitude",
+        "gps_source",
+        "has_gps",
         "evidence",
         "review_decision",
         "review_notes",
@@ -3989,6 +4610,12 @@ def _import_sample(base: Path, members: dict[str, bytes]) -> Path:
         canonical_root=canonical_root,
     )
     return canonical_root
+
+
+def _project_originals_root(base: Path) -> Path:
+    root = base / "Source Data" / "Original Photos matching Project365 Entries"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _insert_people(canonical_root: Path, entry_id: str, names: list[str]) -> None:

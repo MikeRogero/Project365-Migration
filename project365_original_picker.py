@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import shutil
 import sqlite3
@@ -35,6 +36,7 @@ from project365_original_reference_pipeline import (
     _external_decision_id,
     apply_reviewed_external_references,
     build_external_original_search_queue,
+    clear_reject_all_range_state,
     load_reject_all_range_state,
     prune_applied_review_queue,
     record_reject_all_range_state,
@@ -63,6 +65,27 @@ MAX_MANUAL_INDEX_DATE_SEARCH_DAYS = 366
 SEARCH_RANGE_EVIDENCE_RE = re.compile(r"(?:manual_range|auto_range|date_within)_(\d+)_days")
 BUTTON_RANGE_EVIDENCE_RE = re.compile(r"(?:manual_range|auto_range)_(\d+)_days")
 APPLY_DECISIONS_CONFIRM_TOKEN = "apply-reviewed-decisions"
+PROJECT_ORIGINALS_SOURCE_PARTS = ("Source Data", "Original Photos matching Project365 Entries")
+PROJECT_ORIGINALS_SOURCE_RELATIVE_PATH = Path(*PROJECT_ORIGINALS_SOURCE_PARTS)
+PROJECT_ADDITION_FILENAME_MARKER = "Project365 project file addition"
+PROJECT_ADDITION_DROP_TIME = dt.time(0, 0, 1)
+
+
+def project_originals_source_path(canonical_root: Path) -> Path:
+    return (Path(canonical_root).parent / PROJECT_ORIGINALS_SOURCE_RELATIVE_PATH).resolve()
+
+
+def project_originals_source_folder(canonical_root: Path) -> str:
+    folder = project_originals_source_path(canonical_root)
+    return str(folder) if folder.is_dir() else ""
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
 
 
 @dataclass(frozen=True)
@@ -228,11 +251,13 @@ class PickerState:
         self._crop_staging = self._load_crop_staging()
         self._queue_shards = PickerQueueShards(config.queue_path, config.canonical_root)
         self._source_media = self._load_source_media()
-        self._confirmed_original_entry_ids_cache: set[str] | None = None
+        self._completed_external_entry_ids_cache: set[str] | None = None
+        self._completed_queue_prune_signature: tuple[tuple[int, int] | None, tuple[int, int] | None] | None = None
         self._people_cache_signature: tuple[int, int] | None = None
         self._people_by_entry: dict[str, list[str]] = {}
 
     def summary(self) -> dict[str, Any]:
+        self._prune_completed_queue_entries_if_needed()
         status_counts: dict[str, int] = {}
         entry_count = 0
         pending = {"accepted": 0, "rejected": 0, "associated": 0}
@@ -279,9 +304,11 @@ class PickerState:
             "pending_entry_counts": pending_entries,
             "pending_crop_commits": self.pending_crop_commits(),
             "queue_path": str(self.config.queue_path),
+            "default_photo_index_folder": project_originals_source_folder(self.config.canonical_root),
         }
 
     def batches(self) -> dict[str, Any]:
+        self._prune_completed_queue_entries_if_needed()
         batch_path = self._batch_plan_path()
         if not batch_path.exists():
             return {"exists": False, "batches": []}
@@ -345,6 +372,7 @@ class PickerState:
         limit: int | None = DEFAULT_ENTRY_PAGE_SIZE,
         offset: int = 0,
     ) -> dict[str, Any]:
+        self._prune_completed_queue_entries_if_needed()
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive")
         if offset < 0:
@@ -358,7 +386,7 @@ class PickerState:
         reverse_entry_order = status in {"accepted_not_applied", "rejected"}
         for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
             entry_id = str(record.get("entry_id", ""))
-            if self._entry_has_confirmed_external_original(entry_id) and not self._entry_has_active_review_state(entry_id):
+            if self._entry_has_completed_external_decision(entry_id):
                 continue
             if entry_id in affected_entry_ids:
                 entry = self._entry_summary(entry_id, self._entry_rows(entry_id))
@@ -393,15 +421,17 @@ class PickerState:
         candidate_offset: int = 0,
         rank_if_needed: bool = True,
     ) -> dict[str, Any] | None:
+        self._prune_completed_queue_entries_if_needed()
         if candidate_limit is not None and candidate_limit <= 0:
             raise ValueError("candidate_limit must be positive")
         if candidate_offset < 0:
             raise ValueError("candidate_offset must be zero or greater")
-        if self._entry_has_confirmed_external_original(entry_id) and not self._entry_has_active_review_state(entry_id):
+        if self._entry_has_completed_external_decision(entry_id):
             return None
         entry_rows = self._entry_rows(entry_id)
         if not entry_rows:
             return None
+        entry_rows = self._ensure_default_filename_index_candidates(entry_id, entry_rows)
         if candidate_limit is None and rank_if_needed:
             entry_rows = self._rank_oversized_entry_if_needed(entry_id, entry_rows)
         entry = self._entry_summary(entry_id, entry_rows)
@@ -416,6 +446,7 @@ class PickerState:
         candidate_total = len(candidate_rows)
         if candidate_limit is not None:
             candidate_rows = candidate_rows[candidate_offset : candidate_offset + candidate_limit]
+        self._hydrate_candidate_rows_with_indexed_geolocation(candidate_rows)
         candidates = [self._candidate_detail(row) for row in candidate_rows]
         entry["candidates"] = candidates
         entry["candidate_total"] = candidate_total
@@ -423,6 +454,89 @@ class PickerState:
         entry["candidate_limit"] = candidate_limit
         entry["candidate_has_more"] = candidate_offset + len(candidates) < candidate_total
         return entry
+
+    def _ensure_default_filename_index_candidates(
+        self,
+        entry_id: str,
+        entry_rows: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        if entry_id in self._replacement_candidate_rows:
+            return entry_rows
+        if not entry_rows:
+            return entry_rows
+        entry_date = entry_rows[0].get("entry_date", "")
+        try:
+            dt.date.fromisoformat(entry_date)
+        except ValueError:
+            return entry_rows
+        target_dates = {entry_date}
+        indexed = query_index_candidates(
+            default_index_db(self.config.canonical_root),
+            target_dates,
+            filename_dates_only=True,
+        ).get(entry_date, [])
+        existing_paths = {
+            row.get("candidate_path", "")
+            for row in entry_rows
+            if row.get("candidate_path", "")
+        }
+        rejected_hashes = self._rejected_candidate_hashes(entry_id)
+        template = entry_rows[0]
+        additions: list[dict[str, Any]] = []
+        for candidate in indexed:
+            path = Path(str(candidate.get("candidate_path", ""))).resolve()
+            path_text = str(path)
+            if not path_text or path_text in existing_paths or not path.exists():
+                continue
+            if not _candidate_filename_starts_with_any_date(candidate, target_dates):
+                continue
+            digest = str(candidate.get("candidate_sha256", "")).strip() or _sha256_path(path)
+            if digest in rejected_hashes:
+                continue
+            byte_size = candidate.get("byte_size", "")
+            if byte_size in (None, ""):
+                byte_size = path.stat().st_size
+            evidence_parts = [part for part in str(candidate.get("evidence", "")).strip(";").split(";") if part]
+            evidence_parts.extend(
+                [
+                    "manual_default_search",
+                    "manual_default_scope_filename_index",
+                    "manual_default_date_source_filename_only",
+                ]
+            )
+            additions.append(
+                {
+                    "entry_id": entry_id,
+                    "entry_date": entry_date,
+                    "project365_media_asset_id": template.get("project365_media_asset_id", ""),
+                    "current_match_status": template.get("current_match_status", ""),
+                    "current_decision": template.get("current_decision", ""),
+                    "candidate_path": path_text,
+                    "candidate_filename": candidate.get("candidate_filename", path.name),
+                    "candidate_sha256": digest,
+                    "byte_size": str(byte_size),
+                    "mime_type": candidate.get("mime_type", mimetypes.guess_type(path.name)[0] or "application/octet-stream"),
+                    "filename_dates": candidate.get("filename_dates", ""),
+                    "media_creation_dates": candidate.get("media_creation_dates", ""),
+                    "filesystem_dates": candidate.get("filesystem_dates", ""),
+                    "capture_timestamp": candidate.get("capture_timestamp", ""),
+                    "capture_timestamp_source": candidate.get("capture_timestamp_source", ""),
+                    "gps_latitude": candidate.get("gps_latitude", ""),
+                    "gps_longitude": candidate.get("gps_longitude", ""),
+                    "gps_source": candidate.get("gps_source", ""),
+                    "has_gps": candidate.get("has_gps", ""),
+                    "date_distance": candidate.get("date_distance", ""),
+                    "evidence": ";".join(evidence_parts),
+                    "candidate_filter_reason": candidate.get("candidate_filter_reason", ""),
+                    "review_decision": "",
+                    "review_notes": "",
+                }
+            )
+            existing_paths.add(path_text)
+        if not additions:
+            return entry_rows
+        self._store_added_candidates(entry_id, template, additions)
+        return self._entry_rows(entry_id)
 
     def crop_entry_detail(self, entry_id: str, mark_estimated_viewed: bool = True) -> dict[str, Any] | None:
         entry_rows = self._entry_rows(entry_id)
@@ -497,12 +611,16 @@ class PickerState:
             "byte_size": row.get("byte_size", ""),
             "mime_type": row.get("mime_type", ""),
             "dimensions": "",
-            "has_embedded_geolocation": False,
+            "has_embedded_geolocation": _candidate_row_has_indexed_geolocation(row),
             "filename_dates": row.get("filename_dates", ""),
             "media_creation_dates": row.get("media_creation_dates", ""),
             "filesystem_dates": row.get("filesystem_dates", ""),
             "capture_timestamp": row.get("capture_timestamp", ""),
             "capture_timestamp_source": row.get("capture_timestamp_source", ""),
+            "gps_latitude": row.get("gps_latitude", ""),
+            "gps_longitude": row.get("gps_longitude", ""),
+            "gps_source": row.get("gps_source", ""),
+            "has_gps": row.get("has_gps", ""),
             "date_distance": row.get("date_distance", ""),
             "alignment_score": row.get("alignment_score", ""),
             "alignment_confidence": row.get("alignment_confidence", ""),
@@ -527,6 +645,7 @@ class PickerState:
             "review_notes": row.get("review_notes", ""),
             "associated_entry_date": row.get("associated_entry_date", ""),
             "associated_date_source": row.get("associated_date_source", ""),
+            "project_originals_source": _is_project_originals_source_path(path_text),
             "selected": row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS,
             "associated": row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS,
         }
@@ -545,11 +664,15 @@ class PickerState:
 
     def candidate_facts(self, tokens: list[str]) -> dict[str, dict[str, Any]]:
         facts: dict[str, dict[str, Any]] = {}
-        for token in tokens[:100]:
-            path = self.image_path(token)
-            if path is None:
-                continue
+        paths_by_token = {
+            token: path
+            for token in tokens[:100]
+            if (path := self.image_path(token)) is not None
+        }
+        indexed_geolocation = self._indexed_geolocation_by_path(paths_by_token.values())
+        for token, path in paths_by_token.items():
             dimensions, has_geolocation = self._candidate_file_facts(path)
+            has_geolocation = has_geolocation or indexed_geolocation.get(str(path), False)
             facts[token] = {
                 "dimensions": dimensions,
                 "has_embedded_geolocation": has_geolocation,
@@ -568,6 +691,64 @@ class PickerState:
             oldest_key = next(iter(self._candidate_facts_cache))
             self._candidate_facts_cache.pop(oldest_key, None)
         return facts
+
+    def _hydrate_candidate_rows_with_indexed_geolocation(self, rows: list[dict[str, str]]) -> None:
+        stale_paths = [
+            row.get("candidate_path", "").strip()
+            for row in rows
+            if row.get("candidate_path", "").strip()
+            and not _candidate_row_has_indexed_geolocation(row)
+        ]
+        indexed_geolocation = self._indexed_geolocation_by_path_text(stale_paths)
+        for row in rows:
+            path_text = row.get("candidate_path", "").strip()
+            if indexed_geolocation.get(path_text, False):
+                row["has_gps"] = "1"
+                row["has_embedded_geolocation"] = "1"
+
+    def _indexed_geolocation_by_path(self, paths: Any) -> dict[str, bool]:
+        return self._indexed_geolocation_by_path_text(str(path) for path in paths)
+
+    def _indexed_geolocation_by_path_text(self, path_texts: Any) -> dict[str, bool]:
+        original_to_resolved = {
+            path: str(Path(path).resolve())
+            for path in (str(path).strip() for path in path_texts)
+            if path
+        }
+        if not original_to_resolved:
+            return {}
+        resolved_to_originals: dict[str, list[str]] = {}
+        for original, resolved in original_to_resolved.items():
+            resolved_to_originals.setdefault(resolved, []).append(original)
+        resolved_paths = sorted(resolved_to_originals)
+        index_db = default_index_db(self.config.canonical_root)
+        if not index_db.exists():
+            return {}
+        try:
+            with sqlite3.connect(index_db, timeout=1) as connection:
+                columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(photo_library_files)")}
+                if not {"path", "gps_latitude", "gps_longitude"}.issubset(columns):
+                    return {}
+                has_gps_select = "has_gps" if "has_gps" in columns else "0"
+                placeholders = ",".join("?" for _ in resolved_paths)
+                indexed = {
+                    str(path): bool(has_gps or _valid_geolocation(latitude, longitude))
+                    for path, has_gps, latitude, longitude in connection.execute(
+                        f"""
+                        SELECT path, {has_gps_select}, gps_latitude, gps_longitude
+                        FROM photo_library_files
+                        WHERE path IN ({placeholders})
+                        """,
+                        resolved_paths,
+                    )
+                }
+                return {
+                    original: indexed.get(resolved, False)
+                    for resolved, originals in resolved_to_originals.items()
+                    for original in originals
+                }
+        except sqlite3.Error:
+            return {}
 
     def _crop_summary(
         self,
@@ -964,7 +1145,8 @@ class PickerState:
             for rejected_row in rejected_rows_to_append:
                 self._append_rejected_queue_row(rejected_row)
             if rejected_rows_to_append:
-                self._confirmed_original_entry_ids_cache = None
+                self._completed_external_entry_ids_cache = None
+                self._completed_queue_prune_signature = None
                 prune_summary = prune_applied_review_queue(
                     canonical_root=self.config.canonical_root,
                     queue_path=self.config.queue_path,
@@ -1092,44 +1274,71 @@ class PickerState:
         associated_date_source: str = "manual",
     ) -> dict[str, Any]:
         normalized_decision = decision.strip().lower()
-        if normalized_decision not in {"use_external_original", "rejected", "clear", *ASSOCIATED_PHOTO_DECISIONS, *FALLBACK_DECISIONS}:
+        if normalized_decision not in {
+            "use_external_original",
+            "rejected",
+            "clear",
+            "unlink_associated_photo",
+            *ASSOCIATED_PHOTO_DECISIONS,
+            *FALLBACK_DECISIONS,
+        }:
             raise ValueError("Unsupported decision")
+        rows: list[dict[str, str]]
         with self._lock:
             rows = self._entry_rows(entry_id)
-            found_entry = False
-            found_candidate = normalized_decision == "clear" or normalized_decision in FALLBACK_DECISIONS
-            fallback_applied = False
-            for row in rows:
-                found_entry = True
-                if normalized_decision == "clear":
+            if normalized_decision == "clear":
+                if not rows:
+                    raise ValueError("Unknown entry")
+                self._decision_overrides.pop(entry_id, None)
+                self._added_candidate_rows.pop(entry_id, None)
+                self._replacement_candidate_rows.pop(entry_id, None)
+                self._entry_rows_cache.pop(entry_id, None)
+                clear_reject_all_range_state(self.config.queue_path.parent, entry_id)
+                rows = self._entry_rows(entry_id)
+                for row in rows:
                     row["review_decision"] = ""
                     row["review_notes"] = ""
-                    continue
-                if normalized_decision in FALLBACK_DECISIONS:
-                    if not fallback_applied:
-                        row["review_decision"] = normalized_decision
-                        row["review_notes"] = notes
-                        fallback_applied = True
-                    elif row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS:
+                found_entry = True
+                found_candidate = True
+            else:
+                found_entry = False
+                found_candidate = normalized_decision in FALLBACK_DECISIONS
+                fallback_applied = False
+                for row in rows:
+                    found_entry = True
+                    if normalized_decision in FALLBACK_DECISIONS:
+                        if not fallback_applied:
+                            row["review_decision"] = normalized_decision
+                            row["review_notes"] = notes
+                            fallback_applied = True
+                        elif row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS:
+                            row["review_decision"] = ""
+                            row["review_notes"] = ""
+                        continue
+                    if row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS:
                         row["review_decision"] = ""
                         row["review_notes"] = ""
-                    continue
-                if row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS:
-                    row["review_decision"] = ""
-                    row["review_notes"] = ""
-                if row.get("candidate_path") == candidate_path:
-                    found_candidate = True
-                    row["review_decision"] = normalized_decision
-                    row["review_notes"] = notes
-                    if normalized_decision in ASSOCIATED_PHOTO_DECISIONS:
-                        associated_date = _normalized_associated_entry_date(associated_entry_date)
-                        row["associated_entry_date"] = associated_date or row.get("entry_date", "")
-                        row["associated_date_source"] = associated_date_source.strip() or "manual"
-                    if normalized_decision == "use_external_original" and crop is not None:
-                        _set_review_crop(row, crop, source="manual")
-                elif normalized_decision == "use_external_original" and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS:
-                    row["review_decision"] = ""
-                    row["review_notes"] = ""
+                    if row.get("candidate_path") == candidate_path:
+                        found_candidate = True
+                        current_decision = row.get("review_decision", "").strip().lower()
+                        if normalized_decision == "unlink_associated_photo":
+                            if current_decision in ASSOCIATED_PHOTO_DECISIONS:
+                                row["review_decision"] = ""
+                                row["review_notes"] = ""
+                                row["associated_entry_date"] = ""
+                                row["associated_date_source"] = ""
+                            continue
+                        row["review_decision"] = normalized_decision
+                        row["review_notes"] = notes
+                        if normalized_decision in ASSOCIATED_PHOTO_DECISIONS:
+                            associated_date = _normalized_associated_entry_date(associated_entry_date)
+                            row["associated_entry_date"] = associated_date or row.get("entry_date", "")
+                            row["associated_date_source"] = associated_date_source.strip() or "manual"
+                        if normalized_decision == "use_external_original" and crop is not None:
+                            _set_review_crop(row, crop, source="manual")
+                    elif normalized_decision == "use_external_original" and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS:
+                        row["review_decision"] = ""
+                        row["review_notes"] = ""
             if not found_entry:
                 raise ValueError("Unknown entry")
             if not found_candidate:
@@ -1677,13 +1886,31 @@ class PickerState:
                 / parsed_date.strftime("%Y-%m")
             )
             target_dir.mkdir(parents=True, exist_ok=True)
-            destination = target_dir / safe_name
-            if destination.exists() and _sha256_path(destination) != digest:
-                destination = target_dir / f"{destination.stem} - {digest[:12]}{suffix}"
-            if not destination.exists():
-                temp_path = destination.with_suffix(destination.suffix + ".tmp")
+            timestamp = dt.datetime.combine(parsed_date, PROJECT_ADDITION_DROP_TIME)
+            temp_path = target_dir / f".{parsed_date.isoformat()} {digest[:12]}{suffix}.tmp"
+            try:
                 temp_path.write_bytes(payload)
-                temp_path.replace(destination)
+                _set_project_addition_timestamps(temp_path, timestamp)
+                stored_digest = _sha256_path(temp_path)
+                destination = _project_addition_destination(target_dir, parsed_date, suffix, stored_digest)
+                if destination.exists():
+                    if _sha256_path(destination) != stored_digest:
+                        destination = _project_addition_destination(
+                            target_dir,
+                            parsed_date,
+                            suffix,
+                            stored_digest,
+                            force_digest_suffix=True,
+                        )
+                    if destination.exists():
+                        temp_path.unlink()
+                    else:
+                        temp_path.replace(destination)
+                else:
+                    temp_path.replace(destination)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
             destination = destination.resolve()
             destination_text = str(destination)
             if not any(row.get("candidate_path") == destination_text for row in entry_rows):
@@ -1698,12 +1925,12 @@ class PickerState:
                     "current_decision": template.get("current_decision", ""),
                     "candidate_path": destination_text,
                     "candidate_filename": destination.name,
-                    "candidate_sha256": digest,
-                    "byte_size": str(len(payload)),
+                    "candidate_sha256": _sha256_path(destination),
+                    "byte_size": str(destination.stat().st_size),
                     "mime_type": mime_type,
-                    "filename_dates": "",
+                    "filename_dates": entry_date,
                     "media_creation_dates": "",
-                    "filesystem_dates": "",
+                    "filesystem_dates": entry_date,
                     "evidence": "manual_drop_copy",
                     "candidate_filter_reason": "",
                     "review_decision": "",
@@ -1719,6 +1946,7 @@ class PickerState:
         )
 
     def apply_decisions(self) -> dict[str, Any]:
+        self._prune_completed_queue_entries_if_needed()
         with self._lock:
             self._materialize_decision_overrides()
             apply_summary = apply_reviewed_external_references(
@@ -1732,7 +1960,8 @@ class PickerState:
             )
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
-            self._confirmed_original_entry_ids_cache = None
+            self._completed_external_entry_ids_cache = None
+            self._completed_queue_prune_signature = None
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -1748,6 +1977,7 @@ class PickerState:
         }
 
     def commit_entry_decision(self, entry_id: str) -> dict[str, Any]:
+        self._prune_completed_queue_entries_if_needed()
         with self._lock:
             fieldnames, rows = self._read_rows_with_fieldnames()
             entry_rows = [dict(row) for row in rows if row.get("entry_id") == entry_id]
@@ -1781,7 +2011,8 @@ class PickerState:
             )
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
-            self._confirmed_original_entry_ids_cache = None
+            self._completed_external_entry_ids_cache = None
+            self._completed_queue_prune_signature = None
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -1803,18 +2034,15 @@ class PickerState:
         photo_index_folder: str | Path | None = None,
         search_whole_index: bool = False,
         whole_index_filename_only: bool = False,
+        filename_dates_only: bool = False,
+        include_modified_dates: bool = False,
     ) -> dict[str, Any]:
         if days not in EXPAND_DATE_RANGE_DAYS:
             raise ValueError("Date range must be 1, 3, 5, 15, or 30 days.")
-        effective_search_whole_index = search_whole_index or not str(photo_index_folder or "").strip()
-        folder_root = (
-            Path(str(photo_index_folder).strip()).expanduser()
-            if photo_index_folder and not effective_search_whole_index
-            else None
-        )
-        if folder_root is not None and not folder_root.is_dir():
-            raise ValueError(f"Missing photo-index folder: {folder_root}")
-        effective_filename_only = bool(effective_search_whole_index and whole_index_filename_only)
+        effective_search_whole_index = bool(search_whole_index)
+        folder_root = None
+        effective_filename_only = True if not effective_search_whole_index else bool(whole_index_filename_only or filename_dates_only)
+        effective_include_modified_dates = bool(include_modified_dates and effective_search_whole_index and not effective_filename_only)
         with self._lock:
             replace_candidates = bool(search_whole_index)
             if not replace_candidates:
@@ -1824,13 +2052,15 @@ class PickerState:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
             dt.date.fromisoformat(entry_date)
+            target_dates = _date_window(entry_date, days)
             indexed = query_index_candidates(
                 default_index_db(self.config.canonical_root),
                 {entry_date},
                 max_distance_days=days,
                 folder_root=folder_root,
-                include_filesystem_dates=effective_search_whole_index and not effective_filename_only,
+                include_filesystem_dates=not effective_filename_only,
                 filename_dates_only=effective_filename_only,
+                include_modified_dates=effective_include_modified_dates,
             ).get(entry_date, [])
             existing_paths = set() if replace_candidates else {
                 row.get("candidate_path", "")
@@ -1845,6 +2075,8 @@ class PickerState:
                 path_text = str(path)
                 if not path_text or path_text in existing_paths or not path.exists():
                     continue
+                if not effective_search_whole_index and not _candidate_filename_starts_with_any_date(candidate, target_dates):
+                    continue
                 digest = str(candidate.get("candidate_sha256", "")).strip() or _sha256_path(path)
                 if digest in rejected_hashes:
                     continue
@@ -1856,10 +2088,12 @@ class PickerState:
                 evidence_parts.append(
                     "manual_range_scope_whole_index"
                     if effective_search_whole_index
-                    else "manual_range_scope_folder"
+                    else "manual_range_scope_filename_index"
                 )
                 if effective_filename_only:
                     evidence_parts.append("manual_range_date_source_filename_only")
+                if effective_include_modified_dates:
+                    evidence_parts.append("manual_range_date_source_modified_date")
                 evidence = ";".join(evidence_parts)
                 values = {
                     "entry_id": entry_id,
@@ -1877,6 +2111,10 @@ class PickerState:
                     "filesystem_dates": candidate.get("filesystem_dates", ""),
                     "capture_timestamp": candidate.get("capture_timestamp", ""),
                     "capture_timestamp_source": candidate.get("capture_timestamp_source", ""),
+                    "gps_latitude": candidate.get("gps_latitude", ""),
+                    "gps_longitude": candidate.get("gps_longitude", ""),
+                    "gps_source": candidate.get("gps_source", ""),
+                    "has_gps": candidate.get("has_gps", ""),
                     "date_distance": candidate.get("date_distance", ""),
                     "evidence": evidence,
                     "candidate_filter_reason": candidate.get("candidate_filter_reason", ""),
@@ -1902,7 +2140,9 @@ class PickerState:
             "entry": detail,
             "range_days": days,
             "search_whole_index": effective_search_whole_index,
-            "whole_index_filename_only": effective_filename_only,
+            "filename_dates_only": effective_filename_only,
+            "include_modified_dates": effective_include_modified_dates,
+            "whole_index_filename_only": bool(effective_search_whole_index and effective_filename_only),
             "replace_candidates": replace_candidates,
             "photo_index_folder": str(folder_root) if folder_root else "",
             "added_count": len(additions),
@@ -1915,16 +2155,13 @@ class PickerState:
         photo_index_folder: str | Path | None = None,
         search_whole_index: bool = False,
         whole_index_filename_only: bool = False,
+        filename_dates_only: bool = False,
+        include_modified_dates: bool = False,
     ) -> dict[str, Any]:
-        effective_search_whole_index = search_whole_index or not str(photo_index_folder or "").strip()
-        folder_root = (
-            Path(str(photo_index_folder).strip()).expanduser()
-            if photo_index_folder and not effective_search_whole_index
-            else None
-        )
-        if folder_root is not None and not folder_root.is_dir():
-            raise ValueError(f"Missing photo-index folder: {folder_root}")
-        effective_filename_only = bool(effective_search_whole_index and whole_index_filename_only)
+        effective_search_whole_index = bool(search_whole_index)
+        folder_root = None
+        effective_filename_only = True if not effective_search_whole_index else bool(whole_index_filename_only or filename_dates_only)
+        effective_include_modified_dates = bool(include_modified_dates and effective_search_whole_index and not effective_filename_only)
         with self._lock:
             replace_candidates = bool(search_whole_index)
             if not replace_candidates:
@@ -1934,12 +2171,14 @@ class PickerState:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
             dt.date.fromisoformat(entry_date)
+            target_dates = {entry_date}
             indexed = query_index_candidates(
                 default_index_db(self.config.canonical_root),
                 {entry_date},
                 folder_root=folder_root,
-                include_filesystem_dates=effective_search_whole_index and not effective_filename_only,
+                include_filesystem_dates=not effective_filename_only,
                 filename_dates_only=effective_filename_only,
+                include_modified_dates=effective_include_modified_dates,
             ).get(entry_date, [])
             existing_paths = set() if replace_candidates else {
                 row.get("candidate_path", "")
@@ -1954,6 +2193,8 @@ class PickerState:
                 path_text = str(path)
                 if not path_text or path_text in existing_paths or not path.exists():
                     continue
+                if not effective_search_whole_index and not _candidate_filename_starts_with_any_date(candidate, target_dates):
+                    continue
                 digest = str(candidate.get("candidate_sha256", "")).strip() or _sha256_path(path)
                 if digest in rejected_hashes:
                     continue
@@ -1965,10 +2206,12 @@ class PickerState:
                 evidence_parts.append(
                     "manual_default_scope_whole_index"
                     if effective_search_whole_index
-                    else "manual_default_scope_folder"
+                    else "manual_default_scope_filename_index"
                 )
                 if effective_filename_only:
                     evidence_parts.append("manual_default_date_source_filename_only")
+                if effective_include_modified_dates:
+                    evidence_parts.append("manual_default_date_source_modified_date")
                 values = {
                     "entry_id": entry_id,
                     "entry_date": entry_date,
@@ -1985,6 +2228,10 @@ class PickerState:
                     "filesystem_dates": candidate.get("filesystem_dates", ""),
                     "capture_timestamp": candidate.get("capture_timestamp", ""),
                     "capture_timestamp_source": candidate.get("capture_timestamp_source", ""),
+                    "gps_latitude": candidate.get("gps_latitude", ""),
+                    "gps_longitude": candidate.get("gps_longitude", ""),
+                    "gps_source": candidate.get("gps_source", ""),
+                    "has_gps": candidate.get("has_gps", ""),
                     "date_distance": candidate.get("date_distance", ""),
                     "evidence": ";".join(evidence_parts),
                     "candidate_filter_reason": candidate.get("candidate_filter_reason", ""),
@@ -2001,7 +2248,9 @@ class PickerState:
         return {
             "entry": detail,
             "search_whole_index": effective_search_whole_index,
-            "whole_index_filename_only": effective_filename_only,
+            "filename_dates_only": effective_filename_only,
+            "include_modified_dates": effective_include_modified_dates,
+            "whole_index_filename_only": bool(effective_search_whole_index and effective_filename_only),
             "replace_candidates": replace_candidates,
             "photo_index_folder": str(folder_root) if folder_root else "",
             "added_count": len(additions),
@@ -2016,14 +2265,13 @@ class PickerState:
         search_whole_index: bool = False,
         photo_index_folder: str | Path | None = None,
         whole_index_filename_only: bool = False,
+        filename_dates_only: bool = False,
+        include_modified_dates: bool = False,
     ) -> dict[str, Any]:
         target_dates = _manual_index_search_dates(start_date, end_date)
-        effective_filename_only = bool(search_whole_index and whole_index_filename_only)
         folder_root = None
-        if not search_whole_index and photo_index_folder:
-            folder_root = Path(str(photo_index_folder).strip()).expanduser()
-            if not folder_root.is_dir():
-                raise ValueError(f"Missing photo-index folder: {folder_root}")
+        effective_filename_only = True if not search_whole_index else bool(whole_index_filename_only or filename_dates_only)
+        effective_include_modified_dates = bool(include_modified_dates and search_whole_index and not effective_filename_only)
         with self._lock:
             replace_candidates = search_whole_index
             if not replace_candidates:
@@ -2040,6 +2288,7 @@ class PickerState:
                 folder_root=folder_root,
                 include_filesystem_dates=not effective_filename_only,
                 filename_dates_only=effective_filename_only,
+                include_modified_dates=effective_include_modified_dates,
             )
             existing_paths = set() if replace_candidates else {
                 row.get("candidate_path", "")
@@ -2056,6 +2305,8 @@ class PickerState:
                     path_text = str(path)
                     if not path_text or path_text in existing_paths or not path.exists():
                         continue
+                    if not search_whole_index and not _candidate_filename_starts_with_any_date(candidate, set(target_dates)):
+                        continue
                     digest = str(candidate.get("candidate_sha256", "")).strip() or _sha256_path(path)
                     if digest in rejected_hashes:
                         continue
@@ -2064,8 +2315,15 @@ class PickerState:
                         byte_size = path.stat().st_size
                     evidence = str(candidate.get("evidence", "")).strip(";")
                     evidence = f"{evidence};manual_index_date_search" if evidence else "manual_index_date_search"
+                    evidence = (
+                        f"{evidence};manual_index_scope_whole_index"
+                        if search_whole_index
+                        else f"{evidence};manual_index_scope_filename_index"
+                    )
                     if effective_filename_only:
                         evidence = f"{evidence};manual_index_date_source_filename_only"
+                    if effective_include_modified_dates:
+                        evidence = f"{evidence};manual_index_date_source_modified_date"
                     values = {
                         "entry_id": entry_id,
                         "entry_date": entry_date,
@@ -2085,6 +2343,10 @@ class PickerState:
                         "filesystem_dates": candidate.get("filesystem_dates", ""),
                         "capture_timestamp": candidate.get("capture_timestamp", ""),
                         "capture_timestamp_source": candidate.get("capture_timestamp_source", ""),
+                        "gps_latitude": candidate.get("gps_latitude", ""),
+                        "gps_longitude": candidate.get("gps_longitude", ""),
+                        "gps_source": candidate.get("gps_source", ""),
+                        "has_gps": candidate.get("has_gps", ""),
                         "date_distance": str(abs((dt.date.fromisoformat(target_date) - entry_day).days)),
                         "evidence": evidence,
                         "candidate_filter_reason": candidate.get("candidate_filter_reason", ""),
@@ -2106,7 +2368,9 @@ class PickerState:
             "date_count": len(target_dates),
             "matched_date_count": len(matched_dates),
             "search_whole_index": search_whole_index,
-            "whole_index_filename_only": effective_filename_only,
+            "filename_dates_only": effective_filename_only,
+            "include_modified_dates": effective_include_modified_dates,
+            "whole_index_filename_only": bool(search_whole_index and effective_filename_only),
             "replace_candidates": replace_candidates,
             "photo_index_folder": "" if search_whole_index or folder_root is None else str(folder_root),
             "added_count": len(additions),
@@ -2115,6 +2379,9 @@ class PickerState:
 
     def _rejected_candidate_hashes(self, entry_id: str) -> set[str]:
         with sqlite3.connect(self.config.canonical_root / "canonical.db") as connection:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(media_assets)")}
+            if "sha256" not in columns:
+                return set()
             return {
                 str(row[0])
                 for row in connection.execute(
@@ -2286,6 +2553,11 @@ class PickerState:
             for row in candidate_rows
             if row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
         ]
+        associated_rows = [
+            row
+            for row in candidate_rows
+            if row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+        ]
         fallback_rows = [
             row
             for row in entry_rows
@@ -2313,6 +2585,10 @@ class PickerState:
             "current_match_status": first.get("current_match_status", ""),
             "current_decision": first.get("current_decision", ""),
             "manual_search_message": manual_search_message,
+            "accepted_count": len(selected_rows),
+            "associated_count": len(associated_rows),
+            "rejected_count": len(rejected_rows),
+            "fallback_count": len(fallback_rows),
             "used_range_days": _used_search_range_days(
                 entry_id,
                 entry_rows,
@@ -2410,19 +2686,12 @@ class PickerState:
             connection.close()
         return {entry_id: Path(storage_path) for entry_id, storage_path in rows}
 
-    def _entry_has_confirmed_external_original(self, entry_id: str) -> bool:
-        if self._confirmed_original_entry_ids_cache is None:
-            self._confirmed_original_entry_ids_cache = self._load_confirmed_external_original_entry_ids()
-        return entry_id in self._confirmed_original_entry_ids_cache
+    def _entry_has_completed_external_decision(self, entry_id: str) -> bool:
+        if self._completed_external_entry_ids_cache is None:
+            self._completed_external_entry_ids_cache = self._load_completed_external_entry_ids()
+        return entry_id in self._completed_external_entry_ids_cache
 
-    def _entry_has_active_review_state(self, entry_id: str) -> bool:
-        return (
-            entry_id in self._decision_overrides
-            or entry_id in self._added_candidate_rows
-            or entry_id in self._replacement_candidate_rows
-        )
-
-    def _load_confirmed_external_original_entry_ids(self) -> set[str]:
+    def _load_completed_external_entry_ids(self) -> set[str]:
         db_path = self.config.canonical_root / "canonical.db"
         if not db_path.exists():
             return set()
@@ -2432,9 +2701,8 @@ class PickerState:
                 """
                 SELECT DISTINCT entry_id
                 FROM media_assets
-                WHERE role = 'external_original_reference'
+                WHERE role IN ('external_original_reference', 'external_original_fallback')
                     AND review_status = 'confirmed'
-                    AND COALESCE(storage_path, '') != ''
                 """
             ).fetchall()
         except sqlite3.Error:
@@ -2442,6 +2710,56 @@ class PickerState:
         finally:
             connection.close()
         return {str(row[0]) for row in rows if str(row[0] or "").strip()}
+
+    def _completed_queue_signature(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+        return (
+            _file_signature(self.config.queue_path),
+            _file_signature(self.config.canonical_root / "canonical.db"),
+        )
+
+    def _clear_local_review_state(self, entry_ids: set[str]) -> None:
+        changed = False
+        for entry_id in entry_ids:
+            changed = self._decision_overrides.pop(entry_id, None) is not None or changed
+            changed = self._added_candidate_rows.pop(entry_id, None) is not None or changed
+            changed = self._replacement_candidate_rows.pop(entry_id, None) is not None or changed
+        if changed:
+            self._persist_decision_overrides()
+
+    def _prune_completed_queue_entries_if_needed(self) -> dict[str, int | str]:
+        signature = self._completed_queue_signature()
+        if signature == self._completed_queue_prune_signature:
+            return {}
+        with self._lock:
+            signature = self._completed_queue_signature()
+            if signature == self._completed_queue_prune_signature:
+                return {}
+            self._completed_external_entry_ids_cache = None
+            if not self.config.queue_path.exists():
+                self._completed_queue_prune_signature = signature
+                return {}
+            queued_entry_ids = {
+                str(record.get("entry_id", "")).strip()
+                for record in self._queue_shards.summaries()
+                if str(record.get("entry_id", "")).strip()
+            }
+            completed_queue_entry_ids = queued_entry_ids & self._load_completed_external_entry_ids()
+            if not completed_queue_entry_ids:
+                self._completed_queue_prune_signature = signature
+                return {}
+            prune_summary = prune_applied_review_queue(
+                canonical_root=self.config.canonical_root,
+                queue_path=self.config.queue_path,
+                report_dir=self.config.queue_path.parent,
+            )
+            self._clear_local_review_state(completed_queue_entry_ids)
+            self._entry_rows_cache = {}
+            self._queue_shards.invalidate()
+            self._completed_external_entry_ids_cache = None
+            self._source_media = self._load_source_media()
+            self._refresh_image_paths()
+            self._completed_queue_prune_signature = self._completed_queue_signature()
+            return prune_summary
 
     def _read_rows(self) -> list[dict[str, str]]:
         _, rows = self._read_rows_with_fieldnames()
@@ -2760,6 +3078,10 @@ class PickerState:
             "filesystem_dates",
             "capture_timestamp",
             "capture_timestamp_source",
+            "gps_latitude",
+            "gps_longitude",
+            "gps_source",
+            "has_gps",
             "date_distance",
             "evidence",
             "candidate_filter_reason",
@@ -2865,7 +3187,16 @@ class PickerState:
                 rows.extend(dict(row) for row in replacement_rows)
         for added_rows in self._added_candidate_rows.values():
             rows.extend(dict(row) for row in added_rows)
-        for field in ("review_decision", "review_notes", "associated_entry_date", "associated_date_source"):
+        for field in (
+            "review_decision",
+            "review_notes",
+            "associated_entry_date",
+            "associated_date_source",
+            "gps_latitude",
+            "gps_longitude",
+            "gps_source",
+            "has_gps",
+        ):
             if field not in fieldnames:
                 fieldnames.append(field)
                 for row in rows:
@@ -3132,6 +3463,8 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         photo_index_folder=str(payload.get("photo_index_folder", "")),
                         search_whole_index=bool(payload.get("search_whole_index", False)),
                         whole_index_filename_only=bool(payload.get("whole_index_filename_only", False)),
+                        filename_dates_only=bool(payload.get("filename_dates_only", False)),
+                        include_modified_dates=bool(payload.get("include_modified_dates", False)),
                     )
                     self._send_json(result)
                     return
@@ -3142,6 +3475,8 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         photo_index_folder=str(payload.get("photo_index_folder", "")),
                         search_whole_index=bool(payload.get("search_whole_index", False)),
                         whole_index_filename_only=bool(payload.get("whole_index_filename_only", False)),
+                        filename_dates_only=bool(payload.get("filename_dates_only", False)),
+                        include_modified_dates=bool(payload.get("include_modified_dates", False)),
                     )
                     self._send_json(result)
                     return
@@ -3154,6 +3489,8 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         search_whole_index=bool(payload.get("search_whole_index", False)),
                         photo_index_folder=str(payload.get("photo_index_folder", "")),
                         whole_index_filename_only=bool(payload.get("whole_index_filename_only", False)),
+                        filename_dates_only=bool(payload.get("filename_dates_only", False)),
+                        include_modified_dates=bool(payload.get("include_modified_dates", False)),
                     )
                     self._send_json(result)
                     return
@@ -3535,10 +3872,20 @@ def _candidate_page_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     normalized["path"] = candidate.get("candidate_path", "")
     return (
         0 if decision in ACCEPT_DECISIONS else 1,
+        _candidate_manual_link_rank(candidate),
+        0 if _is_project_originals_source_path(str(candidate.get("candidate_path", ""))) else 1,
         0 if visual_likely else 1,
         visual_rank,
         *_candidate_sort_key(normalized)[1:],
     )
+
+
+def _candidate_manual_link_rank(candidate: dict[str, Any]) -> int:
+    text = " ".join(
+        str(candidate.get(key, ""))
+        for key in ["evidence", "candidate_filename", "candidate_path"]
+    )
+    return 0 if re.search(r"manual_link|manual_drop_copy", text, re.IGNORECASE) else 1
 
 
 def _candidate_quality_rank(candidate: dict[str, Any]) -> int:
@@ -3567,6 +3914,31 @@ def _candidate_folder_label(path_text: str) -> str:
     if len(parts) <= 1:
         return ""
     return " / ".join(parts[:-1][-2:])
+
+
+def _is_project_originals_source_path(path_text: str) -> bool:
+    parts = tuple(Path(str(path_text or "")).parts)
+    if len(parts) < len(PROJECT_ORIGINALS_SOURCE_PARTS):
+        return False
+    for index in range(0, len(parts) - len(PROJECT_ORIGINALS_SOURCE_PARTS) + 1):
+        if parts[index : index + len(PROJECT_ORIGINALS_SOURCE_PARTS)] == PROJECT_ORIGINALS_SOURCE_PARTS:
+            return True
+    return False
+
+
+def _date_window(entry_date: str, days: int) -> set[str]:
+    entry_day = dt.date.fromisoformat(entry_date)
+    return {
+        (entry_day + dt.timedelta(days=offset)).isoformat()
+        for offset in range(-days, days + 1)
+    }
+
+
+def _candidate_filename_starts_with_any_date(candidate: dict[str, Any], target_dates: set[str]) -> bool:
+    filename = str(candidate.get("candidate_filename") or candidate.get("filename") or "").strip()
+    if not filename:
+        filename = Path(str(candidate.get("candidate_path") or candidate.get("path") or "")).name
+    return any(filename.startswith(target_date) for target_date in target_dates)
 
 
 def _candidate_path_is_available(path_text: str) -> bool:
@@ -3601,6 +3973,45 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _project_addition_destination(
+    target_dir: Path,
+    entry_date: dt.date,
+    suffix: str,
+    digest: str,
+    force_digest_suffix: bool = False,
+) -> Path:
+    stem = f"{entry_date.isoformat()} 000001 ({PROJECT_ADDITION_FILENAME_MARKER})"
+    if force_digest_suffix:
+        stem = f"{stem} - {digest[:12]}"
+    return target_dir / f"{stem}{suffix}"
+
+
+def _set_project_addition_timestamps(path: Path, timestamp: dt.datetime) -> None:
+    exiftool = shutil.which("exiftool")
+    if not exiftool:
+        raise ValueError("ExifTool is required to timestamp dropped project photos.")
+    exif_timestamp = timestamp.strftime("%Y:%m:%d %H:%M:%S")
+    completed = subprocess.run(
+        [
+            exiftool,
+            "-overwrite_original",
+            "-m",
+            f"-FileCreateDate={exif_timestamp}",
+            f"-FileModifyDate={exif_timestamp}",
+            str(path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        error = (completed.stderr or completed.stdout).strip()
+        raise ValueError(f"ExifTool could not timestamp dropped project photo: {error}")
+    epoch = timestamp.timestamp()
+    os.utime(path, (epoch, epoch))
 
 
 def _choose_photo_dialog() -> dict[str, str]:
@@ -3716,6 +4127,25 @@ def _has_embedded_geolocation(path: Path | None) -> bool:
         if marker == 0xE1 and segment.startswith(b"Exif\x00\x00"):
             return _tiff_has_gps_ifd(segment[6:])
     return False
+
+
+def _candidate_row_has_indexed_geolocation(row: dict[str, Any]) -> bool:
+    gps_flag = str(row.get("has_gps", "")).strip().lower()
+    if gps_flag in {"1", "true", "yes"}:
+        return True
+    flag = str(row.get("has_embedded_geolocation", "")).strip().lower()
+    if flag in {"1", "true", "yes"}:
+        return True
+    return _valid_geolocation(row.get("gps_latitude"), row.get("gps_longitude"))
+
+
+def _valid_geolocation(latitude: Any, longitude: Any) -> bool:
+    try:
+        lat = float(str(latitude).strip())
+        lon = float(str(longitude).strip())
+    except (TypeError, ValueError):
+        return False
+    return -90 <= lat <= 90 and -180 <= lon <= 180
 
 
 def _tiff_has_gps_ifd(payload: bytes) -> bool:
@@ -3859,6 +4289,10 @@ def _queue_fieldnames_with_required_fields(
         "filesystem_dates",
         "capture_timestamp",
         "capture_timestamp_source",
+        "gps_latitude",
+        "gps_longitude",
+        "gps_source",
+        "has_gps",
         "date_distance",
         "evidence",
         "candidate_filter_reason",
@@ -4382,6 +4816,10 @@ button {
   min-width: 0;
   flex: 1 1 420px;
 }
+.navigation-actions {
+  display: inline-flex;
+  gap: 6px;
+}
 .icon-button, .action-button {
   border: 1px solid var(--line);
   background: #fff;
@@ -4459,6 +4897,7 @@ textarea:focus-visible {
   align-self: start;
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 .source-frame,
 .candidate-card {
@@ -4497,6 +4936,14 @@ textarea:focus-visible {
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 12px;
   align-content: start;
+}
+.candidate-group-heading {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 .candidate-pane {
   display: grid;
@@ -4571,14 +5018,30 @@ textarea:focus-visible {
   color: #0f5f52;
   box-shadow: inset 0 0 0 1px rgba(21, 118, 102, 0.18);
 }
+.time-filter-controls {
+  flex-basis: 100%;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.time-filter-controls .action-button[aria-pressed="true"] {
+  background: #e5f4f0;
+  border-color: var(--accent);
+  color: #0f5f52;
+  box-shadow: inset 0 0 0 1px rgba(21, 118, 102, 0.18);
+}
 .manual-date-search {
   flex-basis: 100%;
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) max-content auto;
+  grid-template-columns: 104px 104px max-content auto;
   gap: 8px;
   align-items: center;
+  min-width: 0;
 }
 .manual-date-search input[type="date"] {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   height: 34px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -4631,11 +5094,79 @@ textarea:focus-visible {
 .candidate-card.selected {
   outline: 3px solid var(--accent);
 }
+.candidate-card.project-originals-source {
+  border: 3px solid #b42318;
+  box-shadow: 0 0 0 1px rgba(180, 35, 24, 0.18), 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+.candidate-card.project-originals-source.selected {
+  outline-offset: 3px;
+}
 .candidate-image {
   width: 100%;
   height: 210px;
   object-fit: contain;
   background: #222;
+}
+.image-preview-trigger {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: zoom-in;
+  width: 100%;
+  height: 210px;
+}
+.image-preview-trigger:focus-visible {
+  outline: 3px solid rgba(23, 105, 93, 0.45);
+  outline-offset: 2px;
+}
+.image-preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(22, 27, 34, 0.78);
+}
+.image-preview-modal.is-open {
+  display: flex;
+}
+.image-preview-dialog {
+  position: relative;
+  max-width: min(96vw, 1600px);
+  max-height: 94vh;
+  display: grid;
+  gap: 8px;
+}
+.image-preview-dialog img {
+  max-width: min(96vw, 1600px);
+  max-height: 86vh;
+  object-fit: contain;
+  background: #222;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.32);
+}
+.image-preview-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 38px;
+  height: 38px;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #111827;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+}
+.image-preview-caption {
+  max-width: min(96vw, 1600px);
+  color: #fff;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
 }
 .candidate-filename-row {
   display: flex;
@@ -4740,7 +5271,14 @@ textarea:focus-visible {
   line-height: 1.35;
   max-width: 560px;
 }
-.photo-drop-target {
+.photo-drop-row {
+  display: grid;
+  grid-template-columns: minmax(0, 4fr) minmax(76px, 1fr);
+  gap: 8px;
+  align-items: stretch;
+}
+.photo-drop-target,
+.photo-link-drag-lane {
   min-height: 56px;
   border: 2px dashed var(--line-strong);
   border-radius: 8px;
@@ -4757,14 +5295,23 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 11px;
 }
-.photo-drop-target.active {
+.photo-drop-target.active,
+.photo-link-drag-lane.active {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
 .photo-drop-target.disabled {
   opacity: 0.6;
 }
+.photo-link-drag-lane {
+  border-color: var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
 .search-panel {
+  box-sizing: border-box;
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -4920,10 +5467,14 @@ textarea:focus-visible {
         <div id="entrySubhead" class="summary"></div>
       </div>
       <div class="actions">
+        <div class="navigation-actions" role="group" aria-label="Entry navigation">
+          <button id="previousEntryButton" class="action-button" title="Shortcut: Left arrow">Previous entry (Left)</button>
+          <button id="nextEntryButton" class="action-button" title="Shortcut: Right arrow">Next entry (Right)</button>
+        </div>
         <button id="applyDecisionsButton" class="action-button primary" title="Apply reviewed selections, linked originals, rejections, fallbacks, and associated-photo flags to the database">Apply decisions <span id="acceptedDecisionCount" class="decision-count">0 accepted</span><span id="associatedDecisionCount" class="decision-count">0 flagged</span><span id="rejectedDecisionCount" class="decision-count">0 rejected</span></button>
-        <button id="fallbackButton" class="icon-button" title="Use the photo already stored in the Project365 entry instead of an external original">Use Project365 photo</button>
-        <button id="rejectAllButton" class="icon-button" title="Reject every candidate currently available for this target photo">Reject all</button>
-        <button id="clearButton" class="icon-button" title="Reset all pending selections, rejections, and notes for this entry">Reset decisions</button>
+        <button id="fallbackButton" class="icon-button" title="Shortcut: P. Use the photo already stored in the Project365 entry instead of an external original">Use Project365 photo (P)</button>
+        <button id="rejectAllButton" class="icon-button" title="Shortcut: R. Reject every candidate currently available for this target photo">Reject all (R)</button>
+        <button id="clearButton" class="icon-button" title="Reset pending selections, rejections, notes, and candidate expansions for this entry">Reset decisions</button>
       </div>
     </div>
     <div class="workspace">
@@ -4956,21 +5507,32 @@ textarea:focus-visible {
             <button class="action-button" type="button" data-range-days="5">±5 days</button>
             <button class="action-button" type="button" data-range-days="15">±15 days</button>
             <button class="action-button" type="button" data-range-days="30">±30 days</button>
+            <div class="time-filter-controls" role="group" aria-label="Filter candidates by time of day">
+              <button class="action-button" type="button" data-time-filter="morning" aria-pressed="false" title="Morning, 4:00 AM to 7:59 AM">4-8a</button>
+              <button class="action-button" type="button" data-time-filter="midday" aria-pressed="false" title="Midday, 8:00 AM to 11:59 AM">8-12p</button>
+              <button class="action-button" type="button" data-time-filter="early-afternoon" aria-pressed="false" title="Early afternoon, 12:00 PM to 3:59 PM">12-4p</button>
+              <button class="action-button" type="button" data-time-filter="late-afternoon" aria-pressed="false" title="Late afternoon, 4:00 PM to 7:59 PM">4-8p</button>
+              <button class="action-button" type="button" data-time-filter="early-evening" aria-pressed="false" title="Early evening, 8:00 PM to 11:59 PM">8-12a</button>
+              <button class="action-button" type="button" data-time-filter="late-evening" aria-pressed="false" title="Late evening, 12:00 AM to 3:59 AM">12-4a</button>
+            </div>
             <div class="manual-date-search">
               <input id="indexDateStart" type="date" aria-label="Index search start date">
               <input id="indexDateEnd" type="date" aria-label="Index search end date">
               <div class="index-search-options">
                 <label class="index-search-toggle"><input id="indexSearchWholeIndex" type="checkbox"> Whole index</label>
-                <label class="index-search-toggle"><input id="indexSearchFilenameOnly" type="checkbox"> file name only</label>
+                <label class="index-search-toggle"><input id="indexSearchModifiedDate" type="checkbox"> Include modified dates</label>
               </div>
               <button id="searchIndexDateRange" class="action-button" type="button" title="Add indexed photos from the entered date range">Add dates</button>
             </div>
             <div id="indexSearchScope" class="index-search-scope"></div>
           </div>
         </div>
-        <div id="photoDropTarget" class="photo-drop-target" aria-label="Drop an original photo for the current entry">
-          <strong>Drop original photo here</strong>
-          <span id="photoDropTargetHint">Copies into Source Data for the selected date</span>
+        <div class="photo-drop-row">
+          <div id="photoDropTarget" class="photo-drop-target" aria-label="Drop an original photo for the current entry">
+            <strong>Drop original photo here</strong>
+            <span id="photoDropTargetHint">Copies into Source Data for the selected date</span>
+          </div>
+          <div id="photoLinkDropTarget" class="photo-link-drag-lane" aria-label="Link an original photo for the current entry">Drag here to link instead</div>
         </div>
         <div class="source-frame">
           <img id="sourceImage" class="source-image" alt="">
@@ -5011,6 +5573,13 @@ textarea:focus-visible {
     </div>
   </main>
 </div>
+<div id="imagePreviewModal" class="image-preview-modal" onclick="handleImagePreviewBackdrop(event)" aria-hidden="true">
+  <div class="image-preview-dialog" role="dialog" aria-modal="true" aria-label="Large image preview">
+    <button class="image-preview-close" type="button" onclick="closeImagePreview()" aria-label="Close image preview">&times;</button>
+    <img id="imagePreviewImage" alt="">
+    <div id="imagePreviewCaption" class="image-preview-caption"></div>
+  </div>
+</div>
 <script>
 const state = {
   entries: [],
@@ -5033,12 +5602,19 @@ const state = {
   entryDetailCache: new Map(),
   entryDetailRequests: new Map(),
   suppressedCommittedEntryIds: new Set(),
+  previousEntryStack: [],
   candidateImageObserver: null,
   candidateRenderLimit: 40,
   candidateRenderObserver: null,
   summaryRefreshTimer: null,
   cropEstimateJobId: "",
   activePhotoIndexFolder: "",
+  defaultPhotoIndexFolder: "",
+  activeCandidateTimeFilters: new Set(),
+  filenameDateScopeEntryId: "",
+  filenameDateScopeDays: 0,
+  filenameDateScopeStart: "",
+  filenameDateScopeEnd: "",
   archivedBatchCount: 0
 };
 
@@ -5113,8 +5689,13 @@ function peopleScript(names) {
 
 async function loadSummary() {
   const summary = await fetchJson("/api/summary");
-  if (summary.active_photo_index_folder) {
-    setActivePhotoIndexFolder(summary.active_photo_index_folder);
+  if (Object.prototype.hasOwnProperty.call(summary, "default_photo_index_folder")) {
+    state.defaultPhotoIndexFolder = String(summary.default_photo_index_folder || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(summary, "active_photo_index_folder")) {
+    setActivePhotoIndexFolder(summary.active_photo_index_folder || state.defaultPhotoIndexFolder);
+  } else if (state.defaultPhotoIndexFolder && !state.activePhotoIndexFolder) {
+    setActivePhotoIndexFolder(state.defaultPhotoIndexFolder);
   }
   const counts = summary.status_counts || {};
   const pending = summary.pending_decisions || {};
@@ -5332,7 +5913,10 @@ async function loadEntry(entryId) {
   const entryChanged = state.selectedEntryId !== entryId;
   state.selectedEntryId = entryId;
   renderEntries();
-  if (entryChanged) resetCandidateScroll();
+  if (entryChanged) {
+    scheduleCandidateScrollReset();
+    resetCandidateTimeFilters();
+  }
   maybeLoadMoreEntriesNearEnd().catch(error => {
     document.getElementById("entryPagingSummary").textContent = error.message;
   });
@@ -5340,21 +5924,42 @@ async function loadEntry(entryId) {
   if (cached) {
     state.currentEntry = cached;
     renderEntryDetail();
+    if (entryChanged) scheduleCandidateScrollReset();
   } else {
     document.getElementById("candidateGrid").innerHTML = `<div class="empty">Loading candidates...</div>`;
   }
   const detail = await fetchEntryDetail(entryId, true);
   if (requestId !== state.entryRequestId) return;
   state.currentEntry = detail;
+  syncEntrySummaryFromDetail(detail);
+  renderEntries();
   renderEntryDetail();
+  if (entryChanged) scheduleCandidateScrollReset();
   preloadNextEntry();
+}
+
+function syncEntrySummaryFromDetail(detail) {
+  const entrySummary = state.entries.find(entry => entry.entry_id === detail.entry_id);
+  if (!entrySummary) return;
+  const candidates = Array.isArray(detail?.candidates) ? detail.candidates : [];
+  entrySummary.candidate_count = candidateScopeCandidates(candidates).length;
+  entrySummary.status = detail.status;
+}
+
+function scheduleCandidateScrollReset() {
+  resetCandidateScroll();
+  window.requestAnimationFrame(() => {
+    resetCandidateScroll();
+    window.setTimeout(resetCandidateScroll, 0);
+  });
 }
 
 function resetCandidateScroll() {
   const workspace = document.querySelector(".workspace");
   if (workspace) workspace.scrollTo({top: 0, left: 0});
   const candidatePane = document.querySelector(".candidate-pane");
-  if (candidatePane) candidatePane.scrollTop = 0;
+  if (candidatePane) candidatePane.scrollTo({top: 0, left: 0});
+  window.scrollTo(0, 0);
 }
 
 function capturePickerScroll() {
@@ -5453,8 +6058,9 @@ function renderEntryDetail() {
   document.getElementById("sourceMeta").innerHTML = sourceParts.join("<br>");
   const grid = document.getElementById("candidateGrid");
   grid.innerHTML = "";
-  renderCandidateFolderFilter(entry.candidates);
-  renderCandidateEvidenceFilter(entry.candidates);
+  const scopedCandidates = candidateScopeCandidates(entry.candidates);
+  renderCandidateFolderFilter(scopedCandidates);
+  renderCandidateEvidenceFilter(scopedCandidates);
   defaultVisualControlsForEntry(entry);
   if (!entry.candidates.length) {
     const emptyMessage = entry.manual_search_message
@@ -5473,10 +6079,12 @@ function renderCandidateGrid() {
   if (!entry || !candidates.length) {
     return;
   }
-  renderCandidateEvidenceFilter(candidates);
+  const scopedCandidates = candidateScopeCandidates(candidates);
+  renderCandidateFolderFilter(scopedCandidates);
+  renderCandidateEvidenceFilter(scopedCandidates);
   const visibleCandidates = filteredAndSortedCandidates(candidates);
   const renderedCandidates = visibleCandidates.slice(0, state.candidateRenderLimit);
-  const folderCount = candidateFolderGroups(candidates).length;
+  const folderCount = candidateFolderGroups(scopedCandidates).length;
   const folderFilter = document.getElementById("candidateFolderFilter").value;
   const folderText = folderFilter
     ? " · folder filtered"
@@ -5484,20 +6092,44 @@ function renderCandidateGrid() {
       ? ` · ${folderCount} folders`
       : "";
   const locationText = document.getElementById("candidateLocationOnly").checked ? " · location only" : "";
+  const timeText = activeCandidateTimeFilterLabels().length
+    ? ` · ${activeCandidateTimeFilterLabels().join(" + ")}`
+    : "";
+  const scopeText = currentIndexSearchWholeIndex() || scopedCandidates.length === candidates.length
+    ? ""
+    : ` · ${candidates.length} saved`;
   document.getElementById("candidateSummary").textContent =
-    `Showing ${visibleCandidates.length} of ${candidates.length} candidates${folderText}${locationText}`;
+    `Showing ${visibleCandidates.length} of ${scopedCandidates.length} candidates${folderText}${locationText}${timeText}${scopeText}`;
   if (state.candidateImageObserver) state.candidateImageObserver.disconnect();
   grid.innerHTML = "";
   if (!visibleCandidates.length) {
-    grid.innerHTML = `<div class="empty">No candidates match the current filters.</div>`;
+    const emptyMessage = currentIndexSearchWholeIndex()
+      ? "No candidates match the current filters."
+      : "No indexed filename-prefix candidates match the current date window.";
+    grid.innerHTML = `<div class="empty">${escapeHtml(emptyMessage)}</div>`;
     return;
   }
+  let lastCandidateGroup = "";
+  const hasMixedSourceGroups = visibleCandidates.some(candidateProjectOriginalsSource) && visibleCandidates.some(candidate => !candidateProjectOriginalsSource(candidate));
   for (const candidate of renderedCandidates) {
+    const candidateGroup = candidateProjectOriginalsSource(candidate) ? "project-originals" : "other";
+    if (hasMixedSourceGroups && candidateGroup !== lastCandidateGroup) {
+      const heading = document.createElement("div");
+      heading.className = "candidate-group-heading";
+      heading.textContent = candidateGroup === "project-originals"
+        ? "Original Photos matching Project365 Entries"
+        : "Other candidates";
+      grid.appendChild(heading);
+      lastCandidateGroup = candidateGroup;
+    }
     const card = document.createElement("article");
-    card.className = `candidate-card ${candidate.selected ? "selected" : ""}`;
+    card.className = `candidate-card ${candidate.selected ? "selected" : ""} ${candidateProjectOriginalsSource(candidate) ? "project-originals-source" : ""}`;
     card.dataset.candidateToken = candidate.token;
+    const candidateImageUrl = `/image/${candidate.token}?max=640`;
     card.innerHTML = `
-      <img class="candidate-image" data-src="/image/${candidate.token}?max=640" decoding="async" alt="">
+      <button class="image-preview-trigger" type="button" onclick="openImagePreviewFromTrigger(this)" data-preview-url="${escapeHtml(candidateImageUrl)}" data-preview-title="${escapeHtml(candidate.filename || "Candidate")}" data-preview-path="${escapeHtml(candidate.path || "")}" aria-label="Open larger ${escapeHtml(candidate.filename || "candidate")} image">
+        <img class="candidate-image" data-src="${escapeHtml(candidateImageUrl)}" decoding="async" alt="">
+      </button>
       <div class="candidate-meta">
         <div class="candidate-filename-row">
           <strong>${escapeHtml(candidate.filename)}</strong>
@@ -5514,7 +6146,7 @@ function renderCandidateGrid() {
       <div class="candidate-actions">
         <button class="action-button primary" data-action="select">Select</button>
         <button class="action-button ${candidate.associated ? "flagged" : ""}" data-action="flag" title="${escapeHtml(flagButtonTitle(candidate))}">${escapeHtml(flagButtonLabel(candidate))}</button>
-        <button class="action-button ${candidate.selected ? "linked" : ""}" data-action="link" aria-pressed="${candidate.selected ? "true" : "false"}" title="Matches the origional to the target, but does NOT refresh the page">${candidate.selected ? "Linked" : "Link"}</button>
+        <button class="action-button ${candidateLinked(candidate) ? "linked" : ""}" data-action="link" aria-pressed="${candidateLinked(candidate) ? "true" : "false"}" title="${escapeHtml(linkButtonTitle(candidate))}" ${candidate.selected ? "disabled" : ""}>${escapeHtml(linkButtonLabel(candidate))}</button>
         <div class="associated-date-panel" data-associated-panel hidden>
           <div class="associated-date-choices" data-associated-choices></div>
           <input type="date" data-associated-date aria-label="Associated date">
@@ -5524,7 +6156,7 @@ function renderCandidateGrid() {
       </div>
     `;
     card.querySelector('[data-action="select"]').onclick = () => saveDecision(candidate, "use_external_original", card);
-    card.querySelector('[data-action="link"]').onclick = () => saveDecision(candidate, "use_external_original", card, {advance: false});
+    card.querySelector('[data-action="link"]').onclick = () => linkAssociatedPhoto(candidate, card);
     card.querySelector('[data-action="flag"]').onclick = () => showAssociatedDatePanel(candidate, card);
     card.querySelector('[data-action="save-flag"]').onclick = () => saveAssociatedPhotoFlag(candidate, card);
     card.querySelector('[data-associated-date]').oninput = () => clearAssociatedDateChoiceSelection(card);
@@ -5562,14 +6194,31 @@ function applyFlagButtonState(button, candidate) {
   button.title = flagButtonTitle(candidate);
 }
 
+function candidateLinked(candidate) {
+  return Boolean(candidate.selected || candidate.associated);
+}
+
+function linkButtonLabel(candidate) {
+  if (candidate.selected) return "Selected";
+  return candidate.associated ? "Linked" : "Link";
+}
+
+function linkButtonTitle(candidate) {
+  if (candidate.selected) return "Primary original selected for this target";
+  if (candidate.associated) return "Additional attachment linked for this target. Click to unlink it.";
+  return "Link as an additional attachment for this target";
+}
+
 function applyLinkButtonState(card, candidate) {
   if (!card) return;
-  card.classList.toggle("selected", Boolean(candidate.selected));
+  card.classList.toggle("selected", candidateLinked(candidate));
   const button = card.querySelector('[data-action="link"]');
   if (!button) return;
-  button.classList.toggle("linked", Boolean(candidate.selected));
-  button.setAttribute("aria-pressed", candidate.selected ? "true" : "false");
-  button.textContent = candidate.selected ? "Linked" : "Link";
+  button.classList.toggle("linked", candidateLinked(candidate));
+  button.setAttribute("aria-pressed", candidateLinked(candidate) ? "true" : "false");
+  button.disabled = Boolean(candidate.selected);
+  button.textContent = linkButtonLabel(candidate);
+  button.title = linkButtonTitle(candidate);
 }
 
 function observeCandidateRenderSentinel(sentinel) {
@@ -5658,18 +6307,195 @@ function observeCandidateImages(grid) {
   for (const image of images) state.candidateImageObserver.observe(image);
 }
 
+function largeImageUrl(url) {
+  const parts = String(url || "").split("#");
+  const hash = parts.length > 1 ? `#${parts.slice(1).join("#")}` : "";
+  const [base, queryText = ""] = parts[0].split("?");
+  const params = new URLSearchParams(queryText);
+  params.set("max", "2048");
+  return `${base}?${params.toString()}${hash}`;
+}
+
+function openImagePreviewFromTrigger(trigger) {
+  if (!trigger) return;
+  openImagePreview(trigger.dataset.previewUrl || "", trigger.dataset.previewTitle || "Image preview", trigger.dataset.previewPath || "");
+}
+
+function openImagePreview(url, title, path) {
+  const modal = document.getElementById("imagePreviewModal");
+  const image = document.getElementById("imagePreviewImage");
+  const caption = document.getElementById("imagePreviewCaption");
+  const closeButton = modal?.querySelector(".image-preview-close");
+  if (!modal || !image || !caption || !url) return;
+  caption.textContent = path ? `${title} | ${path}` : title;
+  image.alt = title || "Large image preview";
+  image.src = largeImageUrl(url);
+  modal.classList.add("is-open");
+  modal.setAttribute("aria-hidden", "false");
+  closeButton?.focus();
+}
+
+function closeImagePreview() {
+  const modal = document.getElementById("imagePreviewModal");
+  const image = document.getElementById("imagePreviewImage");
+  if (!modal || !image) return;
+  modal.classList.remove("is-open");
+  modal.setAttribute("aria-hidden", "true");
+  image.removeAttribute("src");
+}
+
+function handleImagePreviewBackdrop(event) {
+  if (event.target?.id === "imagePreviewModal") closeImagePreview();
+}
+
 function filteredAndSortedCandidates(candidates) {
   const text = document.getElementById("candidateFilter").value.trim().toLowerCase();
   const evidenceFilter = document.getElementById("candidateEvidenceFilter").value;
   const folderFilter = document.getElementById("candidateFolderFilter").value;
   const sortMode = document.getElementById("candidateSort").value;
-  const filtered = candidates.filter(candidate => candidateMatchesText(candidate, text) && candidateMatchesEvidence(candidate, evidenceFilter) && candidateMatchesFolder(candidate, folderFilter) && candidateMatchesLocation(candidate));
+  const filtered = candidateScopeCandidates(candidates).filter(candidate => candidateMatchesText(candidate, text) && candidateMatchesEvidence(candidate, evidenceFilter) && candidateMatchesFolder(candidate, folderFilter) && candidateMatchesLocation(candidate) && candidateMatchesActiveTimeFilters(candidate));
   prepareCandidateTimestampGroups(filtered, sortMode);
   return filtered.sort((left, right) => compareCandidates(left, right, sortMode));
 }
 
+function candidateScopeCandidates(candidates) {
+  if (currentIndexSearchWholeIndex()) return candidates;
+  return candidates.filter(candidate => candidateMatchesCurrentIndexDefaultScope(candidate));
+}
+
+function candidateMatchesCurrentIndexDefaultScope(candidate) {
+  return candidateFilenameStartsWithCurrentScopeDate(candidate);
+}
+
+function candidateInProjectOriginalsFolder(candidate) {
+  if (candidateProjectOriginalsSource(candidate)) return true;
+  const root = normalizedCandidateScopePath(state.defaultPhotoIndexFolder);
+  if (!root) return false;
+  const folder = normalizedCandidateScopePath(candidate.folder_path || "");
+  const path = normalizedCandidateScopePath(candidate.path || "");
+  return folder === root || folder.startsWith(`${root}/`) || path.startsWith(`${root}/`);
+}
+
+function normalizedCandidateScopePath(value) {
+  return String(value || "").trim().replace(/\\/+$/, "");
+}
+
+function candidateFilenameStartsWithCurrentScopeDate(candidate) {
+  const filename = String(candidate.filename || candidate.path?.split("/").pop() || "").trim();
+  if (!filename) return false;
+  return currentFilenameDateScopeDates().some(dateText => filename.startsWith(dateText));
+}
+
+function currentFilenameDateScopeDates() {
+  const entry = state.currentEntry;
+  if (!entry?.entry_date) return [];
+  if (state.filenameDateScopeEntryId === entry.entry_id && state.filenameDateScopeStart && state.filenameDateScopeEnd) {
+    return dateRangeValues(state.filenameDateScopeStart, state.filenameDateScopeEnd);
+  }
+  const days = state.filenameDateScopeEntryId === entry.entry_id
+    ? Number(state.filenameDateScopeDays || 0)
+    : 0;
+  return dateWindowValues(entry.entry_date, Number.isFinite(days) ? days : 0);
+}
+
+function dateWindowValues(dateText, days) {
+  const values = [];
+  for (let offset = -days; offset <= days; offset += 1) {
+    const value = isoDateOffset(dateText, offset);
+    if (value) values.push(value);
+  }
+  return values;
+}
+
+function dateRangeValues(startDate, endDate) {
+  const values = [];
+  let cursor = startDate;
+  for (let count = 0; cursor && cursor <= endDate && count <= 366; count += 1) {
+    values.push(cursor);
+    cursor = isoDateOffset(cursor, 1);
+  }
+  return values;
+}
+
+function isoDateOffset(dateText, offsetDays) {
+  const match = String(dateText || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+  if (!match) return "";
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + offsetDays));
+  return date.toISOString().slice(0, 10);
+}
+
 function candidateMatchesLocation(candidate) {
   return !document.getElementById("candidateLocationOnly").checked || Boolean(candidate.has_embedded_geolocation);
+}
+
+function activeCandidateTimeFilterLabels() {
+  const labels = {
+    morning: "4-8a",
+    midday: "8-12p",
+    "early-afternoon": "12-4p",
+    "late-afternoon": "4-8p",
+    "early-evening": "8-12a",
+    "late-evening": "12-4a"
+  };
+  return [...state.activeCandidateTimeFilters].map(value => labels[value] || value);
+}
+
+function candidateMatchesActiveTimeFilters(candidate) {
+  if (!state.activeCandidateTimeFilters.size) return true;
+  const minutes = candidateTimeOfDayMinutes(candidate);
+  if (minutes === null) return false;
+  for (const filter of state.activeCandidateTimeFilters) {
+    if (candidateTimeMatchesFilter(minutes, filter)) return true;
+  }
+  return false;
+}
+
+function candidateTimeOfDayMinutes(candidate) {
+  const timestamp = candidateCaptureSortTime(candidate);
+  const match = String(timestamp || "").match(/[T ](\\d{2}):(\\d{2})(?::\\d{2})?/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
+
+function candidateTimeMatchesFilter(minutes, filter) {
+  if (filter === "morning") return minutes >= 4 * 60 && minutes < 8 * 60;
+  if (filter === "midday") return minutes >= 8 * 60 && minutes < 12 * 60;
+  if (filter === "early-afternoon") return minutes >= 12 * 60 && minutes < 16 * 60;
+  if (filter === "late-afternoon") return minutes >= 16 * 60 && minutes < 20 * 60;
+  if (filter === "early-evening") return minutes >= 20 * 60;
+  if (filter === "late-evening") return minutes < 4 * 60;
+  return false;
+}
+
+function toggleCandidateTimeFilter(button) {
+  const value = button?.dataset.timeFilter || "";
+  if (!value) return;
+  if (state.activeCandidateTimeFilters.has(value)) {
+    state.activeCandidateTimeFilters.delete(value);
+  } else {
+    state.activeCandidateTimeFilters.add(value);
+  }
+  updateCandidateTimeFilterButtons();
+  state.candidateRenderLimit = 40;
+  if (state.candidateRenderObserver) state.candidateRenderObserver.disconnect();
+  renderCandidateGrid();
+}
+
+function resetCandidateTimeFilters() {
+  if (!state.activeCandidateTimeFilters.size) return;
+  state.activeCandidateTimeFilters.clear();
+  updateCandidateTimeFilterButtons();
+}
+
+function updateCandidateTimeFilterButtons() {
+  document.querySelectorAll("[data-time-filter]").forEach(button => {
+    button.setAttribute("aria-pressed", state.activeCandidateTimeFilters.has(button.dataset.timeFilter) ? "true" : "false");
+  });
 }
 
 function candidateFolderLabel(path) {
@@ -5757,54 +6583,59 @@ function updateManualDateSearchControls(entry) {
   const button = document.getElementById("searchIndexDateRange");
   const defaultButton = document.getElementById("defaultDateRange");
   const wholeIndexCheckbox = document.getElementById("indexSearchWholeIndex");
-  const filenameOnlyCheckbox = document.getElementById("indexSearchFilenameOnly");
+  const modifiedDateCheckbox = document.getElementById("indexSearchModifiedDate");
   const disabled = !entry;
   startInput.disabled = disabled;
   endInput.disabled = disabled;
   button.disabled = disabled;
   defaultButton.disabled = disabled;
   wholeIndexCheckbox.disabled = disabled;
-  filenameOnlyCheckbox.disabled = disabled;
+  modifiedDateCheckbox.disabled = disabled;
   if (entry && startInput.dataset.entryId !== entry.entry_id) {
-    if (state.activePhotoIndexFolder) {
-      wholeIndexCheckbox.checked = false;
-      wholeIndexCheckbox.dataset.userChanged = "";
-      filenameOnlyCheckbox.checked = false;
-    }
+    wholeIndexCheckbox.checked = false;
+    wholeIndexCheckbox.dataset.userChanged = "";
+    modifiedDateCheckbox.checked = false;
+    state.filenameDateScopeEntryId = entry.entry_id;
+    state.filenameDateScopeDays = 0;
+    state.filenameDateScopeStart = "";
+    state.filenameDateScopeEnd = "";
     startInput.dataset.entryId = entry.entry_id;
     endInput.dataset.entryId = entry.entry_id;
     startInput.value = entry.entry_date;
     endInput.value = entry.entry_date;
+  } else if (!entry) {
+    state.filenameDateScopeEntryId = "";
+    state.filenameDateScopeDays = 0;
+    state.filenameDateScopeStart = "";
+    state.filenameDateScopeEnd = "";
   }
   updateManualDateSearchScope();
 }
 
 function updateManualDateSearchScope() {
   const checkbox = document.getElementById("indexSearchWholeIndex");
-  const filenameOnlyCheckbox = document.getElementById("indexSearchFilenameOnly");
+  const modifiedDateCheckbox = document.getElementById("indexSearchModifiedDate");
   const target = document.getElementById("indexSearchScope");
   if (!checkbox || !target) return;
-  const constrained = Boolean(state.activePhotoIndexFolder);
   if (checkbox.dataset.userChanged !== "1") {
-    checkbox.checked = !constrained;
+    checkbox.checked = false;
   }
-  if (filenameOnlyCheckbox) {
-    filenameOnlyCheckbox.disabled = !state.currentEntry;
-    if (!checkbox.checked) {
-      filenameOnlyCheckbox.checked = false;
-    }
+  const wholeIndex = currentIndexSearchWholeIndex();
+  if (modifiedDateCheckbox) {
+    if (!wholeIndex) modifiedDateCheckbox.checked = false;
+    modifiedDateCheckbox.disabled = !state.currentEntry || !wholeIndex;
   }
-  const scope = constrained && !checkbox.checked
-    ? `Active folder: ${state.activePhotoIndexFolder}`
-    : currentIndexFilenameOnly()
-      ? "Whole photo index, file names only"
-      : "Whole photo index";
+  const scope = wholeIndex
+    ? `Whole photo index, ${currentIndexDateSourceLabel()}`
+    : state.defaultPhotoIndexFolder
+      ? `Project originals folder first: ${state.defaultPhotoIndexFolder}, plus filename prefixes across the index`
+      : "Filename prefixes across the index";
   target.textContent = scope;
   updateDateRangeButtons(state.currentEntry);
 }
 
 function usedDateRangeDays(entry) {
-  const includeUnscopedRangeState = !state.activePhotoIndexFolder && currentIndexSearchWholeIndex();
+  const includeUnscopedRangeState = currentIndexSearchWholeIndex();
   const days = includeUnscopedRangeState
     ? new Set((entry?.used_range_days || []).map(Number).filter(Number.isFinite))
     : new Set();
@@ -5831,39 +6662,62 @@ function defaultEvidenceMatchesCurrentIndexScope(evidence) {
   const wholeIndex = currentIndexSearchWholeIndex();
   const hasWholeIndexScope = /manual_default_scope_whole_index/i.test(evidence);
   const hasFolderScope = /manual_default_scope_folder/i.test(evidence);
+  const hasProjectOriginalsScope = /manual_default_scope_project_originals/i.test(evidence);
+  const hasFilenameIndexScope = /manual_default_scope_filename_index/i.test(evidence);
   const hasFilenameOnlySource = /manual_default_date_source_filename_only/i.test(evidence);
+  const hasModifiedDateSource = /manual_default_date_source_modified_date/i.test(evidence);
   if (wholeIndex) {
-    if (hasWholeIndexScope) return hasFilenameOnlySource === currentIndexFilenameOnly();
-    return !state.activePhotoIndexFolder && !hasFolderScope && !currentIndexFilenameOnly();
+    if (hasWholeIndexScope) return !hasFilenameOnlySource && hasModifiedDateSource === currentIndexIncludeModifiedDates();
+    return !hasFolderScope && !hasProjectOriginalsScope && !hasFilenameIndexScope && !currentIndexIncludeModifiedDates();
   }
-  return !hasWholeIndexScope;
+  return !hasWholeIndexScope && hasFilenameOnlySource && !hasModifiedDateSource;
 }
 
 function rangeEvidenceMatchesCurrentIndexScope(evidence) {
   const wholeIndex = currentIndexSearchWholeIndex();
   const hasWholeIndexScope = /(?:manual_range|auto_range)_scope_whole_index/i.test(evidence);
   const hasFolderScope = /(?:manual_range|auto_range)_scope_folder/i.test(evidence);
+  const hasProjectOriginalsScope = /(?:manual_range|auto_range)_scope_project_originals/i.test(evidence);
+  const hasFilenameIndexScope = /(?:manual_range|auto_range)_scope_filename_index/i.test(evidence);
   const hasFilenameOnlySource = /manual_range_date_source_filename_only/i.test(evidence);
+  const hasModifiedDateSource = /manual_range_date_source_modified_date/i.test(evidence);
   if (wholeIndex) {
-    if (hasWholeIndexScope) return hasFilenameOnlySource === currentIndexFilenameOnly();
-    return !state.activePhotoIndexFolder && !hasFolderScope && !currentIndexFilenameOnly();
+    if (hasWholeIndexScope) return !hasFilenameOnlySource && hasModifiedDateSource === currentIndexIncludeModifiedDates();
+    return !hasFolderScope && !hasProjectOriginalsScope && !hasFilenameIndexScope && !currentIndexIncludeModifiedDates();
   }
-  return !hasWholeIndexScope;
+  return !hasWholeIndexScope && hasFilenameOnlySource && !hasModifiedDateSource;
 }
 
 function currentIndexSearchWholeIndex() {
   const checkbox = document.getElementById("indexSearchWholeIndex");
-  return checkbox ? checkbox.checked : !state.activePhotoIndexFolder;
+  return checkbox ? checkbox.checked : false;
 }
 
-function currentIndexFilenameOnly() {
-  const checkbox = document.getElementById("indexSearchFilenameOnly");
+function currentIndexIncludeModifiedDates() {
+  const checkbox = document.getElementById("indexSearchModifiedDate");
   return currentIndexSearchWholeIndex() && Boolean(checkbox?.checked);
 }
 
+function currentIndexRangeDateSourceLabel() {
+  if (!currentIndexSearchWholeIndex()) return "filename prefixes";
+  return currentIndexIncludeModifiedDates()
+    ? "file name, media, filesystem, and modified dates"
+    : "file name, media, and filesystem dates";
+}
+
+function currentIndexDateSourceLabel() {
+  return currentIndexRangeDateSourceLabel();
+}
+
 function currentIndexScopeLabel() {
-  if (state.activePhotoIndexFolder && !currentIndexSearchWholeIndex()) return "active folder";
-  return currentIndexFilenameOnly() ? "whole photo index filenames only" : "whole photo index";
+  const scope = currentIndexSearchWholeIndex()
+    ? "whole photo index"
+    : "project originals folder first plus filename prefixes across the index";
+  return `${scope}, ${currentIndexDateSourceLabel()}`;
+}
+
+function ensureIndexSearchScopeAvailable() {
+  return true;
 }
 
 function shouldDefaultLikely(candidates) {
@@ -5874,7 +6728,7 @@ function shouldDefaultLikely(candidates) {
 function candidateEvidenceCountBase(candidates) {
   const text = document.getElementById("candidateFilter").value.trim().toLowerCase();
   const folderFilter = document.getElementById("candidateFolderFilter").value;
-  return candidates.filter(candidate => candidateMatchesText(candidate, text) && candidateMatchesFolder(candidate, folderFilter) && candidateMatchesLocation(candidate));
+  return candidates.filter(candidate => candidateMatchesText(candidate, text) && candidateMatchesFolder(candidate, folderFilter) && candidateMatchesLocation(candidate) && candidateMatchesActiveTimeFilters(candidate));
 }
 
 function fileTypeLabel(path, mimeType = "") {
@@ -6006,6 +6860,10 @@ function candidateMatchesEntryDate(candidate, fields) {
   return fields.some(field => splitDateList(candidate[field]).includes(entryDate));
 }
 
+function candidateMatchesTargetDate(candidate) {
+  return candidateMatchesEntryDate(candidate, ["filename_dates", "media_creation_dates", "filesystem_dates"]);
+}
+
 function splitDateList(value) {
   return String(value || "").split(";").map(item => item.trim()).filter(Boolean);
 }
@@ -6046,6 +6904,12 @@ function prepareCandidateTimestampGroups(candidates, sortMode) {
 }
 
 function compareCandidates(left, right, sortMode) {
+  const targetDateCompare = candidateTargetDateRank(left) - candidateTargetDateRank(right);
+  if (targetDateCompare) return targetDateCompare;
+  const manualLinkCompare = candidateManualLinkRank(left) - candidateManualLinkRank(right);
+  if (manualLinkCompare) return manualLinkCompare;
+  const sourceCompare = candidateProjectOriginalRank(left) - candidateProjectOriginalRank(right);
+  if (sourceCompare) return sourceCompare;
   if (sortMode === "capture_time") {
     const groupCompare = compareTimestampGroups(left, right, sortMode);
     return groupCompare
@@ -6164,6 +7028,23 @@ function compareCandidateNames(left, right) {
   return String(left.filename || "").localeCompare(String(right.filename || ""));
 }
 
+function candidateManualLinkRank(candidate) {
+  const text = `${candidate.evidence || ""} ${candidate.filename || ""} ${candidate.path || ""}`;
+  return /manual_link|manual_drop_copy/i.test(text) ? 0 : 1;
+}
+
+function candidateProjectOriginalRank(candidate) {
+  return candidateProjectOriginalsSource(candidate) ? 0 : 1;
+}
+
+function candidateProjectOriginalsSource(candidate) {
+  return Boolean(candidate.project_originals_source);
+}
+
+function candidateTargetDateRank(candidate) {
+  return candidateMatchesTargetDate(candidate) ? 0 : 1;
+}
+
 function numericCandidateValue(value, fallback = 0) {
   const number = Number(String(value || "").trim());
   return Number.isFinite(number) ? number : fallback;
@@ -6212,31 +7093,36 @@ async function saveDecision(candidate, decision, card, options = {}) {
   const nextEntryId = nextEntryIdAfterCurrent();
   const buttons = [...card.querySelectorAll("button")];
   buttons.forEach(button => { button.disabled = true; });
-  const isLink = decision === "use_external_original" && options.advance === false;
+  const isLink = options.link === true;
   const linkScrollState = isLink ? capturePickerScroll() : null;
   document.getElementById("crawlStatus").textContent = isLink
-    ? "Linking original..."
+    ? (decision === "unlink_associated_photo" ? "Unlinking attachment..." : "Linking attachment...")
     : decision === "rejected" ? "Saving rejection..." : "Saving selection...";
   try {
     const updatedEntry = await fetchJson("/api/decision", {
       method: "POST",
       headers: {"content-type": "application/json"},
-      body: JSON.stringify({
+      body: JSON.stringify(Object.assign({
         entry_id: currentEntryId,
         candidate_path: candidate.path,
         decision,
         notes
-      })
+      }, options.extra || {}))
     });
     const entrySummary = state.entries.find(entry => entry.entry_id === currentEntryId);
     if (entrySummary) {
       entrySummary.status = updatedEntry.status;
       entrySummary.candidate_count = updatedEntry.candidate_count;
       entrySummary.selected_count = updatedEntry.selected_count;
+      entrySummary.accepted_count = updatedEntry.accepted_count;
+      entrySummary.associated_count = updatedEntry.associated_count;
+      entrySummary.rejected_count = updatedEntry.rejected_count;
+      entrySummary.fallback_count = updatedEntry.fallback_count;
     }
     const shouldAdvance = options.advance !== false && shouldAdvanceAfterDecision(decision, updatedEntry);
     state.entryDetailCache.delete(currentEntryId);
     if (shouldAdvance) {
+      rememberPreviousEntry(currentEntryBeforeSave);
       const index = state.entries.findIndex(entry => entry.entry_id === currentEntryId);
       if (index >= 0) state.entries.splice(index, 1);
       renderEntries();
@@ -6263,20 +7149,53 @@ async function saveDecision(candidate, decision, card, options = {}) {
             item.review_notes = notes;
           }
         }
+      } else if (decision === "external_original_associated_photo") {
+        const associatedUpdate = {
+          associated: true,
+          review_decision: decision,
+          review_notes: notes,
+          associated_entry_date: options.extra?.associated_entry_date || state.currentEntry.entry_date || "",
+          associated_date_source: options.extra?.associated_date_source || "entry"
+        };
+        for (const item of state.currentEntry.candidates) {
+          if (item.path === candidate.path) {
+            Object.assign(item, associatedUpdate);
+          }
+        }
+        Object.assign(candidate, associatedUpdate);
+      } else if (decision === "unlink_associated_photo") {
+        const associatedUpdate = {
+          associated: false,
+          review_decision: "",
+          review_notes: "",
+          associated_entry_date: "",
+          associated_date_source: ""
+        };
+        for (const item of state.currentEntry.candidates) {
+          if (item.path === candidate.path) {
+            Object.assign(item, associatedUpdate);
+          }
+        }
+        Object.assign(candidate, associatedUpdate);
       }
       state.currentEntry.candidate_count = updatedEntry.candidate_count;
       state.currentEntry.candidate_total = updatedEntry.candidate_count;
       state.currentEntry.status = updatedEntry.status;
       state.currentEntry.selected_count = updatedEntry.selected_count;
+      state.currentEntry.accepted_count = updatedEntry.accepted_count;
+      state.currentEntry.associated_count = updatedEntry.associated_count;
+      state.currentEntry.rejected_count = updatedEntry.rejected_count;
+      state.currentEntry.fallback_count = updatedEntry.fallback_count;
       state.entryDetailCache.set(currentEntryId, state.currentEntry);
       if (isLink) {
         applyEntryListState(entrySummary || state.currentEntry);
-	        for (const item of state.currentEntry.candidates) {
-	          const itemCard = item.path === candidate.path
-	            ? card
-	            : [...document.querySelectorAll(".candidate-card")].find(candidateCard => candidateCard.dataset.candidateToken === item.token);
-	          applyLinkButtonState(itemCard, item);
-	        }
+        for (const item of state.currentEntry.candidates) {
+          const itemCard = item.path === candidate.path
+            ? card
+            : [...document.querySelectorAll(".candidate-card")].find(candidateCard => candidateCard.dataset.candidateToken === item.token);
+          applyLinkButtonState(itemCard, item);
+          applyFlagButtonState(itemCard?.querySelector('[data-action="flag"]'), item);
+        }
         buttons.forEach(button => { button.disabled = false; });
         document.getElementById("entrySubhead").textContent =
           `${state.currentEntry.candidate_count} candidates · ${statusLabel(state.currentEntry.status)}`;
@@ -6285,7 +7204,9 @@ async function saveDecision(candidate, decision, card, options = {}) {
         renderEntries();
         renderEntryDetail();
       }
-      document.getElementById("crawlStatus").textContent = isLink ? "Linked. Commit when ready." : "Rejected.";
+      document.getElementById("crawlStatus").textContent = isLink
+        ? (decision === "unlink_associated_photo" ? "Unlinked." : "Linked. Apply decisions when ready.")
+        : "Rejected.";
     }
     scheduleSummaryRefresh();
   } catch (error) {
@@ -6293,6 +7214,28 @@ async function saveDecision(candidate, decision, card, options = {}) {
     buttons.forEach(button => { button.disabled = false; });
     if (isLink) restorePickerScroll(linkScrollState);
   }
+}
+
+async function linkAssociatedPhoto(candidate, card) {
+  if (candidate.selected) {
+    document.getElementById("crawlStatus").textContent = "This is already the selected original.";
+    return;
+  }
+  if (candidate.associated) {
+    await saveDecision(candidate, "unlink_associated_photo", card, {
+      advance: false,
+      link: true
+    });
+    return;
+  }
+  await saveDecision(candidate, "external_original_associated_photo", card, {
+    advance: false,
+    link: true,
+    extra: {
+      associated_entry_date: state.currentEntry?.entry_date || "",
+      associated_date_source: "entry"
+    }
+  });
 }
 
 async function showAssociatedDatePanel(candidate, card) {
@@ -6501,6 +7444,53 @@ function scheduleSummaryRefresh() {
   }, 1500);
 }
 
+function navigableEntrySummary(entry) {
+  if (!entry?.entry_id) return null;
+  return {
+    entry_id: entry.entry_id,
+    entry_date: entry.entry_date || "",
+    status: entry.status || "needs_review",
+    candidate_count: Number(entry.candidate_count || entry.candidate_total || 0),
+    selected_count: Number(entry.selected_count || entry.accepted_count || 0),
+    accepted_count: Number(entry.accepted_count || entry.selected_count || 0),
+    associated_count: Number(entry.associated_count || 0),
+    rejected_count: Number(entry.rejected_count || 0),
+    fallback_count: Number(entry.fallback_count || 0),
+    source_token: entry.source_token || "",
+    source_exists: Boolean(entry.source_exists),
+    people_names: Array.isArray(entry.people_names) ? entry.people_names : [],
+    current_match_status: entry.current_match_status || "",
+    current_decision: entry.current_decision || "",
+    manual_search_message: entry.manual_search_message || "",
+    used_range_days: entry.used_range_days || null
+  };
+}
+
+function rememberPreviousEntry(entry) {
+  const summary = navigableEntrySummary(entry);
+  if (!summary || summary.entry_id === state.selectedEntryId && !state.currentEntry) return;
+  state.previousEntryStack = state.previousEntryStack.filter(item => item.entry_id !== summary.entry_id);
+  state.previousEntryStack.push(summary);
+  if (state.previousEntryStack.length > 20) state.previousEntryStack.shift();
+}
+
+async function loadRememberedPreviousEntry() {
+  while (state.previousEntryStack.length) {
+    const previous = state.previousEntryStack.pop();
+    if (!previous?.entry_id || previous.entry_id === state.selectedEntryId) continue;
+    if (!state.entries.some(entry => entry.entry_id === previous.entry_id)) {
+      const index = currentEntryIndex();
+      state.entries.splice(index >= 0 ? index : 0, 0, previous);
+      state.entryOffset = state.entries.length;
+      renderEntries();
+      renderEntryPaging();
+    }
+    await loadEntry(previous.entry_id);
+    return true;
+  }
+  return false;
+}
+
 function nextEntryIdAfterCurrent() {
   const index = state.entries.findIndex(entry => entry.entry_id === state.selectedEntryId);
   if (index < 0) return "";
@@ -6519,7 +7509,66 @@ function currentEntryPositionLabel() {
 }
 
 function updateNavigationState() {
-  if (currentEntryIndex() < 0) document.getElementById("entryPosition").textContent = "";
+  const index = currentEntryIndex();
+  if (index < 0) document.getElementById("entryPosition").textContent = "";
+  const previousButton = document.getElementById("previousEntryButton");
+  const nextButton = document.getElementById("nextEntryButton");
+  if (previousButton) previousButton.disabled = index <= 0 && !state.previousEntryStack.length;
+  if (nextButton) nextButton.disabled = index < 0 || (index >= state.entries.length - 1 && !state.entryHasMore);
+}
+
+async function selectAdjacentEntry(direction) {
+  const index = currentEntryIndex();
+  if (index < 0) {
+    if (direction < 0) await loadRememberedPreviousEntry();
+    return;
+  }
+  const targetIndex = index + direction;
+  if (targetIndex >= 0 && targetIndex < state.entries.length) {
+    await loadEntry(state.entries[targetIndex].entry_id);
+    return;
+  }
+  if (direction < 0 && await loadRememberedPreviousEntry()) return;
+  if (direction > 0 && state.entryHasMore) {
+    await loadMoreEntries();
+    const refreshedIndex = currentEntryIndex();
+    const next = state.entries[refreshedIndex + 1];
+    if (next) await loadEntry(next.entry_id);
+  }
+}
+
+function isPickerShortcutEditableTarget(target) {
+  if (!target) return false;
+  const focusedControl = target.closest?.("input, select, textarea, button, a, [contenteditable='true']");
+  return Boolean(focusedControl);
+}
+
+function runPickerShortcutButton(buttonId, action) {
+  const button = document.getElementById(buttonId);
+  if (!button || button.disabled) return false;
+  action();
+  return true;
+}
+
+function handlePickerKeyboardShortcut(event) {
+  const previewModal = document.getElementById("imagePreviewModal");
+  if (event.key === "Escape" && previewModal?.classList.contains("is-open")) {
+    closeImagePreview();
+    event.preventDefault();
+    return;
+  }
+  if (event.repeat || event.metaKey || event.ctrlKey || event.altKey || isPickerShortcutEditableTarget(event.target)) return;
+  let handled = false;
+  if (event.key === "ArrowLeft") {
+    handled = runPickerShortcutButton("previousEntryButton", () => selectAdjacentEntry(-1));
+  } else if (event.key === "ArrowRight") {
+    handled = runPickerShortcutButton("nextEntryButton", () => selectAdjacentEntry(1));
+  } else if (event.key.toLowerCase() === "r") {
+    handled = runPickerShortcutButton("rejectAllButton", rejectAllCandidates);
+  } else if (event.key.toLowerCase() === "p") {
+    handled = runPickerShortcutButton("fallbackButton", () => document.getElementById("fallbackButton").click());
+  }
+  if (handled) event.preventDefault();
 }
 
 function shouldAdvanceAfterDecision(decision, updatedEntry) {
@@ -6597,36 +7646,40 @@ async function applyDecisions() {
 
 async function expandDefaultDateRange() {
   if (!state.currentEntry) return;
+  if (!ensureIndexSearchScopeAvailable()) return;
   const buttons = [document.getElementById("defaultDateRange"), ...document.querySelectorAll("[data-range-days]")];
   buttons.forEach(button => { button.disabled = true; });
   const entryId = state.currentEntry.entry_id;
   const wholeIndex = currentIndexSearchWholeIndex();
-  const filenameOnly = currentIndexFilenameOnly();
-  const scopeLabel = currentIndexScopeLabel();
-  setCrawlStatus(`Searching default ${scopeLabel} candidates.`, true);
+  const filenameOnly = !wholeIndex;
+  const includeModifiedDates = wholeIndex && currentIndexIncludeModifiedDates();
+  const scopeLabel = currentIndexScopeLabel(false);
+    setCrawlStatus(`Searching default ${scopeLabel} candidates.`, true);
   try {
-    const payload = {entry_id: entryId, search_whole_index: wholeIndex, whole_index_filename_only: filenameOnly};
-    if (state.activePhotoIndexFolder && !wholeIndex) payload.photo_index_folder = state.activePhotoIndexFolder;
+    const payload = {entry_id: entryId, search_whole_index: wholeIndex, filename_dates_only: filenameOnly, include_modified_dates: includeModifiedDates};
     const result = await fetchJson("/api/expand-default-date-range", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify(payload)
     });
+    state.filenameDateScopeEntryId = entryId;
+    state.filenameDateScopeDays = 0;
+    state.filenameDateScopeStart = "";
+    state.filenameDateScopeEnd = "";
     state.currentEntry = result.entry;
     state.entryDetailCache.set(entryId, result.entry);
-    const entrySummary = state.entries.find(entry => entry.entry_id === entryId);
-    if (entrySummary) {
-      entrySummary.candidate_count = result.entry.candidate_count;
-      entrySummary.status = result.entry.status;
-    }
+    syncEntrySummaryFromDetail(result.entry);
     renderEntries();
     renderEntryDetail();
     await loadBatches();
     const resultScope = result.search_whole_index
-      ? result.whole_index_filename_only ? "whole photo index filenames only" : "whole photo index"
-      : "active folder";
+      ? "whole photo index"
+      : "project originals folder";
+    const resultDateSources = result.filename_dates_only
+      ? "filename dates"
+      : result.include_modified_dates ? "file name, media, filesystem, and modified dates" : "file name, media, and filesystem dates";
     const actionLabel = result.replace_candidates ? "Loaded" : "Added";
-    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from the default search in the ${resultScope}. ${result.candidate_count || 0} candidates are now available.`);
+    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from the default search in the ${resultScope}, ${resultDateSources}. ${result.candidate_count || 0} candidates are now available.`);
   } catch (error) {
     setCrawlStatus(error.message);
   } finally {
@@ -6636,36 +7689,40 @@ async function expandDefaultDateRange() {
 
 async function expandDateRange(days) {
   if (!state.currentEntry) return;
+  if (!ensureIndexSearchScopeAvailable()) return;
   const buttons = [document.getElementById("defaultDateRange"), ...document.querySelectorAll("[data-range-days]")];
   buttons.forEach(button => { button.disabled = true; });
   const entryId = state.currentEntry.entry_id;
   const wholeIndex = currentIndexSearchWholeIndex();
-  const filenameOnly = currentIndexFilenameOnly();
-  const scopeLabel = currentIndexScopeLabel();
-  setCrawlStatus(`Expanding ${scopeLabel} candidates to ±${days} days.`, true);
+  const filenameOnly = !wholeIndex;
+  const includeModifiedDates = wholeIndex && currentIndexIncludeModifiedDates();
+  const scopeLabel = currentIndexScopeLabel(false);
+    setCrawlStatus(`Expanding ${scopeLabel} candidates to ±${days} days.`, true);
   try {
-    const payload = {entry_id: entryId, days, search_whole_index: wholeIndex, whole_index_filename_only: filenameOnly};
-    if (state.activePhotoIndexFolder && !wholeIndex) payload.photo_index_folder = state.activePhotoIndexFolder;
+    const payload = {entry_id: entryId, days, search_whole_index: wholeIndex, filename_dates_only: filenameOnly, include_modified_dates: includeModifiedDates};
     const result = await fetchJson("/api/expand-date-range", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify(payload)
     });
+    state.filenameDateScopeEntryId = entryId;
+    state.filenameDateScopeDays = days;
+    state.filenameDateScopeStart = "";
+    state.filenameDateScopeEnd = "";
     state.currentEntry = result.entry;
     state.entryDetailCache.set(entryId, result.entry);
-    const entrySummary = state.entries.find(entry => entry.entry_id === entryId);
-    if (entrySummary) {
-      entrySummary.candidate_count = result.entry.candidate_count;
-      entrySummary.status = result.entry.status;
-    }
+    syncEntrySummaryFromDetail(result.entry);
     renderEntries();
     renderEntryDetail();
     await loadBatches();
     const resultScope = result.search_whole_index
-      ? result.whole_index_filename_only ? "whole photo index filenames only" : "whole photo index"
-      : "active folder";
+      ? "whole photo index"
+      : "project originals folder";
+    const resultDateSources = result.filename_dates_only
+      ? "filename dates"
+      : result.include_modified_dates ? "file name, media, filesystem, and modified dates" : "file name, media, and filesystem dates";
     const actionLabel = result.replace_candidates ? "Loaded" : "Added";
-    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from ±${days} days in the ${resultScope}. ${result.candidate_count || 0} candidates are now available.`);
+    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from ±${days} days in the ${resultScope}, ${resultDateSources}. ${result.candidate_count || 0} candidates are now available.`);
   } catch (error) {
     setCrawlStatus(error.message);
   } finally {
@@ -6678,9 +7735,11 @@ async function searchIndexDateRange() {
   if (!entry) return;
   const startDate = document.getElementById("indexDateStart").value;
   const endDate = document.getElementById("indexDateEnd").value;
-  const wholeIndex = document.getElementById("indexSearchWholeIndex").checked;
-  const filenameOnly = currentIndexFilenameOnly();
+  const wholeIndex = currentIndexSearchWholeIndex();
+  const filenameOnly = !wholeIndex;
+  const includeModifiedDates = wholeIndex && currentIndexIncludeModifiedDates();
   const button = document.getElementById("searchIndexDateRange");
+  if (!ensureIndexSearchScopeAvailable()) return;
   if (!startDate || !endDate) {
     setCrawlStatus("Enter a start and end date.");
     return;
@@ -6694,23 +7753,21 @@ async function searchIndexDateRange() {
       start_date: startDate,
       end_date: endDate,
       search_whole_index: wholeIndex,
-      whole_index_filename_only: filenameOnly
+      filename_dates_only: filenameOnly,
+      include_modified_dates: includeModifiedDates
     };
-    if (state.activePhotoIndexFolder && !wholeIndex) {
-      payload.photo_index_folder = state.activePhotoIndexFolder;
-    }
     const result = await fetchJson("/api/search-index-date-range", {
       method: "POST",
       headers: {"content-type": "application/json"},
       body: JSON.stringify(payload)
     });
+    state.filenameDateScopeEntryId = entry.entry_id;
+    state.filenameDateScopeDays = 0;
+    state.filenameDateScopeStart = startDate;
+    state.filenameDateScopeEnd = endDate;
     state.currentEntry = result.entry;
     state.entryDetailCache.set(entry.entry_id, result.entry);
-    const entrySummary = state.entries.find(item => item.entry_id === entry.entry_id);
-    if (entrySummary) {
-      entrySummary.candidate_count = result.entry.candidate_count;
-      entrySummary.status = result.entry.status;
-    }
+    syncEntrySummaryFromDetail(result.entry);
     renderEntries();
     renderEntryDetail();
     await loadBatches();
@@ -6718,10 +7775,13 @@ async function searchIndexDateRange() {
       ? result.start_date
       : `${result.start_date} to ${result.end_date}`;
     const resultScope = result.search_whole_index
-      ? result.whole_index_filename_only ? "whole photo index filenames only" : "whole photo index"
-      : "active folder";
+      ? "whole photo index"
+      : "project originals folder";
+    const resultDateSources = result.filename_dates_only
+      ? "filename dates"
+      : result.include_modified_dates ? "file name, media, filesystem, and modified dates" : "file name, media, and filesystem dates";
     const actionLabel = result.replace_candidates ? "Loaded" : "Added";
-    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from ${rangeLabel} in the ${resultScope}. ${result.candidate_count || 0} candidates are now available.`);
+    setCrawlStatus(`${actionLabel} ${result.added_count || 0} candidates from ${rangeLabel} in the ${resultScope}, ${resultDateSources}. ${result.candidate_count || 0} candidates are now available.`);
   } catch (error) {
     setCrawlStatus(error.message);
   } finally {
@@ -6765,6 +7825,7 @@ async function rejectAllCandidates() {
       renderEntries();
       renderEntryDetail();
     } else {
+      rememberPreviousEntry(updatedEntry);
       const index = state.entries.findIndex(entry => entry.entry_id === currentEntryId);
       if (index >= 0) state.entries.splice(index, 1);
       renderEntries();
@@ -6792,6 +7853,9 @@ document.getElementById("candidateEvidenceFilter").onchange = renderCandidateGri
 document.getElementById("candidateFolderFilter").onchange = renderCandidateGrid;
 document.getElementById("candidateSort").onchange = renderCandidateGrid;
 document.getElementById("candidateLocationOnly").onchange = renderCandidateGrid;
+document.querySelectorAll("[data-time-filter]").forEach(button => {
+  button.onclick = () => toggleCandidateTimeFilter(button);
+});
 document.getElementById("chooseFolder").onclick = chooseFolder;
 document.getElementById("choosePhoto").onclick = choosePhoto;
 document.getElementById("searchPanelToggle").onclick = () => {
@@ -6803,6 +7867,8 @@ document.getElementById("crawlSelected").onclick = () => startCrawl("selected");
 document.getElementById("crawlVisible").onclick = () => startCrawl("visible");
 document.getElementById("selectVisible").onclick = selectVisibleEntries;
 document.getElementById("clearSelection").onclick = clearSelectedEntries;
+document.getElementById("previousEntryButton").onclick = () => selectAdjacentEntry(-1);
+document.getElementById("nextEntryButton").onclick = () => selectAdjacentEntry(1);
 document.getElementById("applyDecisionsButton").onclick = applyDecisions;
 document.getElementById("rejectAllButton").onclick = rejectAllCandidates;
 document.getElementById("defaultDateRange").onclick = expandDefaultDateRange;
@@ -6812,21 +7878,20 @@ document.querySelectorAll("[data-range-days]").forEach(button => {
 document.getElementById("searchIndexDateRange").onclick = searchIndexDateRange;
 document.getElementById("indexSearchWholeIndex").onchange = event => {
   event.currentTarget.dataset.userChanged = "1";
+  state.candidateRenderLimit = 40;
   updateManualDateSearchScope();
+  renderCandidateGrid();
 };
-document.getElementById("indexSearchFilenameOnly").onchange = event => {
-  if (event.currentTarget.checked) {
-    const wholeIndex = document.getElementById("indexSearchWholeIndex");
-    wholeIndex.checked = true;
-    wholeIndex.dataset.userChanged = "1";
-  }
+document.getElementById("indexSearchModifiedDate").onchange = () => {
   updateManualDateSearchScope();
+  renderCandidateGrid();
 };
 document.getElementById("fallbackButton").onclick = async () => {
   if (!state.currentEntry) return;
   if (!confirm("Keep the Project365 export for this entry and remove it from the active original-photo search list?")) return;
   const currentEntryId = state.currentEntry.entry_id;
   const nextEntryId = nextEntryIdAfterCurrent();
+  rememberPreviousEntry(state.currentEntry);
   await fetchJson("/api/decision", {
     method: "POST",
     headers: {"content-type": "application/json"},
@@ -6842,7 +7907,7 @@ document.getElementById("fallbackButton").onclick = async () => {
 };
 document.getElementById("clearButton").onclick = async () => {
   if (!state.currentEntry) return;
-  if (!confirm(`Reset all pending selections, rejections, and notes for ${state.currentEntry.entry_date}?`)) return;
+  if (!confirm(`Reset pending selections, rejections, notes, and candidate expansions for ${state.currentEntry.entry_date}?`)) return;
   const currentEntryId = state.currentEntry.entry_id;
   await fetchJson("/api/decision", {
     method: "POST",
@@ -6972,14 +8037,6 @@ function setActivePhotoIndexFolder(folder) {
   updateManualDateSearchScope();
 }
 
-function savedActivePhotoIndexFolder() {
-  try {
-    return window.localStorage.getItem("project365.activePhotoIndexFolder") || "";
-  } catch (_) {
-    return "";
-  }
-}
-
 function renderBatchSummary() {
   const selectedId = document.getElementById("batchFilter").value;
   const batch = state.batches.find(item => item.batch_id === selectedId);
@@ -7096,6 +8153,26 @@ function isFileDrag(event) {
   return Array.from(event.dataTransfer?.types || []).includes("Files");
 }
 
+function isLinkDrag(event) {
+  const types = Array.from(event.dataTransfer?.types || []);
+  return types.includes("Files") || types.includes("text/uri-list") || types.includes("text/plain");
+}
+
+function droppedLinkPath(event) {
+  const transfer = event.dataTransfer;
+  const text = transfer?.getData("text/uri-list") || transfer?.getData("text/plain") || "";
+  const line = text.split(/\\r?\\n/).map(value => value.trim()).find(value => value && !value.startsWith("#")) || "";
+  if (line.startsWith("file://")) {
+    try {
+      return decodeURIComponent(new URL(line).pathname);
+    } catch (_) {
+      return "";
+    }
+  }
+  if (line.startsWith("/")) return line;
+  return transfer?.files?.[0]?.path || "";
+}
+
 function updatePhotoDropTarget() {
   const target = document.getElementById("photoDropTarget");
   const hint = document.getElementById("photoDropTargetHint");
@@ -7130,6 +8207,7 @@ async function linkCandidatePath(candidatePath) {
 async function handlePhotoDrop(event) {
   if (!isFileDrag(event)) return;
   event.preventDefault();
+  photoDropDragDepth = 0;
   event.currentTarget.classList.remove("active");
   const entry = state.currentEntry;
   const files = Array.from(event.dataTransfer?.files || []);
@@ -7157,6 +8235,7 @@ async function handlePhotoDrop(event) {
       body: file
     });
     state.entryDetailCache.delete(currentEntryId);
+    rememberPreviousEntry(entry);
     const index = state.entries.findIndex(item => item.entry_id === currentEntryId);
     if (index >= 0) state.entries.splice(index, 1);
     renderEntries();
@@ -7170,7 +8249,32 @@ async function handlePhotoDrop(event) {
   }
 }
 
+async function handleLinkDrop(event) {
+  if (!isLinkDrag(event)) return;
+  event.preventDefault();
+  photoLinkDragDepth = 0;
+  event.currentTarget.classList.remove("active");
+  if (!state.currentEntry) {
+    document.getElementById("crawlStatus").textContent = "Open an entry before linking a photo.";
+    return;
+  }
+  const candidatePath = droppedLinkPath(event);
+  if (!candidatePath) {
+    document.getElementById("crawlStatus").textContent =
+      "Use Choose photo to link without copying, or drop on the left box to copy.";
+    return;
+  }
+  try {
+    await linkCandidatePath(candidatePath);
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+  }
+}
+
 const dropTarget = document.getElementById("photoDropTarget");
+const linkDropTarget = document.getElementById("photoLinkDropTarget");
+let photoDropDragDepth = 0;
+let photoLinkDragDepth = 0;
 document.getElementById("loadMoreEntries").onclick = () => {
   loadMoreEntries().catch(error => {
     document.getElementById("summary").textContent = error.message;
@@ -7179,6 +8283,7 @@ document.getElementById("loadMoreEntries").onclick = () => {
 dropTarget.addEventListener("dragenter", event => {
   if (!isFileDrag(event)) return;
   event.preventDefault();
+  photoDropDragDepth += 1;
   dropTarget.classList.add("active");
 });
 dropTarget.addEventListener("dragover", event => {
@@ -7188,9 +8293,36 @@ dropTarget.addEventListener("dragover", event => {
 });
 dropTarget.addEventListener("dragleave", event => {
   if (!isFileDrag(event)) return;
+  photoDropDragDepth = Math.max(0, photoDropDragDepth - 1);
+  if (photoDropDragDepth === 0) dropTarget.classList.remove("active");
+});
+dropTarget.addEventListener("dragend", () => {
+  photoDropDragDepth = 0;
   dropTarget.classList.remove("active");
 });
 dropTarget.addEventListener("drop", handlePhotoDrop);
+linkDropTarget.addEventListener("dragenter", event => {
+  if (!isLinkDrag(event)) return;
+  event.preventDefault();
+  photoLinkDragDepth += 1;
+  linkDropTarget.classList.add("active");
+});
+linkDropTarget.addEventListener("dragover", event => {
+  if (!isLinkDrag(event)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "link";
+});
+linkDropTarget.addEventListener("dragleave", event => {
+  if (!isLinkDrag(event)) return;
+  photoLinkDragDepth = Math.max(0, photoLinkDragDepth - 1);
+  if (photoLinkDragDepth === 0) linkDropTarget.classList.remove("active");
+});
+linkDropTarget.addEventListener("dragend", () => {
+  photoLinkDragDepth = 0;
+  linkDropTarget.classList.remove("active");
+});
+linkDropTarget.addEventListener("drop", handleLinkDrop);
+document.addEventListener("keydown", handlePickerKeyboardShortcut);
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, char => ({
@@ -7214,7 +8346,9 @@ function applyUrlFilters() {
   state.urlEntryIds = params.getAll("entry_id").flatMap(splitFilterValue);
   state.urlEntryDates = params.getAll("entry_date").flatMap(splitFilterValue);
   state.initialBatchId = params.get("batch") || "";
-  setActivePhotoIndexFolder(params.get("photo_index_folder") || savedActivePhotoIndexFolder());
+  if (params.has("photo_index_folder")) {
+    setActivePhotoIndexFolder(params.get("photo_index_folder") || "");
+  }
 }
 
 function splitFilterValue(value) {
@@ -7885,6 +9019,8 @@ button.subtle-danger:hover {
           </label>
         </div>
         <div class="control-group item-actions">
+          <button id="previousCropEntryButton" title="Shortcut: Left arrow">Previous entry (Left)</button>
+          <button id="nextCropEntryButton" title="Shortcut: Right arrow">Next entry (Right)</button>
           <button id="suggestCropButton">Estimate crop</button>
           <button id="resetCropButton">Reset crop</button>
           <button id="saveCropButton" class="primary" title="Shortcut: Return. Save crop offsets to staging">Save crop (Return)</button>
@@ -8061,6 +9197,7 @@ function renderEntries() {
     }
     list.appendChild(yearDetails);
   }
+  updateCropNavigationState();
 }
 
 function groupedEntriesByYearMonth(entries) {
@@ -8158,6 +9295,7 @@ function renderEmpty() {
   document.getElementById("cropStatus").textContent = "";
   document.getElementById("cropListHint").hidden = false;
   document.getElementById("savedCropLabel").textContent = "";
+  updateCropNavigationState();
 }
 
 function renderCropEditor() {
@@ -8196,6 +9334,7 @@ function renderCropEditor() {
     ? `${cropSource} loaded. Adjust it if needed.`
     : "Adjust the default crop, estimate this crop, or run the batch estimate.";
   document.getElementById("savedCropLabel").textContent = cropLabel(candidate);
+  updateCropNavigationState();
 }
 
 function initialCropForCandidate(candidate) {
@@ -8942,6 +10081,25 @@ function nextEntryIdAfterCurrent() {
   return next ? next.entry_id : "";
 }
 
+function currentCropEntryIndex() {
+  return state.entries.findIndex(entry => entry.entry_id === state.selectedEntryId);
+}
+
+function updateCropNavigationState() {
+  const index = currentCropEntryIndex();
+  const previousButton = document.getElementById("previousCropEntryButton");
+  const nextButton = document.getElementById("nextCropEntryButton");
+  if (previousButton) previousButton.disabled = index <= 0;
+  if (nextButton) nextButton.disabled = index < 0 || index >= state.entries.length - 1;
+}
+
+async function selectAdjacentCropEntry(direction) {
+  const index = currentCropEntryIndex();
+  const target = state.entries[index + direction];
+  if (!target) return;
+  await loadEntry(target.entry_id);
+}
+
 function cropLabel(candidate) {
   const saved = savedCropForCandidate(candidate);
   if (!saved) return "No saved crop";
@@ -9034,6 +10192,10 @@ function handleCropKeyboardShortcut(event) {
     handled = runCropShortcutButton("minimalFitButton", minimalFitCurrentCrop);
   } else if (key === "m") {
     handled = runCropShortcutButton("minimalMoveButton", minimalMoveCurrentCrop);
+  } else if (event.key === "ArrowLeft") {
+    handled = runCropShortcutButton("previousCropEntryButton", () => selectAdjacentCropEntry(-1));
+  } else if (event.key === "ArrowRight") {
+    handled = runCropShortcutButton("nextCropEntryButton", () => selectAdjacentCropEntry(1));
   } else if (event.key === "Enter") {
     handled = runCropShortcutButton("saveCropButton", saveCropForCurrentCandidate);
   }
@@ -9053,6 +10215,8 @@ document.getElementById("cropFilter").onchange = () => {
 document.getElementById("suggestCropButton").onclick = estimateCropForCurrentCandidate;
 document.getElementById("resetCropButton").onclick = resetCropForCurrentCandidate;
 document.getElementById("rejectOriginalButton").onclick = rejectOriginalForCurrentCrop;
+document.getElementById("previousCropEntryButton").onclick = () => selectAdjacentCropEntry(-1);
+document.getElementById("nextCropEntryButton").onclick = () => selectAdjacentCropEntry(1);
 document.getElementById("saveCropButton").onclick = saveCropForCurrentCandidate;
 document.getElementById("commitCropButton").onclick = commitStagedCrops;
 document.getElementById("originalImage").onpointerdown = event => {
