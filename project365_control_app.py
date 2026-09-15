@@ -36,6 +36,7 @@ from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY, derivative_r
 import project365_original_picker as original_picker
 import project365_broad_visual_match as broad_visual_match
 import project365_diary_enrichment as diary_enrichment
+import project365_diary_intake as diary_intake
 import project365_media_dedupe_review as media_dedupe
 from project365_paths import ORIGINAL_PHOTOS_ROOT, PROJECT365_PRO_EXPORT_ZIPS_DIR
 
@@ -57,7 +58,6 @@ DIARIUM_DB_PATH = (
     Path.home() / "Library" / "Containers" / "mac.partl.Diarium" / "Data" / "data.db"
 )
 DERIVATIVE_POLICY = DEFAULT_DERIVATIVE_POLICY
-STATUS_BATCH_LIMIT = 50
 CONTROL_RUN_HISTORY = VERIFY_REPORT_DIR / "control_run_history.jsonl"
 RUN_HISTORY_LIMIT = 50
 ARCHIVE_RESULT_LIMIT = 25
@@ -229,7 +229,9 @@ class ControlState:
             picker_state = self.picker_state()
             entries = picker_state.crop_entries(crop_filter="all")
             pending_commits = picker_state.pending_crop_commits()
-            crop_estimate_batch = picker_state.latest_crop_estimate_job() or {}
+            crop_estimate_batch = _compact_crop_estimate_job(
+                picker_state.latest_crop_estimate_job() or {}
+            )
         except Exception as exc:  # noqa: BLE001 - status panel should stay readable if crop state is unavailable.
             return {
                 "exists": False,
@@ -2077,6 +2079,7 @@ def _step_title(step: str) -> str:
         "rough_prefilter_build": "Rough visual prefilter",
         "rough_visual_match": "No-date visual match",
         "rough_visual_benchmark": "No-date visual benchmark",
+        "diary_intake": "Diary intake",
         "diary_enrichment": "Diary enrichment",
         "generate_derivatives": "Working photo copies",
         "face_tagging": "Build tag queue",
@@ -2845,8 +2848,6 @@ def _batch_plan_status(batch_plan_path: Path, attempt_path: Path | None = None) 
         "hidden_rejected_candidate_count": hidden_rejected_total,
         "hidden_export_equivalent_candidate_count": hidden_export_equivalent_total,
         "status_counts": status_counts,
-        "batch_limit": STATUS_BATCH_LIMIT,
-        "batches": [_batch_summary(row, attempts) for row in rows[:STATUS_BATCH_LIMIT]],
         "next_batch": {
             **_batch_summary(next_batch, attempts),
         },
@@ -2984,10 +2985,6 @@ def _search_attempt_status(attempt_path: Path) -> dict[str, Any]:
         "exists": True,
         "rows": len(rows),
         "latest": _search_attempt_summary(latest),
-        "recent": [
-            _search_attempt_summary(row)
-            for row in reversed(rows[-10:])
-        ],
     }
 
 
@@ -3760,8 +3757,12 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self._send_html(_control_html(config.picker_url, initial_step=initial_step), no_store=True)
                 elif parsed.path in {"/picker", "/picker/"}:
                     self._send_html(_embedded_picker_html())
+                elif parsed.path in {"/picker/link-drop", "/picker/link-drop/"}:
+                    self._send_html(original_picker.link_drop_html("/picker/api"))
                 elif parsed.path in {"/enrich", "/enrich/"}:
                     self._send_html(diary_enrichment.ENRICHMENT_HTML, no_store=True)
+                elif parsed.path in {"/intake", "/intake/"}:
+                    self._send_html(diary_intake.INTAKE_HTML, no_store=True)
                 elif parsed.path in {"/broad-review", "/broad-review/"}:
                     self._send_html(BROAD_REVIEW_HTML, no_store=True)
                 elif parsed.path in {"/crop", "/crop/"}:
@@ -3910,6 +3911,16 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
                         self._send_json(detail)
+                elif parsed.path == "/intake/api/nearby":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send_json(
+                        diary_intake.nearby_photos(
+                            CANONICAL_ROOT,
+                            date=query.get("date", [""])[0],
+                            days=original_picker._query_int(query, "days", 0) or 0,
+                            image_tokens=state.picker_state(),
+                        )
+                    )
                 elif parsed.path == "/picker/api/entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     status = query.get("status", ["all"])[0]
@@ -3936,11 +3947,13 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         }
                     )
                 elif parsed.path.startswith("/picker/api/entry/"):
+                    query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/picker/api/entry/"))
                     detail = state.picker_state().entry_detail(
                         entry_id,
                         candidate_limit=None,
                         rank_if_needed=False,
+                        include_database=original_picker._query_flag(query, "include_database"),
                     )
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
@@ -3961,11 +3974,17 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 elif parsed.path == "/crop/api/crop-entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     crop_filter = query.get("crop_filter", ["missing"])[0]
+                    entries = state.picker_state().crop_entries(crop_filter=crop_filter)
+                    limit = original_picker._query_int(query, "limit", None)
+                    limited_entries = entries[:limit] if limit and limit > 0 else entries
                     self._send_json(
                         {
-                            "entries": state.picker_state().crop_entries(crop_filter=crop_filter),
+                            "entries": limited_entries,
+                            "total_count": len(entries),
                             "pending_crop_commits": state.picker_state().pending_crop_commits(),
-                            "crop_estimate_batch": state.picker_state().latest_crop_estimate_job() or {},
+                            "crop_estimate_batch": _compact_crop_estimate_job(
+                                state.picker_state().latest_crop_estimate_job() or {}
+                            ),
                         }
                     )
                 elif parsed.path.startswith("/crop/api/entry/"):
@@ -4257,17 +4276,73 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     detail = state.picker_state().add_linked_candidate(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
+                        associate=bool(payload.get("associate", False)),
                     )
                     self._send_json(detail)
                     return
                 if parsed.path == "/picker/api/import-dropped-candidate":
+                    entry_id = urllib.parse.unquote(self.headers.get("x-entry-id", ""))
+                    filename = urllib.parse.unquote(self.headers.get("x-file-name", ""))
+                    suffix = Path(filename.replace("\\", "/")).suffix.lower()
+                    if suffix in original_picker.VIDEO_DROP_EXTENSIONS:
+                        upload_path = self._read_upload_to_temp(
+                            original_picker.MAX_VIDEO_DROP_BYTES,
+                            suffix,
+                        )
+                        detail = state.picker_state().prepare_video_frame_choices(
+                            entry_id=entry_id,
+                            filename=filename,
+                            upload_path=upload_path,
+                        )
+                    else:
+                        payload = self._read_bytes(original_picker.MAX_DROP_BYTES)
+                        detail = state.picker_state().add_copied_candidate(
+                            entry_id=entry_id,
+                            filename=filename,
+                            content_type=self.headers.get("content-type", ""),
+                            payload=payload,
+                            include_candidates=False,
+                        )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/picker/api/import-video-frames":
+                    payload = self._read_json()
+                    detail = state.picker_state().import_video_frames(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                        main_frame_id=str(payload.get("main_frame_id", "")),
+                        supplemental_frame_ids=[
+                            str(value) for value in payload.get("supplemental_frame_ids", [])
+                        ],
+                    )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/picker/api/discard-video-frames":
+                    payload = self._read_json()
+                    state.picker_state().discard_video_frame_choices(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                    )
+                    self._send_json({"ok": True})
+                    return
+                if parsed.path == "/picker/api/extract-video-frame":
+                    payload = self._read_json()
+                    detail = state.picker_state().extract_video_frame_at_time(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                        time_seconds=float(payload.get("time_seconds", 0) or 0),
+                    )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/picker/api/import-linked-candidate":
                     payload = self._read_bytes(original_picker.MAX_DROP_BYTES)
                     detail = state.picker_state().add_copied_candidate(
                         entry_id=urllib.parse.unquote(self.headers.get("x-entry-id", "")),
                         filename=urllib.parse.unquote(self.headers.get("x-file-name", "")),
                         content_type=self.headers.get("content-type", ""),
                         payload=payload,
-                        include_candidates=False,
+                        include_candidates=True,
+                        associate=True,
                     )
                     self._send_json(detail)
                     return
@@ -4305,12 +4380,42 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                     self._send_json(detail)
                     return
+                if parsed.path == "/intake/api/stage":
+                    payload = self._read_bytes(original_picker.MAX_DROP_BYTES)
+                    detail = diary_intake.stage_dropped_photo(
+                        CANONICAL_ROOT,
+                        filename=urllib.parse.unquote(self.headers.get("x-file-name", "")),
+                        content_type=self.headers.get("content-type", ""),
+                        payload=payload,
+                        image_tokens=state.picker_state(),
+                    )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/intake/api/commit":
+                    payload = self._read_json()
+                    detail = diary_intake.commit_intake_photo(
+                        CANONICAL_ROOT,
+                        staged_path=str(payload.get("staged_path", "")),
+                        mode=str(payload.get("mode", "")),
+                        timestamp=str(payload.get("timestamp", "")),
+                        timestamp_source=str(payload.get("timestamp_source", "")),
+                        original_timestamp=str(payload.get("original_timestamp", "")),
+                        original_timestamp_source=str(payload.get("original_timestamp_source", "")),
+                        text=str(payload.get("text", "")),
+                        image_tokens=state.picker_state(),
+                    )
+                    self._send_json(detail)
+                    return
                 if parsed.path == "/picker/api/apply-decisions":
                     payload = self._read_json()
                     if payload.get("confirm_apply_decisions") != original_picker.APPLY_DECISIONS_CONFIRM_TOKEN:
                         self._send_error(HTTPStatus.BAD_REQUEST, "Apply decisions requires explicit confirmation.")
                         return
                     self._send_json(state.picker_state().apply_decisions())
+                    return
+                if parsed.path == "/picker/api/commit-entry":
+                    payload = self._read_json()
+                    self._send_json(state.picker_state().commit_entry_decision(str(payload.get("entry_id", ""))))
                     return
                 if parsed.path == "/dedupe/api/decision":
                     payload = self._read_json()
@@ -4348,24 +4453,50 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 raise ValueError("Dropped image exceeds the 250 MB limit.")
             return self.rfile.read(length)
 
+        def _read_upload_to_temp(self, maximum: int, suffix: str) -> Path:
+            length = int(self.headers.get("content-length", "0"))
+            if length > maximum:
+                raise ValueError("Dropped video exceeds the 2 GB limit.")
+            temp_dir = CANONICAL_ROOT / "cache" / "picker_video_uploads"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}{suffix or '.video'}"
+            remaining = length
+            with temp_path.open("wb") as handle:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                temp_path.unlink(missing_ok=True)
+                raise ValueError("Dropped video upload ended before the full file was received.")
+            return temp_path
+
         def _send_html(self, body: str, no_store: bool = False) -> None:
             payload = body.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("content-type", "text/html; charset=utf-8")
-            if no_store:
-                self.send_header("cache-control", "no-store")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "text/html; charset=utf-8")
+                if no_store:
+                    self.send_header("cache-control", "no-store")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _send_json(self, body: dict[str, Any]) -> None:
             payload = json.dumps(body, sort_keys=True).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("content-type", "application/json")
-            self.send_header("cache-control", "no-store")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("cache-control", "no-store")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         def _send_picker_image(self, token: str, max_size: int | None = None) -> None:
             path = state.picker_state().preview_path(urllib.parse.unquote(token), max_size)
@@ -4515,11 +4646,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
 
         def _send_error(self, status: HTTPStatus, message: str) -> None:
             payload = json.dumps({"error": message}).encode("utf-8")
-            self.send_response(status)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     return ControlHandler
 
@@ -4534,6 +4668,7 @@ WORKFLOW_STEPS = (
     "crop_confirmation",
     "generate_derivatives",
     "face_tagging",
+    "diary_intake",
     "diary_enrichment",
     "generate_diarium_package",
 )
@@ -4552,11 +4687,48 @@ STEP_OWNER = {
 
 def _crop_estimate_active_job(job: dict[str, Any]) -> dict[str, Any]:
     return {
-        **job,
+        **_compact_crop_estimate_job(job),
         "step": "crop_confirmation",
         "kind": "crop_estimate_batch",
         "cancellable": False,
     }
+
+
+def _compact_crop_estimate_job(job: dict[str, Any]) -> dict[str, Any]:
+    if not job:
+        return {}
+    compact = {
+        key: value
+        for key, value in job.items()
+        if key != "errors"
+    }
+    errors = job.get("errors") if isinstance(job.get("errors"), list) else []
+    compact["error_count"] = len(errors)
+    if errors:
+        first = errors[0] if isinstance(errors[0], dict) else {}
+        compact["first_error"] = _compact_crop_estimate_error(first)
+    return compact
+
+
+def _compact_crop_estimate_error(error: dict[str, Any]) -> dict[str, str]:
+    entry_id = str(error.get("entry_id", "") or "")
+    candidate_path = str(error.get("candidate_path", "") or "")
+    return {
+        "entry_id": entry_id,
+        "candidate_filename": Path(candidate_path).name if candidate_path else "",
+        "message": _short_crop_estimate_error(str(error.get("error", "") or "")),
+    }
+
+
+def _short_crop_estimate_error(error: str) -> str:
+    text = " ".join(str(error or "").split())
+    if not text:
+        return "estimate failed"
+    if "Cannot load image for crop estimation" in text:
+        return "could not load image for crop estimation"
+    if "returned non-zero exit status" in text and ("sips" in text or "magick" in text):
+        return "image conversion failed"
+    return text.split("; ", 1)[0][:180]
 
 
 def _owner_step(step: str) -> str:
@@ -6214,12 +6386,8 @@ a { color: var(--accent); }
       <div class="step-result" data-step-result="match_easy_originals"></div>
       <div class="step-history" data-step-history="match_easy_originals"></div>
       <div>
-        <h2>Original-photo batches</h2>
+        <h2>Current original review</h2>
         <div id="batchOverview" class="subtle">No batch data loaded.</div>
-      </div>
-      <div>
-        <h2>Recent original-photo searches</h2>
-        <div id="attemptOverview" class="subtle">No search attempts yet.</div>
       </div>
       </div>
     </section>
@@ -6510,10 +6678,27 @@ a { color: var(--accent); }
       </div>
     </section>
 
-    <section class="panel workflow-step" data-step="diary_enrichment">
+    <section class="panel workflow-step" data-step="diary_intake">
       <div class="workflow-step-header">
         <div>
           <div class="step-kicker">Step 8</div>
+          <h2>Diary intake</h2>
+        </div>
+        <div class="step-status-bar" data-step-status="diary_intake">Ready</div>
+        <button class="button small step-toggle" data-step-toggle="diary_intake" onclick="toggleWorkflowStep('diary_intake')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+      <div class="subtle">Drag photos from Finder or Apple Photos, choose the date/time, and save them as main day photos, additional photos, or new secondary entries.</div>
+      <div class="button-row">
+        <button class="button primary" type="button" onclick="openDiaryIntake()">Open diary intake</button>
+      </div>
+      </div>
+    </section>
+
+    <section class="panel workflow-step" data-step="diary_enrichment">
+      <div class="workflow-step-header">
+        <div>
+          <div class="step-kicker">Step 9</div>
           <h2>Diary enrichment</h2>
         </div>
         <div class="step-status-bar" data-step-status="diary_enrichment">Choose date range</div>
@@ -6543,7 +6728,7 @@ a { color: var(--accent); }
     <section class="panel workflow-step" data-step="generate_diarium_package">
       <div class="workflow-step-header">
         <div>
-          <div class="step-kicker">Step 9</div>
+          <div class="step-kicker">Step 10</div>
           <h2>Diarium import package</h2>
         </div>
         <div class="step-status-bar" data-step-status="generate_diarium_package">No runs yet</div>
@@ -6630,7 +6815,6 @@ async function loadStatus(steps, options = {}) {
     renderCropConfirmationBox(payload);
     attachCropEstimateBatchJob(payload);
     renderBatchOverview(payload);
-    renderAttemptOverview(payload);
     scheduleActiveStatusRefresh(payload);
     return payload;
   } catch (error) {
@@ -6814,6 +6998,8 @@ function renderWorkflowCard(card, owner, active, records) {
   if (statusTarget) {
     if (owner === "crop_confirmation" && !active) {
       statusTarget.innerHTML = formatCropConfirmationStatus((lastStatus || {}).crop_confirmation || {});
+    } else if (owner === "diary_intake" && !active) {
+      statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Ready`;
     } else if (owner === "diary_enrichment" && !active) {
       statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Set date range`;
     } else {
@@ -6863,6 +7049,10 @@ function validIsoDate(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00Z`);
   return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function openDiaryIntake() {
+  window.location.assign(new URL("/intake", window.location.href).toString());
 }
 
 function openDiaryEnrichment() {
@@ -6992,14 +7182,28 @@ function renderCropEstimateBatchJob(job) {
   const failed = Number(job.failed_count || 0);
   const current = job.current_entry_id ? ` · ${job.current_entry_id}` : "";
   const mode = job.apply_estimates ? "saved" : "previewed";
-  const firstError = Array.isArray(job.errors) && job.errors.length ? job.errors[0] : null;
-  const errorDetail = firstError
-    ? ` · First error: ${firstError.entry_id || "item"} ${firstError.error || "estimate failed"}`
-    : "";
+  const errorDetail = cropEstimateFailureSummary(job);
   const label = runningNow ? "Working" : job.status === "pass" ? "Complete" : "Failed";
   setCropEstimateBatchStatus(
     `${label} · ${processed}/${total} checked · ${estimated} ${mode} estimates · ${skipped} skipped · ${failed} failed${current}${errorDetail}`
   );
+}
+
+function cropEstimateFailureSummary(job) {
+  const firstError = job.first_error || (Array.isArray(job.errors) && job.errors.length ? job.errors[0] : null);
+  if (!firstError) return "";
+  const entry = firstError.entry_id || "item";
+  const filename = firstError.candidate_filename ? ` · ${firstError.candidate_filename}` : "";
+  const message = cropEstimateErrorMessage(firstError);
+  return ` · First failure: ${entry}${filename} · ${message}`;
+}
+
+function cropEstimateErrorMessage(error) {
+  const text = String(error.message || error.error || "estimate failed").replace(/\\s+/g, " ").trim();
+  if (!text) return "estimate failed";
+  if (text.includes("Cannot load image for crop estimation")) return "could not load image for crop estimation";
+  if (text.includes("returned non-zero exit status") && (text.includes("sips") || text.includes("magick"))) return "image conversion failed";
+  return text.split("; ", 1)[0].slice(0, 180);
 }
 
 function toggleWorkflowStep(step) {
@@ -7794,7 +7998,7 @@ function formatBatch(batch) {
 function formatSearchAttempt(attempt) {
   if (!attempt || !attempt.finished_at) return "none";
   const target = formatAttemptScope(attempt);
-  return `${escapeHtml(attempt.finished_at)} · ${escapeHtml(attempt.unclear_entry_count || "0")} entries · ${escapeHtml(attempt.candidate_count || "0")} candidates · ${escapeHtml(target || "all unmatched")}`;
+  return `${escapeHtml(formatShortDateTime(attempt.finished_at))} · ${escapeHtml(attempt.unclear_entry_count || "0")} entries · ${escapeHtml(attempt.candidate_count || "0")} candidates · ${escapeHtml(target || "all unmatched")}`;
 }
 
 function formatAttemptScope(attempt) {
@@ -7809,113 +8013,27 @@ function renderBatchOverview(payload) {
   const target = document.getElementById("batchOverview");
   if (!target) return;
   const batchPlan = payload.original_batch_plan || {};
-  const batches = (batchPlan.batches || []);
-  if (!batches.length) {
+  const nextBatch = batchPlan.next_batch || {};
+  const attempts = payload.original_search_attempts || {};
+  const latestAttempt = attempts.latest || {};
+  if (!batchPlan.exists) {
     target.textContent = "No unresolved batches.";
     return;
   }
-  const limitNote = Number(batchPlan.rows || 0) > Number(batchPlan.batch_limit || batches.length)
-    ? `<div>Showing first ${batchPlan.batch_limit} of ${batchPlan.rows} batches. Use Review easy matches for the full queue.</div>`
-    : "";
-  const rows = batches.map(batch => {
-    const hidden = Number(batch.hidden_rejected_candidate_count || "0");
-    const hiddenCopies = Number(batch.hidden_export_equivalent_candidate_count || "0");
-    return `
-      <tr>
-        <td><strong>${escapeHtml(batch.batch_id)}</strong></td>
-        <td>${escapeHtml(batch.start_date)} to ${escapeHtml(batch.end_date)}</td>
-        <td class="number">${escapeHtml(batch.entry_count || "0")}</td>
-        <td class="number">${escapeHtml(batch.candidate_count || "0")}</td>
-        <td class="number">${escapeHtml(batch.review_date_count || "0")}</td>
-        <td class="number">${escapeHtml(batch.folder_needed_date_count || "0")}</td>
-        <td class="number">${hidden}</td>
-        <td class="number">${hiddenCopies}</td>
-        <td>${escapeHtml(formatBatchStatuses(batch.statuses || ""))}</td>
-        <td>${escapeHtml(batch.next_step || "")}</td>
-        <td class="number">${escapeHtml(batch.search_attempt_count || "0")}</td>
-        <td title="${escapeHtml(batch.latest_search_roots || "")}">${escapeHtml(formatBatchAttempt(batch))}</td>
-        <td><a href="${escapeHtml(pickerUrlForBatch(batch))}">Review in picker</a></td>
-      </tr>
-    `;
-  }).join("");
-  target.innerHTML = `
-    ${limitNote}
-    <table class="batch-table">
-      <thead>
-        <tr>
-          <th>Batch</th>
-          <th>Dates</th>
-          <th class="number">Entries</th>
-          <th class="number">Candidates</th>
-          <th class="number">Review dates</th>
-          <th class="number">Need folders</th>
-          <th class="number">Rejected</th>
-          <th class="number">Export copies</th>
-          <th>Status</th>
-          <th>Next step</th>
-          <th class="number">Searches</th>
-          <th>Last search</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-  `;
-}
-
-function formatBatchStatuses(statuses) {
-  const labels = {
-    needs_choice: "Review candidates",
-    no_external_candidates: "Choose another folder",
-    only_export_equivalent_candidates: "Only export-copy candidates",
-    all_candidates_rejected: "All found candidates rejected"
-  };
-  const parts = splitAttemptList(statuses || "");
-  if (!parts.length) return "";
-  return parts.map(status => labels[status] || replaceAllText(status, "_", " ")).join("; ");
-}
-
-function formatBatchAttempt(batch) {
-  const count = Number(batch.search_attempt_count || "0");
-  if (!count) return "not searched";
-  const candidates = batch.latest_search_candidate_count || "0";
-  return `${formatShortDateTime(batch.latest_search_finished_at)} · ${candidates} candidates`;
-}
-
-function renderAttemptOverview(payload) {
-  const target = document.getElementById("attemptOverview");
-  if (!target) return;
-  const attempts = ((payload.original_search_attempts || {}).recent || []);
-  if (!attempts.length) {
-    target.textContent = "No search attempts yet.";
-    return;
-  }
-  const rows = attempts.map(attempt => `
-    <tr>
-      <td>${escapeHtml(formatShortDateTime(attempt.finished_at || ""))}</td>
-      <td>${escapeHtml(formatAttemptScope(attempt))}</td>
-      <td>${escapeHtml(replaceAllText(attempt.search_roots || "", ";", "; "))}</td>
-      <td class="number">${escapeHtml(attempt.unclear_entry_count || "0")}</td>
-      <td class="number">${escapeHtml(attempt.candidate_count || "0")}</td>
-      <td class="number">${escapeHtml(attempt.hidden_rejected_candidate_count || "0")}</td>
-      <td class="number">${escapeHtml(attempt.hidden_export_equivalent_candidate_count || "0")}</td>
-    </tr>
+  const statusCounts = batchPlan.status_counts || {};
+  const metrics = [
+    ["Current batches", batchPlan.rows || 0],
+    ["Review-ready", statusCounts.needs_choice || 0],
+    ["Need folder", statusCounts.no_external_candidates || 0],
+    ["Hidden rejected", batchPlan.hidden_rejected_candidate_count || 0],
+    ["Hidden export copies", batchPlan.hidden_export_equivalent_candidate_count || 0]
+  ].map(([label, value]) => `
+    <div class="result-metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>
   `).join("");
   target.innerHTML = `
-    <table class="batch-table">
-      <thead>
-        <tr>
-          <th>Finished</th>
-          <th>Scope</th>
-          <th>Folders</th>
-          <th class="number">Entries</th>
-          <th class="number">Candidates</th>
-          <th class="number">Rejected</th>
-          <th class="number">Export copies</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
+    <div class="result-grid">${metrics}</div>
+    <div><span>Next batch</span><strong>${escapeHtml(formatBatch(nextBatch))}</strong></div>
+    <div><span>Last search</span><strong>${formatSearchAttempt(latestAttempt)}</strong></div>
   `;
 }
 

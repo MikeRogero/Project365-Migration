@@ -1537,17 +1537,16 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("function renderBatchOverview(", control.CONTROL_HTML)
         self.assertIn("Search attempts", control.CONTROL_HTML)
         self.assertIn("Latest search attempt", control.CONTROL_HTML)
-        self.assertIn('id="attemptOverview"', control.CONTROL_HTML)
         self.assertIn("function formatSearchAttempt(", control.CONTROL_HTML)
-        self.assertIn("function renderAttemptOverview(", control.CONTROL_HTML)
-        self.assertIn("Review dates", control.CONTROL_HTML)
-        self.assertIn("Need folders", control.CONTROL_HTML)
+        self.assertIn("Current original review", control.CONTROL_HTML)
+        self.assertIn("Review-ready", control.CONTROL_HTML)
+        self.assertIn("Need folder", control.CONTROL_HTML)
         self.assertIn("Hidden export copies", control.CONTROL_HTML)
-        self.assertIn("Export copies", control.CONTROL_HTML)
         self.assertIn("hidden_export_equivalent_candidate_count", control.CONTROL_HTML)
-        self.assertIn("Review in picker", control.CONTROL_HTML)
+        self.assertNotIn('id="attemptOverview"', control.CONTROL_HTML)
+        self.assertNotIn("function renderAttemptOverview(", control.CONTROL_HTML)
+        self.assertNotIn("<th>Batch</th>", control.CONTROL_HTML)
         self.assertIn("function formatAttemptScope(", control.CONTROL_HTML)
-        self.assertIn("function formatBatchAttempt(batch)", control.CONTROL_HTML)
         self.assertIn("Pending picker decisions", control.CONTROL_HTML)
         self.assertIn("function formatPendingApply(pending)", control.CONTROL_HTML)
         self.assertIn("selected ·", control.CONTROL_HTML)
@@ -1555,10 +1554,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("function formatRemainderOverview(summary)", control.CONTROL_HTML)
         self.assertIn("review-ready", control.CONTROL_HTML)
         self.assertIn("export-copy only", control.CONTROL_HTML)
-        self.assertIn("function formatBatchStatuses(statuses)", control.CONTROL_HTML)
-        self.assertIn("Choose another folder", control.CONTROL_HTML)
-        self.assertIn("Only export-copy candidates", control.CONTROL_HTML)
-        self.assertIn("All found candidates rejected", control.CONTROL_HTML)
+        self.assertNotIn("function formatBatchStatuses(statuses)", control.CONTROL_HTML)
+        self.assertIn("Current batches", control.CONTROL_HTML)
+        self.assertIn("Next batch", control.CONTROL_HTML)
+        self.assertIn("Last search", control.CONTROL_HTML)
         self.assertIn("Project365 entries", control.CONTROL_HTML)
         self.assertIn("Canonical entries", control.CONTROL_HTML)
         self.assertIn("Refresh existing index metadata", control.CONTROL_HTML)
@@ -1579,7 +1578,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("function formatDiariumAttachmentNote(verification)", control.CONTROL_HTML)
         self.assertIn("diarium_import_verification", control.CONTROL_HTML)
         self.assertIn("Photos are imported.", control.CONTROL_HTML)
-        self.assertIn("<th>Next step</th>", control.CONTROL_HTML)
+        self.assertIn("<span>Next batch</span>", control.CONTROL_HTML)
         self.assertIn("Build photo index", control.CONTROL_HTML)
         self.assertIn('id="photoIndexBox"', control.CONTROL_HTML)
         self.assertIn('id="indexRoots"', control.CONTROL_HTML)
@@ -1786,6 +1785,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('confirm_apply_decisions: "apply-reviewed-decisions"', html)
         self.assertIn('fetchJson(`/picker/api/entries?', html)
         self.assertIn('fetchJson(`/picker/api/entry/', html)
+        self.assertIn('"?include_database=1"', html)
         self.assertIn('fetchJson("/picker/api/choose-folder")', html)
         self.assertIn('fetchJson(`/picker/api/crawl/', html)
         self.assertIn('fetchJson("/picker/api/associated-date-choices"', html)
@@ -1882,6 +1882,33 @@ class Project365ControlAppTests(unittest.TestCase):
 
         self.assertEqual(result["applied_count"], 3)
         picker_state.apply_decisions.assert_called_once_with()
+
+    def test_control_routes_picker_commit_entry(self) -> None:
+        state = mock.Mock()
+        picker_state = state.picker_state.return_value
+        picker_state.commit_entry_decision.return_value = {"applied_count": 1}
+        server = control.ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/picker/api/commit-entry",
+                data=json.dumps({"entry_id": "project365:1998-04-12"}).encode("utf-8"),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(result["applied_count"], 1)
+        picker_state.commit_entry_decision.assert_called_once_with("project365:1998-04-12")
 
     def test_control_routes_picker_associated_photo_decision_and_date_choices(self) -> None:
         state = mock.Mock()
@@ -2098,9 +2125,22 @@ class Project365ControlAppTests(unittest.TestCase):
     def test_control_routes_crop_entries(self) -> None:
         state = mock.Mock()
         picker_state = state.picker_state.return_value
-        picker_state.crop_entries.return_value = [{"entry_id": "project365:1998-04-11"}]
+        picker_state.crop_entries.return_value = [
+            {"entry_id": "project365:1998-04-11"},
+            {"entry_id": "project365:1998-04-12"},
+        ]
         picker_state.pending_crop_commits.return_value = {"pending_count": 2}
-        picker_state.latest_crop_estimate_job.return_value = {"id": "job-1", "status": "running"}
+        picker_state.latest_crop_estimate_job.return_value = {
+            "id": "job-1",
+            "status": "running",
+            "errors": [
+                {
+                    "entry_id": "project365:1998-04-11",
+                    "candidate_path": "/tmp/example.heic",
+                    "error": "Cannot load image for crop estimation: /tmp/example.heic; raw command detail",
+                }
+            ],
+        }
         server = control.ThreadingHTTPServer(
             ("127.0.0.1", 0),
             control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
@@ -2109,7 +2149,7 @@ class Project365ControlAppTests(unittest.TestCase):
         thread.start()
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing",
+                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing&limit=1",
                 timeout=5,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
@@ -2119,8 +2159,19 @@ class Project365ControlAppTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertEqual(result["entries"], [{"entry_id": "project365:1998-04-11"}])
+        self.assertEqual(result["total_count"], 2)
         self.assertEqual(result["pending_crop_commits"], {"pending_count": 2})
-        self.assertEqual(result["crop_estimate_batch"], {"id": "job-1", "status": "running"})
+        self.assertEqual(result["crop_estimate_batch"]["id"], "job-1")
+        self.assertEqual(result["crop_estimate_batch"]["error_count"], 1)
+        self.assertNotIn("errors", result["crop_estimate_batch"])
+        self.assertEqual(
+            result["crop_estimate_batch"]["first_error"],
+            {
+                "entry_id": "project365:1998-04-11",
+                "candidate_filename": "example.heic",
+                "message": "could not load image for crop estimation",
+            },
+        )
         picker_state.crop_entries.assert_called_once_with(crop_filter="missing")
         picker_state.pending_crop_commits.assert_called_once_with()
         picker_state.latest_crop_estimate_job.assert_called_once_with()
@@ -2213,6 +2264,13 @@ class Project365ControlAppTests(unittest.TestCase):
                 "estimated_count": 50,
                 "apply_estimates": True,
                 "started_at": "2026-09-10T00:00:00+00:00",
+                "errors": [
+                    {
+                        "entry_id": "project365:1998-04-11",
+                        "candidate_path": "/tmp/example.heic",
+                        "error": "Cannot load image for crop estimation: /tmp/example.heic; raw command detail",
+                    }
+                ],
             }
         ]
         picker_state.crop_entries.return_value = []
@@ -2226,7 +2284,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertEqual(status["active_jobs"][0]["step"], "crop_confirmation")
         self.assertEqual(status["active_jobs"][0]["kind"], "crop_estimate_batch")
         self.assertFalse(status["active_jobs"][0]["cancellable"])
+        self.assertNotIn("errors", status["active_jobs"][0])
+        self.assertEqual(status["active_jobs"][0]["error_count"], 1)
         self.assertEqual(status["crop_confirmation"]["crop_estimate_batch"]["id"], "crop-job")
+        self.assertNotIn("errors", status["crop_confirmation"]["crop_estimate_batch"])
         picker_state.crop_estimate_jobs.assert_called_once_with(active_only=True)
 
     def test_control_routes_crop_commit(self) -> None:
@@ -2636,8 +2697,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("function pad2(value)", control.CONTROL_HTML)
         self.assertIn('].join("-") + " " + [', control.CONTROL_HTML)
         self.assertNotIn("return parsed.toLocaleString();", control.CONTROL_HTML)
-        self.assertIn("formatShortDateTime(batch.latest_search_finished_at)", control.CONTROL_HTML)
-        self.assertIn("formatShortDateTime(attempt.finished_at || \"\")", control.CONTROL_HTML)
+        self.assertIn("formatShortDateTime(attempt.finished_at)", control.CONTROL_HTML)
 
     def test_broad_visual_history_filters_stale_index_metrics_from_match_rows(self) -> None:
         self.assertIn("function workflowHistoryMetrics(record)", control.CONTROL_HTML)
@@ -3440,12 +3500,8 @@ class Project365ControlAppTests(unittest.TestCase):
             status["original_batch_plan"]["status_counts"],
             {"no_external_candidates": 1, "all_candidates_rejected": 1},
         )
-        self.assertEqual(len(status["original_batch_plan"]["batches"]), 2)
-        self.assertEqual(status["original_batch_plan"]["batches"][0]["batch_id"], "batch-0001")
-        self.assertEqual(
-            status["original_batch_plan"]["batches"][0]["entry_ids"],
-            "project365:1998-04-10",
-        )
+        self.assertNotIn("batches", status["original_batch_plan"])
+        self.assertNotIn("batch_limit", status["original_batch_plan"])
         self.assertEqual(
             status["original_batch_plan"]["next_batch"]["start_date"],
             "1998-04-10",
@@ -3470,11 +3526,6 @@ class Project365ControlAppTests(unittest.TestCase):
             "0",
         )
         self.assertEqual(status["original_batch_plan"]["next_batch"]["next_step"], "Try another folder")
-        self.assertEqual(
-            status["original_batch_plan"]["batches"][1]["next_step"],
-            "Try another folder or keep fallback",
-        )
-        self.assertEqual(status["original_batch_plan"]["batches"][1]["search_attempt_count"], "0")
 
     def test_remainder_overview_reports_actionable_folder_and_hidden_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3674,9 +3725,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertEqual(status["latest"]["candidate_count"], "2")
         self.assertEqual(status["latest"]["hidden_rejected_candidate_count"], "3")
         self.assertEqual(status["latest"]["hidden_export_equivalent_candidate_count"], "4")
-        self.assertEqual(len(status["recent"]), 2)
-        self.assertEqual(status["recent"][0]["attempt_id"], "second")
-        self.assertEqual(status["recent"][1]["attempt_id"], "first")
+        self.assertNotIn("recent", status)
 
     def test_status_reports_latest_diarium_package_photo_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

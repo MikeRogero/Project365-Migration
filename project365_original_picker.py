@@ -17,6 +17,7 @@ import struct
 import subprocess
 import threading
 import urllib.parse
+import uuid
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,7 +26,7 @@ from typing import Any
 
 from project365_crop_align import suggest_crop
 from project365_original_matcher import IMAGE_EXTENSIONS
-from project365_photo_library_index import default_index_db, query_index_candidates
+from project365_photo_library_index import _exiftool_capture_metadata, default_index_db, query_index_candidates
 from project365_original_reference_pipeline import (
     ACCEPT_DECISIONS,
     ASSOCIATED_PHOTO_DECISIONS,
@@ -69,10 +70,31 @@ PROJECT_ORIGINALS_SOURCE_PARTS = ("Source Data", "Original Photos matching Proje
 PROJECT_ORIGINALS_SOURCE_RELATIVE_PATH = Path(*PROJECT_ORIGINALS_SOURCE_PARTS)
 PROJECT_ADDITION_FILENAME_MARKER = "Project365 project file addition"
 PROJECT_ADDITION_DROP_TIME = dt.time(0, 0, 1)
+DROP_CONVERT_TO_HEIC_EXTENSIONS = {".avif", ".avifs", ".webp"}
+DROP_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | DROP_CONVERT_TO_HEIC_EXTENSIONS
+VIDEO_DROP_EXTENSIONS = {".mov", ".mp4", ".m4v"}
+MAX_VIDEO_DROP_BYTES = 2 * 1024 * 1024 * 1024
+VIDEO_FRAME_COUNT = 16
 
 
 def project_originals_source_path(canonical_root: Path) -> Path:
     return (Path(canonical_root).parent / PROJECT_ORIGINALS_SOURCE_RELATIVE_PATH).resolve()
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _rows_for_fieldnames(rows: list[dict[str, str]], fieldnames: list[str]) -> list[dict[str, str]]:
+    return [{field: row.get(field, "") for field in fieldnames} for row in rows]
 
 
 def project_originals_source_folder(canonical_root: Path) -> str:
@@ -243,6 +265,7 @@ class PickerState:
         self._crawl_jobs: dict[str, dict[str, Any]] = {}
         self._crop_estimate_jobs: dict[str, dict[str, Any]] = {}
         self._image_paths: dict[str, Path] = {}
+        self._video_frame_sets: dict[str, dict[str, Any]] = {}
         self._entry_rows_cache: dict[str, list[dict[str, str]]] = {}
         self._candidate_facts_cache: dict[str, tuple[str, bool]] = {}
         self._added_candidate_rows: dict[str, list[dict[str, str]]] = {}
@@ -265,7 +288,9 @@ class PickerState:
         affected_entry_ids = set(self._decision_overrides) | set(self._added_candidate_rows) | set(
             self._replacement_candidate_rows
         )
+        seen_entry_ids: set[str] = set()
         for record in self._queue_shards.summaries():
+            seen_entry_ids.add(record["entry_id"])
             if record["entry_id"] in affected_entry_ids:
                 entry_rows = self._entry_rows(record["entry_id"])
                 status = _entry_status(entry_rows)
@@ -286,6 +311,34 @@ class PickerState:
                 accepted_count = int(record.get("accepted_count", 0))
                 rejected_count = int(record.get("rejected_count", 0))
                 associated_count = int(record.get("associated_count", 0))
+            status_counts[status] = status_counts.get(status, 0) + 1
+            entry_count += 1
+            pending["accepted"] += accepted_count
+            pending["rejected"] += rejected_count
+            pending["associated"] += associated_count
+            if accepted_count:
+                pending_entries["accepted"] += 1
+            if rejected_count:
+                pending_entries["rejected"] += 1
+            if associated_count:
+                pending_entries["associated"] += 1
+        for entry_id in sorted(affected_entry_ids - seen_entry_ids):
+            entry_rows = self._entry_rows(entry_id)
+            if not entry_rows:
+                continue
+            status = _entry_status(entry_rows)
+            accepted_count = sum(
+                row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                for row in entry_rows
+            )
+            rejected_count = sum(
+                row.get("review_decision", "").strip().lower() in REJECT_DECISIONS
+                for row in entry_rows
+            )
+            associated_count = sum(
+                row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+                for row in entry_rows
+            )
             status_counts[status] = status_counts.get(status, 0) + 1
             entry_count += 1
             pending["accepted"] += accepted_count
@@ -384,6 +437,40 @@ class PickerState:
             self._replacement_candidate_rows
         )
         reverse_entry_order = status in {"accepted_not_applied", "rejected"}
+        if entry_ids or entry_dates:
+            seen_entry_ids: set[str] = set()
+            for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
+                entry_id = str(record.get("entry_id", ""))
+                if self._entry_has_completed_external_decision(entry_id):
+                    continue
+                if entry_ids and entry_id not in entry_ids:
+                    continue
+                if entry_dates and str(record.get("entry_date", "")) not in entry_dates:
+                    continue
+                if entry_id in affected_entry_ids:
+                    entry = self._entry_summary(entry_id, self._entry_rows(entry_id))
+                else:
+                    entry = self._entry_summary_from_index(record)
+                if not _entry_matches_status(entry, status):
+                    continue
+                entries.append(entry)
+                seen_entry_ids.add(entry_id)
+            for entry in self._database_entry_summaries(entry_ids, entry_dates):
+                if entry["entry_id"] in seen_entry_ids:
+                    continue
+                if not _entry_matches_status(entry, status):
+                    continue
+                entries.append(entry)
+                seen_entry_ids.add(entry["entry_id"])
+            entries.sort(key=_entry_sort_key, reverse=reverse_entry_order)
+            paged_entries = entries[offset:] if limit is None else entries[offset : offset + limit]
+            return {
+                "entries": paged_entries,
+                "offset": offset,
+                "limit": limit,
+                "returned_count": len(paged_entries),
+                "has_more": limit is not None and offset + len(paged_entries) < len(entries),
+            }
         for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
             entry_id = str(record.get("entry_id", ""))
             if self._entry_has_completed_external_decision(entry_id):
@@ -420,16 +507,22 @@ class PickerState:
         candidate_limit: int | None = None,
         candidate_offset: int = 0,
         rank_if_needed: bool = True,
+        include_database: bool = False,
     ) -> dict[str, Any] | None:
         self._prune_completed_queue_entries_if_needed()
         if candidate_limit is not None and candidate_limit <= 0:
             raise ValueError("candidate_limit must be positive")
         if candidate_offset < 0:
             raise ValueError("candidate_offset must be zero or greater")
-        if self._entry_has_completed_external_decision(entry_id):
+        has_local_pending_rows = self._entry_has_local_pending_rows(entry_id)
+        if self._entry_has_completed_external_decision(entry_id) and not has_local_pending_rows:
+            if include_database:
+                return self._database_entry_detail(entry_id)
             return None
         entry_rows = self._entry_rows(entry_id)
         if not entry_rows:
+            if include_database:
+                return self._database_entry_detail(entry_id)
             return None
         entry_rows = self._ensure_default_filename_index_candidates(entry_id, entry_rows)
         if candidate_limit is None and rank_if_needed:
@@ -907,6 +1000,12 @@ class PickerState:
             "status": "selected",
             "candidate_count": 1,
             "selected_count": 1,
+            "pending_commit_count": 0,
+            "commit_ready": False,
+            "accepted_count": 1,
+            "associated_count": 0,
+            "rejected_count": 0,
+            "fallback_count": 0,
             "source_token": self._image_token(source_path) if source_path else "",
             "source_exists": bool(source_path and source_path.exists()),
             "source_byte_size": _file_byte_size(source_path),
@@ -915,11 +1014,163 @@ class PickerState:
             "people_names": self._entry_people(str(row["entry_id"])),
             "current_match_status": "",
             "current_decision": "",
+            "manual_search_message": "",
+            "used_range_days": [],
             "crop_source_state": crop_source_state,
             "crop_has_crop": _candidate_has_review_crop(candidate),
             "candidates": [candidate],
         }
         return entry
+
+    def _database_entry_summaries(
+        self,
+        entry_ids: set[str],
+        entry_dates: set[str],
+    ) -> list[dict[str, Any]]:
+        summaries = []
+        for entry_id in self._database_entry_ids(entry_ids, entry_dates):
+            detail = self._database_entry_detail(entry_id)
+            if not detail:
+                continue
+            summary = {key: value for key, value in detail.items() if key != "candidates"}
+            summaries.append(summary)
+        summaries.sort(key=_entry_sort_key)
+        return summaries
+
+    def _database_entry_ids(self, entry_ids: set[str], entry_dates: set[str]) -> list[str]:
+        db_path = self.config.canonical_root / "canonical.db"
+        if not db_path.exists():
+            return []
+        clauses = []
+        params: list[str] = []
+        if entry_ids:
+            clauses.append(f"entries.id IN ({','.join('?' for _ in entry_ids)})")
+            params.extend(sorted(entry_ids))
+        if entry_dates:
+            clauses.append(f"entries.entry_date IN ({','.join('?' for _ in entry_dates)})")
+            params.extend(sorted(entry_dates))
+        if not clauses:
+            return []
+        connection = sqlite3.connect(db_path)
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT entries.id
+                FROM entries
+                WHERE {' OR '.join(clauses)}
+                ORDER BY entries.entry_date, entries.id
+                """,
+                params,
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            connection.close()
+        return [str(row[0]) for row in rows if str(row[0] or "").strip()]
+
+    def _database_entry_detail(self, entry_id: str) -> dict[str, Any] | None:
+        selected_detail = self._database_crop_entry_detail(entry_id, mark_estimated_viewed=False)
+        if selected_detail is not None:
+            return selected_detail
+        db_path = self.config.canonical_root / "canonical.db"
+        if not db_path.exists():
+            return None
+        connection = sqlite3.connect(db_path)
+        try:
+            row = connection.execute(
+                """
+                SELECT
+                    entries.id,
+                    entries.entry_date,
+                    SUM(
+                        CASE
+                            WHEN media_assets.role = 'external_original_fallback'
+                                AND media_assets.review_status = 'confirmed'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS fallback_count
+                FROM entries
+                LEFT JOIN media_assets
+                    ON media_assets.entry_id = entries.id
+                WHERE entries.id = ?
+                GROUP BY entries.id, entries.entry_date
+                """,
+                (entry_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        source_path = self._source_media.get(entry_id)
+        fallback_count = int(row[2] or 0)
+        return {
+            "entry_id": str(row[0]),
+            "entry_date": str(row[1]),
+            "status": "fallback" if fallback_count else "search_needed",
+            "candidate_count": 0,
+            "selected_count": 0,
+            "pending_commit_count": 0,
+            "commit_ready": False,
+            "accepted_count": 0,
+            "associated_count": 0,
+            "rejected_count": 0,
+            "fallback_count": fallback_count,
+            "source_token": self._image_token(source_path) if source_path else "",
+            "source_exists": bool(source_path and source_path.exists()),
+            "source_byte_size": _file_byte_size(source_path),
+            "source_file_type": _file_type_label(source_path),
+            "source_dimensions": _image_dimensions(source_path),
+            "people_names": self._entry_people(entry_id),
+            "current_match_status": "",
+            "current_decision": "",
+            "manual_search_message": "",
+            "used_range_days": [],
+            "candidates": [],
+        }
+
+    def _database_manual_candidate_template(self, entry_id: str) -> dict[str, str] | None:
+        detail = self._database_entry_detail(entry_id)
+        if detail is None:
+            return None
+        row = {
+            "entry_id": entry_id,
+            "entry_date": str(detail.get("entry_date", "")),
+            "project365_media_asset_id": self._database_project365_media_asset_id(entry_id),
+            "current_match_status": "",
+            "current_decision": "",
+            "review_decision": "search_needed",
+        }
+        try:
+            fieldnames, _rows = self._read_rows_with_fieldnames()
+        except FileNotFoundError:
+            fieldnames = []
+        _queue_fieldnames_with_required_fields(fieldnames, row)
+        return row
+
+    def _database_project365_media_asset_id(self, entry_id: str) -> str:
+        db_path = self.config.canonical_root / "canonical.db"
+        if not db_path.exists():
+            return ""
+        connection = sqlite3.connect(db_path)
+        try:
+            row = connection.execute(
+                """
+                SELECT id
+                FROM media_assets
+                WHERE entry_id = ?
+                    AND role = 'project365_export_png'
+                ORDER BY id
+                LIMIT 1
+                """,
+                (entry_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return ""
+        finally:
+            connection.close()
+        return str(row[0]) if row else ""
 
     def _database_crop_source_state(self, entry_id: str, candidate_path: str) -> str:
         if self._staged_crop_record(entry_id, candidate_path) is not None:
@@ -1809,7 +2060,12 @@ class PickerState:
         ]
         return jobs[-1] if jobs else None
 
-    def add_linked_candidate(self, entry_id: str, candidate_path: str) -> dict[str, Any]:
+    def add_linked_candidate(
+        self,
+        entry_id: str,
+        candidate_path: str,
+        associate: bool = False,
+    ) -> dict[str, Any]:
         original_path = Path(candidate_path).expanduser()
         if not original_path.is_absolute():
             raise ValueError("The photo must have an absolute path.")
@@ -1819,7 +2075,7 @@ class PickerState:
         if original_path.suffix.lower() not in IMAGE_EXTENSIONS:
             raise ValueError("Choose one supported image file.")
         with self._lock:
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -1851,6 +2107,15 @@ class PickerState:
                     "review_notes": "",
                 }
                 self._store_added_candidate(entry_id, template, values)
+        if associate:
+            return self.save_decision(
+                entry_id=entry_id,
+                candidate_path=original_path_text,
+                decision="external_original_associated_photo",
+                notes="Linked as an associated attachment.",
+                associated_entry_date=entry_date,
+                associated_date_source="entry",
+            )
         return self.entry_detail(entry_id) or {}
 
     def add_copied_candidate(
@@ -1860,18 +2125,20 @@ class PickerState:
         content_type: str,
         payload: bytes,
         include_candidates: bool = True,
+        associate: bool = False,
     ) -> dict[str, Any]:
         safe_name = Path(filename.replace("\\", "/")).name
         suffix = Path(safe_name).suffix.lower()
-        if not safe_name or suffix not in IMAGE_EXTENSIONS:
+        if not safe_name or suffix not in DROP_IMAGE_EXTENSIONS:
             raise ValueError("Drop one supported image file.")
         if not payload:
             raise ValueError("Dropped image is empty.")
         if len(payload) > MAX_DROP_BYTES:
             raise ValueError("Dropped image exceeds the 250 MB limit.")
         digest = hashlib.sha256(payload).hexdigest()
+        stored_suffix = ".heic" if suffix in DROP_CONVERT_TO_HEIC_EXTENSIONS else suffix
         with self._lock:
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -1887,35 +2154,42 @@ class PickerState:
             )
             target_dir.mkdir(parents=True, exist_ok=True)
             timestamp = dt.datetime.combine(parsed_date, PROJECT_ADDITION_DROP_TIME)
-            temp_path = target_dir / f".{parsed_date.isoformat()} {digest[:12]}{suffix}.tmp"
+            input_temp_path = target_dir / f".{parsed_date.isoformat()} {digest[:12]}{suffix}"
+            converted_temp_path = target_dir / f".{parsed_date.isoformat()} {digest[:12]}.heic"
+            working_path = input_temp_path
             try:
-                temp_path.write_bytes(payload)
-                _set_project_addition_timestamps(temp_path, timestamp)
-                stored_digest = _sha256_path(temp_path)
-                destination = _project_addition_destination(target_dir, parsed_date, suffix, stored_digest)
+                input_temp_path.write_bytes(payload)
+                if suffix in DROP_CONVERT_TO_HEIC_EXTENSIONS:
+                    _convert_dropped_photo_to_heic(input_temp_path, converted_temp_path)
+                    input_temp_path.unlink(missing_ok=True)
+                    working_path = converted_temp_path
+                _set_project_addition_timestamps(working_path, timestamp)
+                stored_digest = _sha256_path(working_path)
+                destination = _project_addition_destination(target_dir, parsed_date, stored_suffix, stored_digest)
                 if destination.exists():
                     if _sha256_path(destination) != stored_digest:
                         destination = _project_addition_destination(
                             target_dir,
                             parsed_date,
-                            suffix,
+                            stored_suffix,
                             stored_digest,
                             force_digest_suffix=True,
                         )
                     if destination.exists():
-                        temp_path.unlink()
+                        working_path.unlink()
                     else:
-                        temp_path.replace(destination)
+                        working_path.replace(destination)
                 else:
-                    temp_path.replace(destination)
+                    working_path.replace(destination)
             finally:
-                if temp_path.exists():
-                    temp_path.unlink()
+                input_temp_path.unlink(missing_ok=True)
+                converted_temp_path.unlink(missing_ok=True)
             destination = destination.resolve()
             destination_text = str(destination)
             if not any(row.get("candidate_path") == destination_text for row in entry_rows):
                 template = entry_rows[0]
-                mime_type = content_type if content_type.startswith("image/") else ""
+                mime_type = "image/heic" if suffix in DROP_CONVERT_TO_HEIC_EXTENSIONS else ""
+                mime_type = mime_type or (content_type if content_type.startswith("image/") else "")
                 mime_type = mime_type or mimetypes.guess_type(destination.name)[0] or "application/octet-stream"
                 values = {
                     "entry_id": entry_id,
@@ -1937,6 +2211,16 @@ class PickerState:
                     "review_notes": "",
                 }
                 self._store_added_candidate(entry_id, template, values)
+        if associate:
+            return self.save_decision(
+                entry_id=entry_id,
+                candidate_path=destination_text,
+                decision="external_original_associated_photo",
+                notes="Dropped photo linked as an associated attachment.",
+                include_candidates=include_candidates,
+                associated_entry_date=entry_date,
+                associated_date_source="entry",
+            )
         return self.save_decision(
             entry_id=entry_id,
             candidate_path=destination_text,
@@ -1945,9 +2229,245 @@ class PickerState:
             include_candidates=include_candidates,
         )
 
+    def prepare_video_frame_choices(
+        self,
+        entry_id: str,
+        filename: str,
+        upload_path: Path,
+    ) -> dict[str, Any]:
+        safe_name = Path(filename.replace("\\", "/")).name or "dropped-video"
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in VIDEO_DROP_EXTENSIONS:
+            raise ValueError("Drop one supported video file.")
+        with self._lock:
+            entry_rows = self._entry_rows(entry_id)
+            if not entry_rows:
+                raise ValueError("Unknown entry")
+            entry_date = entry_rows[0].get("entry_date", "")
+            try:
+                dt.date.fromisoformat(entry_date)
+            except ValueError as exc:
+                raise ValueError("Entry has an invalid date") from exc
+        session_id = uuid.uuid4().hex
+        frame_dir = self.config.canonical_root / "cache" / "picker_video_frames" / session_id
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        video_path = frame_dir / safe_name
+        try:
+            upload_path.replace(video_path)
+            try:
+                extracted = _extract_video_frames(video_path, frame_dir, VIDEO_FRAME_COUNT)
+                capture_timestamp, capture_timestamp_source = _video_capture_timestamp(video_path)
+            except Exception:
+                shutil.rmtree(frame_dir, ignore_errors=True)
+                raise
+        finally:
+            upload_path.unlink(missing_ok=True)
+        if not extracted:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+            raise ValueError("Could not extract screenshots from the dropped video.")
+        frames: list[dict[str, Any]] = []
+        with self._lock:
+            video_token = self._image_token(video_path)
+            for index, (time_seconds, frame_path) in enumerate(extracted, start=1):
+                token = self._image_token(frame_path)
+                frame_id = f"frame-{index:02d}"
+                frames.append(
+                    {
+                        "frame_id": frame_id,
+                        "token": token,
+                        "time_seconds": round(time_seconds, 3),
+                        "label": _format_frame_time(time_seconds),
+                        "path": str(frame_path),
+                    }
+                )
+            self._video_frame_sets[session_id] = {
+                "entry_id": entry_id,
+                "entry_date": entry_date,
+                "filename": safe_name,
+                "video_path": str(video_path),
+                "video_token": video_token,
+                "duration_seconds": _video_duration_seconds(video_path),
+                "capture_timestamp": capture_timestamp,
+                "capture_timestamp_source": capture_timestamp_source,
+                "frames": frames,
+                "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                "frame_dir": str(frame_dir),
+            }
+        return {
+            "kind": "video_frame_choices",
+            "entry_id": entry_id,
+            "entry_date": entry_date,
+            "filename": safe_name,
+            "session_id": session_id,
+            "video_token": self._video_frame_sets[session_id]["video_token"],
+            "duration_seconds": self._video_frame_sets[session_id]["duration_seconds"],
+            "capture_timestamp": self._video_frame_sets[session_id]["capture_timestamp"],
+            "capture_timestamp_source": self._video_frame_sets[session_id]["capture_timestamp_source"],
+            "frames": [
+                {key: frame[key] for key in ("frame_id", "token", "time_seconds", "label")}
+                for frame in frames
+            ],
+        }
+
+    def extract_video_frame_at_time(
+        self,
+        entry_id: str,
+        session_id: str,
+        time_seconds: float,
+    ) -> dict[str, Any]:
+        if time_seconds < 0:
+            raise ValueError("Choose a time inside the movie.")
+        with self._lock:
+            frame_set = self._video_frame_sets.get(session_id)
+            if not frame_set or frame_set.get("entry_id") != entry_id:
+                raise ValueError("Unknown video screenshot session.")
+            frames = list(frame_set.get("frames", []))
+            frame_dir = Path(str(frame_set.get("frame_dir", "")))
+            video_path = Path(str(frame_set.get("video_path", "")))
+            duration = float(frame_set.get("duration_seconds") or 0.0)
+        if duration > 0:
+            time_seconds = min(time_seconds, duration)
+        rounded_time = round(time_seconds, 3)
+        if any(round(float(frame.get("time_seconds") or 0.0), 3) == rounded_time for frame in frames):
+            raise ValueError(
+                f"A screenshot at {_format_frame_time(rounded_time)} is already in the grid. "
+                "Move the scrubber slightly to capture a different frame."
+            )
+        frame_id = f"custom-{len(frames) + 1:02d}"
+        frame_path = frame_dir / f"{frame_id}.jpg"
+        _extract_video_frame_at_time(video_path, frame_path, rounded_time)
+        frame = {
+            "frame_id": frame_id,
+            "token": self._image_token(frame_path),
+            "time_seconds": rounded_time,
+            "label": _format_frame_time(rounded_time),
+            "path": str(frame_path),
+            "custom": True,
+        }
+        with self._lock:
+            current = self._video_frame_sets.get(session_id)
+            if not current or current.get("entry_id") != entry_id:
+                frame_path.unlink(missing_ok=True)
+                raise ValueError("Unknown video screenshot session.")
+            current.setdefault("frames", []).append(frame)
+        return {
+            "frame": {
+                key: frame[key]
+                for key in ("frame_id", "token", "time_seconds", "label", "custom")
+            }
+        }
+
+    def import_video_frames(
+        self,
+        entry_id: str,
+        session_id: str,
+        main_frame_id: str = "",
+        supplemental_frame_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        supplemental_ids = [str(value) for value in (supplemental_frame_ids or [])]
+        selected_ids = ([main_frame_id] if main_frame_id else []) + supplemental_ids
+        selected_ids = [value for value in selected_ids if value]
+        if not selected_ids:
+            raise ValueError("Choose at least one screenshot.")
+        with self._lock:
+            frame_set = self._video_frame_sets.get(session_id)
+            if not frame_set or frame_set.get("entry_id") != entry_id:
+                raise ValueError("Unknown video screenshot session.")
+            frames_by_id = {
+                str(frame.get("frame_id", "")): dict(frame)
+                for frame in frame_set.get("frames", [])
+            }
+            video_name = str(frame_set.get("filename", "video"))
+        detail: dict[str, Any] = {}
+        try:
+            used_supplemental_ids = [value for value in supplemental_ids if value != main_frame_id]
+            if main_frame_id:
+                frame = frames_by_id.get(main_frame_id)
+                if not frame:
+                    raise ValueError("Unknown main screenshot.")
+                frame_path = Path(str(frame.get("path", "")))
+                detail = self.add_copied_candidate(
+                    entry_id=entry_id,
+                    filename=_video_frame_filename(video_name, frame),
+                    content_type="image/jpeg",
+                    payload=frame_path.read_bytes(),
+                    include_candidates=False,
+                    associate=False,
+                )
+            for frame_id in used_supplemental_ids:
+                frame = frames_by_id.get(frame_id)
+                if not frame:
+                    raise ValueError("Unknown supplemental screenshot.")
+                frame_path = Path(str(frame.get("path", "")))
+                detail = self.add_copied_candidate(
+                    entry_id=entry_id,
+                    filename=_video_frame_filename(video_name, frame),
+                    content_type="image/jpeg",
+                    payload=frame_path.read_bytes(),
+                    include_candidates=True,
+                    associate=True,
+                )
+        finally:
+            self.discard_video_frame_choices(entry_id, session_id)
+        return self.entry_detail(entry_id) or detail or {}
+
+    def discard_video_frame_choices(self, entry_id: str, session_id: str) -> None:
+        with self._lock:
+            frame_set = self._video_frame_sets.pop(session_id, None)
+            if not frame_set or frame_set.get("entry_id") != entry_id:
+                return
+            frame_dir = Path(str(frame_set.get("frame_dir", "")))
+        if frame_dir:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+
+    def _unused_project_addition_paths_for_entries(self) -> list[Path]:
+        paths: list[Path] = []
+        for _, rows in self._iter_entry_groups():
+            if not any(
+                row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS | ASSOCIATED_PHOTO_DECISIONS
+                for row in rows
+            ):
+                continue
+            paths.extend(self._unused_project_addition_paths_from_rows(rows))
+        return _unique_paths(paths)
+
+    def _unused_project_addition_paths_from_rows(self, rows: list[dict[str, str]]) -> list[Path]:
+        paths: list[Path] = []
+        project_originals_root = project_originals_source_path(self.config.canonical_root)
+        for row in rows:
+            decision = row.get("review_decision", "").strip().lower()
+            if decision in ACCEPT_DECISIONS or decision in ASSOCIATED_PHOTO_DECISIONS:
+                continue
+            path_text = row.get("candidate_path", "").strip()
+            if not path_text:
+                continue
+            candidate_path = Path(path_text).expanduser()
+            try:
+                candidate_path.resolve().relative_to(project_originals_root)
+            except (OSError, ValueError):
+                continue
+            evidence = row.get("evidence", "").strip().lower()
+            filename = row.get("candidate_filename", "") or candidate_path.name
+            if "manual_drop_copy" not in evidence and PROJECT_ADDITION_FILENAME_MARKER not in filename:
+                continue
+            paths.append(candidate_path)
+        return _unique_paths(paths)
+
+    def _delete_paths(self, paths: list[Path]) -> int:
+        deleted = 0
+        for path in _unique_paths(paths):
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    deleted += 1
+            except OSError:
+                continue
+        return deleted
+
     def apply_decisions(self) -> dict[str, Any]:
         self._prune_completed_queue_entries_if_needed()
         with self._lock:
+            unused_project_additions = self._unused_project_addition_paths_for_entries()
             self._materialize_decision_overrides()
             apply_summary = apply_reviewed_external_references(
                 canonical_root=self.config.canonical_root,
@@ -1962,6 +2482,7 @@ class PickerState:
             self._queue_shards.invalidate()
             self._completed_external_entry_ids_cache = None
             self._completed_queue_prune_signature = None
+            deleted_unused_project_additions = self._delete_paths(unused_project_additions)
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -1970,17 +2491,19 @@ class PickerState:
             "fallback_count": apply_summary.fallback_count,
             "associated_count": apply_summary.associated_count,
             "applied_count": apply_summary.applied_count,
+            "skipped_unknown_media_count": apply_summary.skipped_unknown_media_count,
             "remaining_queue_rows": prune_summary["queue_rows"],
             "remaining_entries": prune_summary["entry_count"],
             "removed_completed_entries": prune_summary["removed_completed_entries"],
             "removed_rejected_candidates": prune_summary["removed_rejected_candidates"],
+            "deleted_unused_project_additions": deleted_unused_project_additions,
         }
 
     def commit_entry_decision(self, entry_id: str) -> dict[str, Any]:
         self._prune_completed_queue_entries_if_needed()
         with self._lock:
-            fieldnames, rows = self._read_rows_with_fieldnames()
-            entry_rows = [dict(row) for row in rows if row.get("entry_id") == entry_id]
+            fieldnames, _rows = self._read_rows_with_fieldnames()
+            entry_rows = self._entry_rows(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             if not any(
@@ -1988,11 +2511,12 @@ class PickerState:
                 for row in entry_rows
             ):
                 raise ValueError("No linked original is pending for this target")
+            unused_project_additions = self._unused_project_addition_paths_from_rows(entry_rows)
             temp_path = self.config.queue_path.with_suffix(f".{entry_id.replace(':', '_')}.commit.csv")
             with temp_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(entry_rows)
+                writer.writerows(_rows_for_fieldnames(entry_rows, fieldnames))
             try:
                 apply_summary = apply_reviewed_external_references(
                     canonical_root=self.config.canonical_root,
@@ -2013,6 +2537,7 @@ class PickerState:
             self._queue_shards.invalidate()
             self._completed_external_entry_ids_cache = None
             self._completed_queue_prune_signature = None
+            deleted_unused_project_additions = self._delete_paths(unused_project_additions)
         self._source_media = self._load_source_media()
         self._refresh_image_paths()
         return {
@@ -2021,10 +2546,12 @@ class PickerState:
             "fallback_count": apply_summary.fallback_count,
             "associated_count": apply_summary.associated_count,
             "applied_count": apply_summary.applied_count,
+            "skipped_unknown_media_count": apply_summary.skipped_unknown_media_count,
             "remaining_queue_rows": prune_summary["queue_rows"],
             "remaining_entries": prune_summary["entry_count"],
             "removed_completed_entries": prune_summary["removed_completed_entries"],
             "removed_rejected_candidates": prune_summary["removed_rejected_candidates"],
+            "deleted_unused_project_additions": deleted_unused_project_additions,
         }
 
     def expand_date_range(
@@ -2576,6 +3103,8 @@ class PickerState:
             "status": status,
             "candidate_count": remaining_candidate_count,
             "selected_count": len(selected_rows),
+            "pending_commit_count": len(selected_rows),
+            "commit_ready": bool(selected_rows),
             "source_token": self._image_token(source_path) if source_path else "",
             "source_exists": bool(source_path and source_path.exists()),
             "source_byte_size": _file_byte_size(source_path),
@@ -2599,12 +3128,15 @@ class PickerState:
     def _entry_summary_from_index(self, record: dict[str, Any]) -> dict[str, Any]:
         entry_id = str(record.get("entry_id", ""))
         source_path = self._source_media.get(entry_id)
+        pending_commit_count = int(record.get("pending_commit_count", record.get("selected_count", 0)))
         return {
             "entry_id": entry_id,
             "entry_date": str(record.get("entry_date", "")),
             "status": str(record.get("status", "search_needed")),
             "candidate_count": int(record.get("candidate_count", 0)),
             "selected_count": int(record.get("selected_count", 0)),
+            "pending_commit_count": pending_commit_count,
+            "commit_ready": bool(record["commit_ready"]) if "commit_ready" in record else pending_commit_count > 0,
             "source_token": self._image_token(source_path) if source_path else "",
             "source_exists": bool(source_path and source_path.exists()),
             "source_byte_size": _file_byte_size(source_path),
@@ -2668,6 +3200,14 @@ class PickerState:
             candidate_path = row.get("candidate_path", "").strip()
             if candidate_path:
                 self._image_token(Path(candidate_path))
+        for frame_set in self._video_frame_sets.values():
+            video_path = Path(str(frame_set.get("video_path", "")))
+            if video_path:
+                self._image_token(video_path)
+            for frame in frame_set.get("frames", []):
+                path = Path(str(frame.get("path", "")))
+                if path:
+                    self._image_token(path)
 
     def _load_source_media(self) -> dict[str, Path]:
         db_path = self.config.canonical_root / "canonical.db"
@@ -3013,9 +3553,10 @@ class PickerState:
         self._replacement_candidate_rows.pop(entry_id, None)
         additions = self._added_candidate_rows.setdefault(entry_id, [])
         additions.extend(rows)
+        self._added_candidate_rows[entry_id] = _deduplicate_candidate_rows(additions)
         cached_rows = self._entry_rows_cache.get(entry_id, [])
         if cached_rows:
-            self._cache_entry_rows(entry_id, [*cached_rows, *rows])
+            self._cache_entry_rows(entry_id, _deduplicate_candidate_rows([*cached_rows, *rows]))
         self._persist_decision_overrides()
 
     def _store_replacement_candidates(
@@ -3024,7 +3565,7 @@ class PickerState:
         template: dict[str, str],
         values_list: list[dict[str, Any]],
     ) -> None:
-        rows = self._deduplicate_candidate_rows(self._candidate_rows_from_values(template, values_list))
+        rows = _deduplicate_candidate_rows(self._candidate_rows_from_values(template, values_list))
         if not rows:
             rows = [self._empty_candidate_row(template)]
         self._replacement_candidate_rows[entry_id] = rows
@@ -3051,19 +3592,6 @@ class PickerState:
                 row[field] = str(value)
             rows.append(row)
         return rows
-
-    def _deduplicate_candidate_rows(self, rows: list[dict[str, str]]) -> list[dict[str, str]]:
-        deduped: list[dict[str, str]] = []
-        seen_paths: set[str] = set()
-        for row in rows:
-            path_text = str(row.get("candidate_path", "")).strip()
-            if path_text:
-                normalized = str(Path(path_text).expanduser())
-                if normalized in seen_paths:
-                    continue
-                seen_paths.add(normalized)
-            deduped.append(row)
-        return deduped
 
     def _empty_candidate_row(self, template: dict[str, str]) -> dict[str, str]:
         row = {field: str(value) for field, value in template.items()}
@@ -3102,6 +3630,23 @@ class PickerState:
             if override:
                 row.update(override)
 
+    def _entry_has_local_pending_rows(self, entry_id: str) -> bool:
+        return (
+            entry_id in self._added_candidate_rows
+            or entry_id in self._replacement_candidate_rows
+            or entry_id in self._decision_overrides
+        )
+
+    def _entry_rows_for_manual_candidate(self, entry_id: str) -> list[dict[str, str]]:
+        rows = self._entry_rows(entry_id)
+        if rows:
+            return rows
+        template = self._database_manual_candidate_template(entry_id)
+        if template is None:
+            return []
+        self._cache_entry_rows(entry_id, [template])
+        return [dict(template)]
+
     def _materialize_decision_overrides(self) -> None:
         if not self._decision_overrides and not self._added_candidate_rows and not self._replacement_candidate_rows:
             return
@@ -3117,6 +3662,7 @@ class PickerState:
             raise FileNotFoundError(f"Missing search queue: {self.config.queue_path}")
         current_entry_id = ""
         current_rows: list[dict[str, str]] = []
+        yielded_entry_ids: set[str] = set()
         with self.config.queue_path.open(encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
                 entry_id = row.get("entry_id", "")
@@ -3125,6 +3671,8 @@ class PickerState:
                     if current_entry_id not in self._replacement_candidate_rows:
                         rows.extend(dict(row) for row in self._added_candidate_rows.get(current_entry_id, []))
                     self._apply_entry_overrides(current_entry_id, rows)
+                    rows = _deduplicate_candidate_rows(rows)
+                    yielded_entry_ids.add(current_entry_id)
                     yield current_entry_id, rows
                     current_rows = []
                 current_entry_id = entry_id
@@ -3134,7 +3682,23 @@ class PickerState:
             if current_entry_id not in self._replacement_candidate_rows:
                 rows.extend(dict(row) for row in self._added_candidate_rows.get(current_entry_id, []))
             self._apply_entry_overrides(current_entry_id, rows)
+            rows = _deduplicate_candidate_rows(rows)
+            yielded_entry_ids.add(current_entry_id)
             yield current_entry_id, rows
+        pending_entry_ids = set(self._replacement_candidate_rows) | set(self._added_candidate_rows)
+        for entry_id in sorted(pending_entry_ids - yielded_entry_ids):
+            rows = [
+                dict(row)
+                for row in self._replacement_candidate_rows.get(
+                    entry_id,
+                    self._added_candidate_rows.get(entry_id, []),
+                )
+            ]
+            if not rows:
+                continue
+            self._apply_entry_overrides(entry_id, rows)
+            rows = _deduplicate_candidate_rows(rows)
+            yield entry_id, rows
 
     def _entry_rows(self, entry_id: str) -> list[dict[str, str]]:
         cached = self._entry_rows_cache.pop(entry_id, None)
@@ -3147,6 +3711,7 @@ class PickerState:
             rows = self._queue_shards.entry_rows(entry_id)
             rows.extend(dict(row) for row in self._added_candidate_rows.get(entry_id, []))
         self._apply_entry_overrides(entry_id, rows)
+        rows = _deduplicate_candidate_rows(rows)
         if rows:
             self._cache_entry_rows(entry_id, rows)
         return rows
@@ -3222,7 +3787,7 @@ class PickerState:
         with temp_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(_rows_for_fieldnames(rows, fieldnames))
         temp_path.replace(self.config.queue_path)
         self._entry_rows_cache = {}
         self._queue_shards.invalidate()
@@ -3283,6 +3848,8 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/":
                     self._send_html(PICKER_HTML)
+                elif parsed.path in {"/link-drop", "/link-drop/"}:
+                    self._send_html(link_drop_html())
                 elif parsed.path in {"/crop", "/crop/"}:
                     self._send_html(CROP_HTML)
                 elif parsed.path == "/favicon.ico":
@@ -3318,11 +3885,13 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         }
                     )
                 elif parsed.path.startswith("/api/entry/"):
+                    query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/api/entry/"))
                     detail = state.entry_detail(
                         entry_id,
                         candidate_limit=None,
                         rank_if_needed=False,
+                        include_database=_query_flag(query, "include_database"),
                     )
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
@@ -3499,17 +4068,70 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     detail = state.add_linked_candidate(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
+                        associate=bool(payload.get("associate", False)),
                     )
                     self._send_json(detail)
                     return
                 if parsed.path == "/api/import-dropped-candidate":
+                    entry_id = urllib.parse.unquote(self.headers.get("x-entry-id", ""))
+                    filename = urllib.parse.unquote(self.headers.get("x-file-name", ""))
+                    suffix = Path(filename.replace("\\", "/")).suffix.lower()
+                    if suffix in VIDEO_DROP_EXTENSIONS:
+                        upload_path = self._read_upload_to_temp(MAX_VIDEO_DROP_BYTES, suffix)
+                        detail = state.prepare_video_frame_choices(
+                            entry_id=entry_id,
+                            filename=filename,
+                            upload_path=upload_path,
+                        )
+                    else:
+                        payload = self._read_bytes(MAX_DROP_BYTES)
+                        detail = state.add_copied_candidate(
+                            entry_id=entry_id,
+                            filename=filename,
+                            content_type=self.headers.get("content-type", ""),
+                            payload=payload,
+                            include_candidates=False,
+                        )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/api/import-linked-candidate":
                     payload = self._read_bytes(MAX_DROP_BYTES)
                     detail = state.add_copied_candidate(
                         entry_id=urllib.parse.unquote(self.headers.get("x-entry-id", "")),
                         filename=urllib.parse.unquote(self.headers.get("x-file-name", "")),
                         content_type=self.headers.get("content-type", ""),
                         payload=payload,
-                        include_candidates=False,
+                        include_candidates=True,
+                        associate=True,
+                    )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/api/import-video-frames":
+                    payload = self._read_json()
+                    detail = state.import_video_frames(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                        main_frame_id=str(payload.get("main_frame_id", "")),
+                        supplemental_frame_ids=[
+                            str(value) for value in payload.get("supplemental_frame_ids", [])
+                        ],
+                    )
+                    self._send_json(detail)
+                    return
+                if parsed.path == "/api/discard-video-frames":
+                    payload = self._read_json()
+                    state.discard_video_frame_choices(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                    )
+                    self._send_json({"ok": True})
+                    return
+                if parsed.path == "/api/extract-video-frame":
+                    payload = self._read_json()
+                    detail = state.extract_video_frame_at_time(
+                        entry_id=str(payload.get("entry_id", "")),
+                        session_id=str(payload.get("session_id", "")),
+                        time_seconds=float(payload.get("time_seconds", 0) or 0),
                     )
                     self._send_json(detail)
                     return
@@ -3545,6 +4167,26 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
             if length > maximum:
                 raise ValueError("Dropped image exceeds the 250 MB limit.")
             return self.rfile.read(length)
+
+        def _read_upload_to_temp(self, maximum: int, suffix: str) -> Path:
+            length = int(self.headers.get("content-length", "0"))
+            if length > maximum:
+                raise ValueError("Dropped video exceeds the 2 GB limit.")
+            temp_dir = state.config.canonical_root / "cache" / "picker_video_uploads"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}{suffix or '.video'}"
+            remaining = length
+            with temp_path.open("wb") as handle:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                temp_path.unlink(missing_ok=True)
+                raise ValueError("Dropped video upload ended before the full file was received.")
+            return temp_path
 
         def _send_html(self, body: str) -> None:
             payload = body.encode("utf-8")
@@ -3628,6 +4270,7 @@ def _batch_sort_key(batch: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def _entry_status(entry_rows: list[dict[str, str]]) -> str:
+    entry_rows = _deduplicate_candidate_rows(entry_rows)
     candidate_rows = [
         row
         for row in entry_rows
@@ -3659,11 +4302,26 @@ def _entry_status(entry_rows: list[dict[str, str]]) -> str:
     return "needs_review"
 
 
+def _deduplicate_candidate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for row in rows:
+        path_text = str(row.get("candidate_path", "")).strip()
+        if path_text:
+            normalized = str(Path(path_text).expanduser())
+            if normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+        deduped.append(row)
+    return deduped
+
+
 def _queue_shard_entry_summary(
     entry_id: str,
     rows: list[dict[str, str]],
     shard_index: int,
 ) -> dict[str, Any]:
+    rows = _deduplicate_candidate_rows(rows)
     first = rows[0]
     candidate_rows = [
         row
@@ -3692,6 +4350,8 @@ def _queue_shard_entry_summary(
         "status": _entry_status(rows),
         "candidate_count": len(candidate_rows) - rejected_count,
         "selected_count": accepted_count,
+        "pending_commit_count": accepted_count,
+        "commit_ready": accepted_count > 0,
         "accepted_count": accepted_count,
         "rejected_count": rejected_count,
         "associated_count": associated_count,
@@ -3988,6 +4648,164 @@ def _project_addition_destination(
     return target_dir / f"{stem}{suffix}"
 
 
+def _magick_command() -> str:
+    magick = shutil.which("magick")
+    if magick:
+        return magick
+    homebrew_magick = Path("/opt/homebrew/bin/magick")
+    if homebrew_magick.is_file():
+        return str(homebrew_magick)
+    raise ValueError("ImageMagick is required to convert AVIF drops to HEIC.")
+
+
+def _convert_dropped_photo_to_heic(source: Path, destination: Path) -> None:
+    completed = subprocess.run(
+        [
+            _magick_command(),
+            str(source),
+            "-auto-orient",
+            f"HEIC:{destination}",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=120,
+    )
+    if completed.returncode != 0 or not destination.exists() or destination.stat().st_size == 0:
+        destination.unlink(missing_ok=True)
+        error = (completed.stderr or completed.stdout).strip()
+        detail = f": {error}" if error else "."
+        raise ValueError(f"Could not convert dropped photo to HEIC{detail}")
+
+
+def _ffmpeg_command() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    homebrew_ffmpeg = Path("/opt/homebrew/bin/ffmpeg")
+    if homebrew_ffmpeg.is_file():
+        return str(homebrew_ffmpeg)
+    raise ValueError("FFmpeg is required to extract screenshots from dropped videos.")
+
+
+def _ffprobe_command() -> str:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        return ffprobe
+    homebrew_ffprobe = Path("/opt/homebrew/bin/ffprobe")
+    if homebrew_ffprobe.is_file():
+        return str(homebrew_ffprobe)
+    raise ValueError("FFprobe is required to inspect dropped videos.")
+
+
+def _video_duration_seconds(path: Path) -> float:
+    completed = subprocess.run(
+        [
+            _ffprobe_command(),
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return 0.0
+    try:
+        return max(0.0, float(completed.stdout.strip()))
+    except ValueError:
+        return 0.0
+
+
+def _video_capture_timestamp(path: Path) -> tuple[str, str]:
+    try:
+        metadata = _exiftool_capture_metadata([path])
+    except Exception:
+        return "", ""
+    return metadata.get(str(path.resolve()), ("", ""))
+
+
+def _video_frame_times(duration: float, max_count: int) -> list[float]:
+    if duration <= 0:
+        return [0.0, 2.0, 5.0, 10.0][:max_count]
+    desired = max(1, max_count)
+    if desired == 1:
+        return [max(0.0, duration / 2)]
+    return [duration * (index + 1) / (desired + 1) for index in range(desired)]
+
+
+def _extract_video_frames(video_path: Path, frame_dir: Path, max_count: int) -> list[tuple[float, Path]]:
+    duration = _video_duration_seconds(video_path)
+    extracted: list[tuple[float, Path]] = []
+    errors: list[str] = []
+    for index, time_seconds in enumerate(_video_frame_times(duration, max_count), start=1):
+        frame_path = frame_dir / f"frame-{index:02d}.jpg"
+        try:
+            _extract_video_frame_at_time(video_path, frame_path, time_seconds)
+            extracted.append((time_seconds, frame_path))
+        except ValueError as exc:
+            errors.append(str(exc))
+    if not extracted and errors:
+        raise ValueError(f"Could not extract screenshots from the dropped video: {errors[0]}")
+    return extracted
+
+
+def _extract_video_frame_at_time(video_path: Path, frame_path: Path, time_seconds: float) -> None:
+    completed = subprocess.run(
+        [
+            _ffmpeg_command(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{time_seconds:.3f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(frame_path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=60,
+    )
+    if completed.returncode == 0 and frame_path.exists() and frame_path.stat().st_size > 0:
+        return
+    error = (completed.stderr or completed.stdout).strip()
+    frame_path.unlink(missing_ok=True)
+    if error:
+        raise ValueError(error)
+    raise ValueError("Could not extract that screenshot.")
+
+
+def _format_frame_time(time_seconds: float) -> str:
+    seconds = max(0, int(round(time_seconds)))
+    minutes, second = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minute:02d}:{second:02d}"
+    return f"{minute}:{second:02d}"
+
+
+def _video_frame_filename(video_name: str, frame: dict[str, Any]) -> str:
+    stem = Path(video_name).stem or "video"
+    label = str(frame.get("label", "")).replace(":", "-") or "frame"
+    frame_id = str(frame.get("frame_id", "frame"))
+    return f"{stem} screenshot {label} {frame_id}.jpg"
+
+
 def _set_project_addition_timestamps(path: Path, timestamp: dt.datetime) -> None:
     exiftool = shutil.which("exiftool")
     if not exiftool:
@@ -4259,6 +5077,10 @@ def _query_int(query: dict[str, list[str]], key: str, default: int | None) -> in
         return int(raw_value)
     except ValueError as exc:
         raise ValueError(f"{key} must be an integer") from exc
+
+
+def _query_flag(query: dict[str, list[str]], key: str) -> bool:
+    return query.get(key, [""])[0].strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _parse_json_object(value: str) -> dict[str, object]:
@@ -4662,6 +5484,21 @@ button {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
 }
+.entry-date-jump {
+  display: inline-grid;
+  grid-template-columns: 112px 112px auto;
+  gap: 8px;
+  justify-content: start;
+}
+.entry-date-jump input {
+  width: 100%;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  padding: 0 8px;
+  font-size: 13px;
+}
 .entry-list {
   overflow: auto;
   min-height: 0;
@@ -4843,6 +5680,7 @@ button {
 .icon-button:focus-visible,
 .action-button:focus-visible,
 .filter:focus-visible,
+.entry-date-jump input:focus-visible,
 .crawl-panel input:focus-visible,
 textarea:focus-visible {
   outline: 2px solid #0b61d8;
@@ -4882,6 +5720,170 @@ textarea:focus-visible {
 .action-button.linked:not(:disabled):hover {
   background: #651616;
   border-color: #651616;
+}
+.video-frame-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.56);
+  padding: 24px;
+}
+.video-frame-modal.is-open {
+  display: flex;
+}
+.video-frame-dialog {
+  width: min(1180px, 100%);
+  max-height: min(760px, 94vh);
+  overflow: auto;
+  background: var(--panel);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.25);
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+.video-frame-header,
+.video-frame-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.video-frame-title {
+  display: grid;
+  gap: 2px;
+}
+.video-frame-title strong {
+  font-size: 17px;
+}
+.video-frame-title span,
+.video-frame-help {
+  color: var(--muted);
+  font-size: 12px;
+}
+.video-frame-scrubber {
+  display: grid;
+  grid-template-columns: minmax(280px, 1.2fr) minmax(260px, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+.video-frame-player {
+  width: 100%;
+  max-height: 360px;
+  background: #111827;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.video-frame-custom {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+.video-frame-custom label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.video-frame-custom input[type="range"] {
+  width: 100%;
+}
+.video-frame-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.video-frame-step-controls {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+.video-frame-step-controls .action-button {
+  min-width: 0;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+.video-frame-capture-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.video-frame-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.video-frame-processing {
+  grid-column: 1 / -1;
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: #f8fafc;
+  text-align: center;
+  padding: 20px;
+}
+.video-frame-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+  display: grid;
+  position: relative;
+}
+.video-frame-card.custom-frame {
+  border: 2px solid #0f766e;
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.24);
+}
+.video-frame-card.custom-frame::before {
+  content: "Captured";
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
+  border-radius: 999px;
+  background: #0f766e;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 5px 8px;
+}
+.video-frame-card .image-preview-trigger {
+  display: block;
+  height: auto;
+  line-height: 0;
+}
+.video-frame-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: #111827;
+}
+.video-frame-controls {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  font-size: 12px;
+}
+.video-frame-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .workspace {
   min-height: 0;
@@ -5122,7 +6124,7 @@ textarea:focus-visible {
 .image-preview-modal {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: 100;
   display: none;
   align-items: center;
   justify-content: center;
@@ -5134,12 +6136,18 @@ textarea:focus-visible {
 }
 .image-preview-dialog {
   position: relative;
+  width: fit-content;
   max-width: min(96vw, 1600px);
   max-height: 94vh;
-  display: grid;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
   gap: 8px;
 }
 .image-preview-dialog img {
+  display: block;
+  width: auto;
+  height: auto;
   max-width: min(96vw, 1600px);
   max-height: 86vh;
   object-fit: contain;
@@ -5162,10 +6170,11 @@ textarea:focus-visible {
   cursor: pointer;
 }
 .image-preview-caption {
-  max-width: min(96vw, 1600px);
+  max-width: min(100%, 96vw);
   color: #fff;
   font-size: 13px;
   overflow-wrap: anywhere;
+  text-align: center;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
 }
 .candidate-filename-row {
@@ -5193,6 +6202,24 @@ textarea:focus-visible {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   padding: 10px;
+}
+.candidate-actions.compact {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.candidate-actions.main-only {
+  grid-template-columns: minmax(0, 1fr);
+}
+.candidate-actions .action-button {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  height: auto;
+  padding: 6px 8px;
+  white-space: normal;
+  line-height: 1.12;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 .associated-date-panel {
   grid-column: 1 / -1;
@@ -5273,7 +6300,7 @@ textarea:focus-visible {
 }
 .photo-drop-row {
   display: grid;
-  grid-template-columns: minmax(0, 4fr) minmax(76px, 1fr);
+  grid-template-columns: minmax(0, 4fr) minmax(120px, 1fr);
   gap: 8px;
   align-items: stretch;
 }
@@ -5305,9 +6332,15 @@ textarea:focus-visible {
 }
 .photo-link-drag-lane {
   border-color: var(--line);
-  color: var(--muted);
+  color: var(--ink);
   font-size: 11px;
   line-height: 1.25;
+  background: #f8fafc;
+}
+.photo-link-drag-lane .action-button {
+  margin-top: 6px;
+  justify-self: center;
+  white-space: normal;
 }
 .search-panel {
   box-sizing: border-box;
@@ -5445,6 +6478,12 @@ textarea:focus-visible {
         <button id="clearBatchFilter" class="action-button" title="Show all batches">All batches</button>
       </div>
       <div id="batchSummary" class="summary batch-summary"></div>
+      <div class="entry-date-jump" role="search" aria-label="Open entries by date range">
+        <input id="entryDateJump" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}-\\d{2}" maxlength="10" placeholder="yyyy-mm-dd" aria-label="Entry date yyyy-mm-dd">
+        <input id="entryDateJumpEnd" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}-\\d{2}" maxlength="10" placeholder="yyyy-mm-dd" aria-label="End entry date yyyy-mm-dd">
+        <button id="entryDateJumpButton" class="action-button" type="button" title="Open matching Project365 entry dates">Go</button>
+      </div>
+      <div id="entryDateJumpStatus" class="summary"></div>
       <div class="selection-actions">
         <button id="selectVisible" class="action-button">Check shown entries</button>
         <button id="clearSelection" class="action-button">Uncheck entries</button>
@@ -5528,11 +6567,14 @@ textarea:focus-visible {
           </div>
         </div>
         <div class="photo-drop-row">
-          <div id="photoDropTarget" class="photo-drop-target" aria-label="Drop an original photo for the current entry">
-            <strong>Drop original photo here</strong>
-            <span id="photoDropTargetHint">Copies into Source Data for the selected date</span>
+          <div id="photoDropTarget" class="photo-drop-target" aria-label="Drop a photo or video for the current entry">
+            <strong>Drop photo/video here</strong>
+            <span id="photoDropTargetHint">Copies stills into Source Data, or opens movie screenshots</span>
           </div>
-          <div id="photoLinkDropTarget" class="photo-link-drag-lane" aria-label="Link an original photo for the current entry">Drag here to link instead</div>
+          <div id="photoLinkDropTarget" class="photo-link-drag-lane" aria-label="Link an original photo for the current entry">
+            <span>Linked photo</span>
+            <button id="chooseLinkedPhoto" class="action-button" type="button">Open drop window</button>
+          </div>
         </div>
         <div class="source-frame">
           <img id="sourceImage" class="source-image" alt="">
@@ -5570,8 +6612,48 @@ textarea:focus-visible {
         </div>
         <div id="candidateGrid" class="candidate-grid"></div>
       </section>
-    </div>
+  </div>
   </main>
+</div>
+<div id="videoFrameModal" class="video-frame-modal" aria-hidden="true">
+  <div class="video-frame-dialog" role="dialog" aria-modal="true" aria-label="Choose movie screenshots">
+    <div class="video-frame-header">
+      <div class="video-frame-title">
+        <strong>Choose movie screenshots</strong>
+        <span id="videoFrameSubtitle"></span>
+      </div>
+      <button class="icon-button" type="button" onclick="closeVideoFrameChooser()" aria-label="Close screenshot chooser">×</button>
+    </div>
+    <div id="videoFrameHelp" class="video-frame-help">Pick one main image, and any supplemental attachments. Click a screenshot to inspect it larger.</div>
+    <div class="video-frame-scrubber">
+      <video id="videoFramePlayer" class="video-frame-player" controls preload="metadata"></video>
+      <div class="video-frame-custom">
+        <label>
+          Scrub movie
+          <input id="videoFrameSlider" type="range" min="0" max="0" step="0.05" value="0" oninput="scrubVideoFrameSlider()">
+        </label>
+        <div class="video-frame-capture-row">
+          <span id="videoFrameSliderLabel" class="video-frame-time">0:00</span>
+          <button id="videoFrameAddCustom" class="action-button primary" type="button" onclick="captureCurrentVideoFrame()" title="Capture the current frame. Shortcut: Enter">Capture frame</button>
+        </div>
+        <div class="video-frame-step-controls" aria-label="Micro-adjust video time">
+          <button class="action-button" type="button" onclick="stepVideoFrameTime(-1)">-1s</button>
+          <button class="action-button" type="button" onclick="stepVideoFrameTime(-0.1)">-0.1s</button>
+          <button id="videoFramePlayPause" class="action-button" type="button" onclick="toggleVideoFramePlayback()" title="Play/pause movie. Shortcut: Space">Play</button>
+          <button class="action-button" type="button" onclick="stepVideoFrameTime(0.1)">+0.1s</button>
+          <button class="action-button" type="button" onclick="stepVideoFrameTime(1)">+1s</button>
+        </div>
+      </div>
+    </div>
+    <div id="videoFrameGrid" class="video-frame-grid"></div>
+    <div class="video-frame-actions">
+      <label><input id="videoFrameNoMain" type="radio" name="videoFrameMain" value="" checked> No main image</label>
+      <div>
+        <button class="action-button" type="button" onclick="closeVideoFrameChooser()">Cancel</button>
+        <button id="videoFrameSave" class="action-button primary" type="button" onclick="saveVideoFrameChoices()">Save screenshots</button>
+      </div>
+    </div>
+  </div>
 </div>
 <div id="imagePreviewModal" class="image-preview-modal" onclick="handleImagePreviewBackdrop(event)" aria-hidden="true">
   <div class="image-preview-dialog" role="dialog" aria-modal="true" aria-label="Large image preview">
@@ -5611,6 +6693,8 @@ const state = {
   activePhotoIndexFolder: "",
   defaultPhotoIndexFolder: "",
   activeCandidateTimeFilters: new Set(),
+  videoFrameReview: null,
+  videoFramePendingToken: "",
   filenameDateScopeEntryId: "",
   filenameDateScopeDays: 0,
   filenameDateScopeStart: "",
@@ -5749,16 +6833,33 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
   state.entryOffset = 0;
   state.entryHasMore = false;
   const filter = document.getElementById("filter").value;
-  const params = new URLSearchParams();
-  params.set("status", filter);
-  params.set("limit", String(state.entryLimit));
-  params.set("offset", "0");
-  for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
-  for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
-  const payload = await fetchJson(`/api/entries?${params.toString()}`);
-  state.entries = payload.entries.filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id));
+  const explicitScope = explicitEntryScopeActive();
+  const entries = [];
+  const seenEntryIds = new Set();
+  let payload = {entries: [], has_more: false};
+  let offset = 0;
+  do {
+    const params = new URLSearchParams();
+    params.set("status", filter);
+    params.set("limit", String(state.entryLimit));
+    params.set("offset", String(offset));
+    for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
+    for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
+    payload = await fetchJson(`/api/entries?${params.toString()}`);
+    const pageEntries = (payload.entries || []).filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id));
+    for (const entry of pageEntries) {
+      if (seenEntryIds.has(entry.entry_id)) continue;
+      seenEntryIds.add(entry.entry_id);
+      entries.push(entry);
+    }
+    offset += (payload.entries || []).length || state.entryLimit;
+  } while (explicitScope && payload.has_more);
+  if (explicitScope) {
+    entries.sort((left, right) => String(left.entry_date || "").localeCompare(String(right.entry_date || "")) || String(left.entry_id || "").localeCompare(String(right.entry_id || "")));
+  }
+  state.entries = entries;
   state.entryOffset = state.entries.length;
-  state.entryHasMore = Boolean(payload.has_more);
+  state.entryHasMore = explicitScope ? false : Boolean(payload.has_more);
   renderEntries();
   renderEntryPaging();
   renderBatchSummary();
@@ -5784,6 +6885,74 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
     state.selectedEntryId = state.entries[0].entry_id;
   }
   await loadEntry(state.selectedEntryId);
+}
+
+function replaceEntryDateScopeUrl(dateTexts, status = "all") {
+  const params = new URLSearchParams(window.location.search);
+  params.delete("entry_id");
+  params.delete("entry_date");
+  params.delete("batch");
+  params.set("status", status);
+  for (const dateText of dateTexts) params.append("entry_date", dateText);
+  window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+}
+
+function syncEntryDateJumpControl(message = "") {
+  const startInput = document.getElementById("entryDateJump");
+  const endInput = document.getElementById("entryDateJumpEnd");
+  const status = document.getElementById("entryDateJumpStatus");
+  if (startInput) startInput.value = state.urlEntryDates[0] || "";
+  if (endInput) endInput.value = state.urlEntryDates.length > 1 ? state.urlEntryDates[state.urlEntryDates.length - 1] : "";
+  if (status) status.textContent = message;
+}
+
+function entryDateScopeLabel(dateTexts) {
+  if (!dateTexts.length) return "";
+  const startDate = dateTexts[0];
+  const endDate = dateTexts[dateTexts.length - 1];
+  return startDate === endDate ? startDate : `${startDate} to ${endDate}`;
+}
+
+function isValidEntryDateText(dateText) {
+  const match = String(dateText || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.toISOString().slice(0, 10) === dateText;
+}
+
+async function jumpToEntryDate() {
+  const startInput = document.getElementById("entryDateJump");
+  const endInput = document.getElementById("entryDateJumpEnd");
+  const targetStatus = document.getElementById("entryDateJumpStatus");
+  const startDate = String(startInput?.value || "").trim();
+  const endDate = String(endInput?.value || "").trim() || startDate;
+  if (!isValidEntryDateText(startDate) || !isValidEntryDateText(endDate)) {
+    targetStatus.textContent = "Enter dates as yyyy-mm-dd.";
+    return;
+  }
+  if (endDate < startDate) {
+    targetStatus.textContent = "End date must be on or after start date.";
+    return;
+  }
+  const dateTexts = dateRangeValues(startDate, endDate);
+  if (!dateTexts.length || dateTexts[dateTexts.length - 1] !== endDate) {
+    targetStatus.textContent = "Use a date range of 367 days or less.";
+    return;
+  }
+  document.getElementById("filter").value = "all";
+  document.getElementById("batchFilter").value = "";
+  state.urlEntryIds = [];
+  state.urlEntryDates = dateTexts;
+  state.batchEntryIds = [];
+  state.batchEntryDates = [];
+  state.selectedEntryIds.clear();
+  state.lastCheckedIndex = null;
+  state.initialBatchId = "";
+  replaceEntryDateScopeUrl(dateTexts);
+  const label = entryDateScopeLabel(dateTexts);
+  syncEntryDateJumpControl(`Opening ${label}.`);
+  await loadEntries("", false, startDate);
+  syncEntryDateJumpControl(state.entries.length ? `Showing ${state.entries.length} entries for ${label}.` : `No entries found for ${label}.`);
 }
 
 async function loadMoreEntries() {
@@ -5832,7 +7001,7 @@ function renderEntries() {
 	    const thumb = entry.source_token
 	      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
 	      : `<div class="entry-thumb"></div>`;
-	    const hasPendingLink = Number(entry.selected_count || 0) > 0;
+	    const hasPendingLink = entryHasPendingCommit(entry);
 	    const people = peopleScript(entry.people_names);
 	    item.innerHTML = `
 	      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
@@ -5870,9 +7039,25 @@ function renderEntries() {
 	  return [...document.querySelectorAll(".entry-item")].find(item => item.dataset.entryId === String(entryId)) || null;
 	}
 
-	function setEntryCommitButtonState(button, selectedCount) {
+	function entryPendingCommitCount(entryOrCount) {
+	  if (typeof entryOrCount === "number") return Number(entryOrCount || 0);
+	  if (!entryOrCount) return 0;
+	  if (Object.prototype.hasOwnProperty.call(entryOrCount, "pending_commit_count")) {
+	    return Number(entryOrCount.pending_commit_count || 0);
+	  }
+	  if (Object.prototype.hasOwnProperty.call(entryOrCount, "commit_ready")) {
+	    return entryOrCount.commit_ready ? 1 : 0;
+	  }
+	  return Number(entryOrCount.selected_count || 0);
+	}
+
+	function entryHasPendingCommit(entryOrCount) {
+	  return entryPendingCommitCount(entryOrCount) > 0;
+	}
+
+	function setEntryCommitButtonState(button, entryOrCount) {
 	  if (!button) return;
-	  const hasPendingLink = Number(selectedCount || 0) > 0;
+	  const hasPendingLink = entryHasPendingCommit(entryOrCount);
 	  button.disabled = !hasPendingLink;
 	  button.setAttribute("aria-hidden", hasPendingLink ? "false" : "true");
 	  button.tabIndex = hasPendingLink ? 0 : -1;
@@ -5891,7 +7076,7 @@ function renderEntries() {
 	  }
 	  const summary = item.querySelector(".summary");
 	  if (summary) summary.textContent = `${entry.candidate_count} candidates`;
-	  setEntryCommitButtonState(item.querySelector('[data-action="commit-entry"]'), entry.selected_count);
+	  setEntryCommitButtonState(item.querySelector('[data-action="commit-entry"]'), entry);
 	}
 
 function renderEntryPaging() {
@@ -5944,6 +7129,11 @@ function syncEntrySummaryFromDetail(detail) {
   const candidates = Array.isArray(detail?.candidates) ? detail.candidates : [];
   entrySummary.candidate_count = candidateScopeCandidates(candidates).length;
   entrySummary.status = detail.status;
+  entrySummary.selected_count = detail.selected_count;
+  entrySummary.pending_commit_count = detail.pending_commit_count;
+  entrySummary.commit_ready = detail.commit_ready;
+  entrySummary.accepted_count = detail.accepted_count;
+  entrySummary.associated_count = detail.associated_count;
 }
 
 function scheduleCandidateScrollReset() {
@@ -5985,16 +7175,19 @@ function restorePickerScroll(snapshot) {
 }
 
 async function fetchEntryDetail(entryId, forceRefresh = false) {
-  if (!forceRefresh && state.entryDetailCache.has(entryId)) return state.entryDetailCache.get(entryId);
-  if (state.entryDetailRequests.has(entryId)) return state.entryDetailRequests.get(entryId);
-  const request = fetchJson(`/api/entry/${encodeURIComponent(entryId)}`);
-  state.entryDetailRequests.set(entryId, request);
+  const includeDatabase = Boolean(state.urlEntryIds.length || state.urlEntryDates.length);
+  const cacheKey = includeDatabase ? `${entryId}::database` : entryId;
+  if (!forceRefresh && state.entryDetailCache.has(cacheKey)) return state.entryDetailCache.get(cacheKey);
+  if (state.entryDetailRequests.has(cacheKey)) return state.entryDetailRequests.get(cacheKey);
+  const query = includeDatabase ? "?include_database=1" : "";
+  const request = fetchJson(`/api/entry/${encodeURIComponent(entryId)}${query}`);
+  state.entryDetailRequests.set(cacheKey, request);
   try {
     const detail = await request;
-    state.entryDetailCache.set(entryId, detail);
+    state.entryDetailCache.set(cacheKey, detail);
     return detail;
   } finally {
-    state.entryDetailRequests.delete(entryId);
+    state.entryDetailRequests.delete(cacheKey);
   }
 }
 
@@ -6126,6 +7319,10 @@ function renderCandidateGrid() {
     card.className = `candidate-card ${candidate.selected ? "selected" : ""} ${candidateProjectOriginalsSource(candidate) ? "project-originals-source" : ""}`;
     card.dataset.candidateToken = candidate.token;
     const candidateImageUrl = `/image/${candidate.token}?max=640`;
+    const generatedAddition = candidateIsGeneratedAddition(candidate);
+    const showFlagControl = !generatedAddition;
+    const showLinkControl = !generatedAddition || !candidate.selected;
+    const actionClass = generatedAddition && candidate.selected ? "main-only" : generatedAddition ? "compact" : "";
     card.innerHTML = `
       <button class="image-preview-trigger" type="button" onclick="openImagePreviewFromTrigger(this)" data-preview-url="${escapeHtml(candidateImageUrl)}" data-preview-title="${escapeHtml(candidate.filename || "Candidate")}" data-preview-path="${escapeHtml(candidate.path || "")}" aria-label="Open larger ${escapeHtml(candidate.filename || "candidate")} image">
         <img class="candidate-image" data-src="${escapeHtml(candidateImageUrl)}" decoding="async" alt="">
@@ -6143,10 +7340,10 @@ function renderCandidateGrid() {
         ${formatCandidateCardDetails(candidate)}
         ${formatAlignment(candidate)}
       </div>
-      <div class="candidate-actions">
-        <button class="action-button primary" data-action="select">Select</button>
-        <button class="action-button ${candidate.associated ? "flagged" : ""}" data-action="flag" title="${escapeHtml(flagButtonTitle(candidate))}">${escapeHtml(flagButtonLabel(candidate))}</button>
-        <button class="action-button ${candidateLinked(candidate) ? "linked" : ""}" data-action="link" aria-pressed="${candidateLinked(candidate) ? "true" : "false"}" title="${escapeHtml(linkButtonTitle(candidate))}" ${candidate.selected ? "disabled" : ""}>${escapeHtml(linkButtonLabel(candidate))}</button>
+      <div class="candidate-actions ${actionClass}">
+        <button class="action-button primary" data-action="select">${escapeHtml(selectButtonLabel(candidate))}</button>
+        ${showFlagControl ? `<button class="action-button ${candidate.associated ? "flagged" : ""}" data-action="flag" title="${escapeHtml(flagButtonTitle(candidate))}">${escapeHtml(flagButtonLabel(candidate))}</button>` : ""}
+        ${showLinkControl ? `<button class="action-button ${candidateLinked(candidate) ? "linked" : ""}" data-action="link" aria-pressed="${candidateLinked(candidate) ? "true" : "false"}" title="${escapeHtml(linkButtonTitle(candidate))}" ${candidate.selected ? "disabled" : ""}>${escapeHtml(linkButtonLabel(candidate))}</button>` : ""}
         <div class="associated-date-panel" data-associated-panel hidden>
           <div class="associated-date-choices" data-associated-choices></div>
           <input type="date" data-associated-date aria-label="Associated date">
@@ -6156,8 +7353,8 @@ function renderCandidateGrid() {
       </div>
     `;
     card.querySelector('[data-action="select"]').onclick = () => saveDecision(candidate, "use_external_original", card);
-    card.querySelector('[data-action="link"]').onclick = () => linkAssociatedPhoto(candidate, card);
-    card.querySelector('[data-action="flag"]').onclick = () => showAssociatedDatePanel(candidate, card);
+    card.querySelector('[data-action="link"]')?.addEventListener("click", () => linkAssociatedPhoto(candidate, card));
+    card.querySelector('[data-action="flag"]')?.addEventListener("click", () => showAssociatedDatePanel(candidate, card));
     card.querySelector('[data-action="save-flag"]').onclick = () => saveAssociatedPhotoFlag(candidate, card);
     card.querySelector('[data-associated-date]').oninput = () => clearAssociatedDateChoiceSelection(card);
     card.querySelector('[data-associated-time]').oninput = () => clearAssociatedDateChoiceSelection(card);
@@ -6176,15 +7373,26 @@ function renderCandidateGrid() {
   });
 }
 
+function selectButtonLabel(candidate) {
+  return candidate.selected ? "Main" : "Select";
+}
+
+function applySelectButtonState(card, candidate) {
+  const button = card?.querySelector('[data-action="select"]');
+  if (!button) return;
+  button.textContent = selectButtonLabel(candidate);
+  button.title = candidate.selected ? "This is the main image selected for this diary entry" : "";
+}
+
 function flagButtonLabel(candidate) {
-  return candidate.associated ? "Flagged" : "Flag";
+  return candidate.associated ? "Date" : "Date";
 }
 
 function flagButtonTitle(candidate) {
-  if (!candidate.associated) return "Flag as an associated photo";
+  if (!candidate.associated) return "Set a custom date and link this as a supplemental attachment";
   const date = candidate.associated_entry_date || "saved date";
   const source = associatedDateSourceLabel(candidate.associated_date_source || "manual");
-  return `Associated photo flag saved for ${date} from ${source}. Click to change the date.`;
+  return `Supplemental attachment saved for ${date} from ${source}. Click to change the date/time.`;
 }
 
 function applyFlagButtonState(button, candidate) {
@@ -6198,15 +7406,21 @@ function candidateLinked(candidate) {
   return Boolean(candidate.selected || candidate.associated);
 }
 
+function candidateIsGeneratedAddition(candidate) {
+  const evidence = String(candidate.evidence || "");
+  const filename = String(candidate.filename || candidate.path || "");
+  return /manual_drop_copy/i.test(evidence) || /Project365 project file addition/i.test(filename);
+}
+
 function linkButtonLabel(candidate) {
-  if (candidate.selected) return "Selected";
+  if (candidate.selected) return "Main";
   return candidate.associated ? "Linked" : "Link";
 }
 
 function linkButtonTitle(candidate) {
-  if (candidate.selected) return "Primary original selected for this target";
-  if (candidate.associated) return "Additional attachment linked for this target. Click to unlink it.";
-  return "Link as an additional attachment for this target";
+  if (candidate.selected) return "This is the main image selected for this diary entry";
+  if (candidate.associated) return "This is linked as a supplemental attachment. Click to unlink it.";
+  return "Link this as a supplemental attachment for this diary entry";
 }
 
 function applyLinkButtonState(card, candidate) {
@@ -7114,6 +8328,8 @@ async function saveDecision(candidate, decision, card, options = {}) {
       entrySummary.status = updatedEntry.status;
       entrySummary.candidate_count = updatedEntry.candidate_count;
       entrySummary.selected_count = updatedEntry.selected_count;
+      entrySummary.pending_commit_count = updatedEntry.pending_commit_count;
+      entrySummary.commit_ready = updatedEntry.commit_ready;
       entrySummary.accepted_count = updatedEntry.accepted_count;
       entrySummary.associated_count = updatedEntry.associated_count;
       entrySummary.rejected_count = updatedEntry.rejected_count;
@@ -7182,6 +8398,8 @@ async function saveDecision(candidate, decision, card, options = {}) {
       state.currentEntry.candidate_total = updatedEntry.candidate_count;
       state.currentEntry.status = updatedEntry.status;
       state.currentEntry.selected_count = updatedEntry.selected_count;
+      state.currentEntry.pending_commit_count = updatedEntry.pending_commit_count;
+      state.currentEntry.commit_ready = updatedEntry.commit_ready;
       state.currentEntry.accepted_count = updatedEntry.accepted_count;
       state.currentEntry.associated_count = updatedEntry.associated_count;
       state.currentEntry.rejected_count = updatedEntry.rejected_count;
@@ -7193,6 +8411,7 @@ async function saveDecision(candidate, decision, card, options = {}) {
           const itemCard = item.path === candidate.path
             ? card
             : [...document.querySelectorAll(".candidate-card")].find(candidateCard => candidateCard.dataset.candidateToken === item.token);
+          applySelectButtonState(itemCard, item);
           applyLinkButtonState(itemCard, item);
           applyFlagButtonState(itemCard?.querySelector('[data-action="flag"]'), item);
         }
@@ -7419,10 +8638,14 @@ async function saveDecisionWithExtra(candidate, decision, card, extra) {
     if (entrySummary) {
       entrySummary.status = updatedEntry.status;
       entrySummary.candidate_count = updatedEntry.candidate_count;
+      entrySummary.pending_commit_count = updatedEntry.pending_commit_count;
+      entrySummary.commit_ready = updatedEntry.commit_ready;
     }
     state.currentEntry.status = updatedEntry.status;
     state.currentEntry.candidate_count = updatedEntry.candidate_count;
     state.currentEntry.candidate_total = updatedEntry.candidate_count;
+    state.currentEntry.pending_commit_count = updatedEntry.pending_commit_count;
+    state.currentEntry.commit_ready = updatedEntry.commit_ready;
     state.entryDetailCache.set(currentEntryId, state.currentEntry);
     buttons.forEach(button => { button.disabled = false; });
     applyFlagButtonState(card.querySelector('[data-action="flag"]'), candidate);
@@ -7452,6 +8675,8 @@ function navigableEntrySummary(entry) {
     status: entry.status || "needs_review",
     candidate_count: Number(entry.candidate_count || entry.candidate_total || 0),
     selected_count: Number(entry.selected_count || entry.accepted_count || 0),
+    pending_commit_count: entryPendingCommitCount(entry),
+    commit_ready: entryHasPendingCommit(entry),
     accepted_count: Number(entry.accepted_count || entry.selected_count || 0),
     associated_count: Number(entry.associated_count || 0),
     rejected_count: Number(entry.rejected_count || 0),
@@ -7557,6 +8782,50 @@ function handlePickerKeyboardShortcut(event) {
     event.preventDefault();
     return;
   }
+  const videoFrameModal = document.getElementById("videoFrameModal");
+  const videoFrameOpen = videoFrameModal?.classList.contains("is-open");
+  if (
+    (event.key === " " || event.code === "Space")
+    && videoFrameOpen
+    && !previewModal?.classList.contains("is-open")
+    && !event.repeat
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.altKey
+  ) {
+    toggleVideoFramePlayback();
+    event.preventDefault();
+    return;
+  }
+  if (
+    videoFrameOpen
+    && !previewModal?.classList.contains("is-open")
+    && (event.key === "ArrowLeft" || event.key === "ArrowRight")
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.altKey
+  ) {
+    const direction = event.key === "ArrowLeft" ? -1 : 1;
+    stepVideoFrameTime(direction * (event.shiftKey ? 1 : 0.1));
+    event.preventDefault();
+    return;
+  }
+  if (
+    event.key === "Enter"
+    && videoFrameOpen
+    && !previewModal?.classList.contains("is-open")
+    && !event.repeat
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.altKey
+  ) {
+    const captureButton = document.getElementById("videoFrameAddCustom");
+    if (captureButton && !captureButton.disabled) {
+      captureCurrentVideoFrame();
+      event.preventDefault();
+      return;
+    }
+  }
   if (event.repeat || event.metaKey || event.ctrlKey || event.altKey || isPickerShortcutEditableTarget(event.target)) return;
   let handled = false;
   if (event.key === "ArrowLeft") {
@@ -7600,8 +8869,18 @@ async function commitEntryDecision(entryId, button = null) {
       headers: {"content-type": "application/json"},
       body: JSON.stringify({entry_id: entryId})
     });
+    const skipped = Number(result.skipped_unknown_media_count || 0);
+    const skippedText = skipped
+      ? ` Skipped ${skipped} decision${skipped === 1 ? "" : "s"} because this target is not in the database.`
+      : "";
     document.getElementById("crawlStatus").textContent =
-      `Committed ${result.selected_count || 0} linked original. ${result.remaining_entries || 0} entries remain.`;
+      `Committed ${result.selected_count || 0} linked original.${skippedText} ${result.remaining_entries || 0} entries remain.`;
+    if (!Number(result.applied_count || 0)) {
+      await loadSummary();
+      await loadBatches();
+      await loadEntries(state.selectedEntryId || entryId, true, committedEntryDate);
+      return;
+    }
     state.suppressedCommittedEntryIds.add(entryId);
     state.selectedEntryIds.delete(entryId);
     state.entries = state.entries.filter(entry => entry.entry_id !== entryId);
@@ -7631,8 +8910,12 @@ async function applyDecisions() {
       headers: {"content-type": "application/json"},
       body: JSON.stringify({confirm_apply_decisions: "apply-reviewed-decisions"})
     });
+    const skipped = Number(result.skipped_unknown_media_count || 0);
+    const skippedText = skipped
+      ? ` Skipped ${skipped} decision${skipped === 1 ? "" : "s"} for test/missing target entries that are not in the database.`
+      : "";
     document.getElementById("crawlStatus").textContent =
-      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.associated_count || 0} flagged, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback. ${result.remaining_entries || 0} entries remain.`;
+      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.associated_count || 0} linked, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback.${skippedText} ${result.remaining_entries || 0} entries remain.`;
     await loadSummary();
     await loadBatches();
     state.entryDetailCache.clear();
@@ -7813,6 +9096,8 @@ async function rejectAllCandidates() {
       entrySummary.status = updatedEntry.status;
       entrySummary.candidate_count = updatedEntry.candidate_count;
       entrySummary.selected_count = updatedEntry.selected_count;
+      entrySummary.pending_commit_count = updatedEntry.pending_commit_count;
+      entrySummary.commit_ready = updatedEntry.commit_ready;
     }
     state.currentEntry = updatedEntry;
     state.entryDetailCache.delete(currentEntryId);
@@ -7858,6 +9143,7 @@ document.querySelectorAll("[data-time-filter]").forEach(button => {
 });
 document.getElementById("chooseFolder").onclick = chooseFolder;
 document.getElementById("choosePhoto").onclick = choosePhoto;
+document.getElementById("chooseLinkedPhoto").onclick = chooseLinkedPhoto;
 document.getElementById("searchPanelToggle").onclick = () => {
   const button = document.getElementById("searchPanelToggle");
   setSearchPanelExpanded(button.getAttribute("aria-expanded") !== "true");
@@ -7867,6 +9153,20 @@ document.getElementById("crawlSelected").onclick = () => startCrawl("selected");
 document.getElementById("crawlVisible").onclick = () => startCrawl("visible");
 document.getElementById("selectVisible").onclick = selectVisibleEntries;
 document.getElementById("clearSelection").onclick = clearSelectedEntries;
+document.getElementById("entryDateJumpButton").onclick = () => {
+  jumpToEntryDate().catch(error => {
+    document.getElementById("entryDateJumpStatus").textContent = error.message;
+  });
+};
+for (const inputId of ["entryDateJump", "entryDateJumpEnd"]) {
+  document.getElementById(inputId).onkeydown = event => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    jumpToEntryDate().catch(error => {
+      document.getElementById("entryDateJumpStatus").textContent = error.message;
+    });
+  };
+}
 document.getElementById("previousEntryButton").onclick = () => selectAdjacentEntry(-1);
 document.getElementById("nextEntryButton").onclick = () => selectAdjacentEntry(1);
 document.getElementById("applyDecisionsButton").onclick = applyDecisions;
@@ -7974,6 +9274,10 @@ function activeEntryDates() {
   return [...state.urlEntryDates, ...state.batchEntryDates];
 }
 
+function explicitEntryScopeActive() {
+  return Boolean(state.urlEntryIds.length || state.urlEntryDates.length);
+}
+
 function changeBatchFilter() {
   syncBatchFilterState();
   state.selectedEntryIds.clear();
@@ -8016,12 +9320,8 @@ function clearBatchFilter() {
 function clearUrlEntryScope(status = "needs_action") {
   state.urlEntryIds = [];
   state.urlEntryDates = [];
-  const params = new URLSearchParams(window.location.search);
-  params.delete("entry_id");
-  params.delete("entry_date");
-  params.delete("batch");
-  params.set("status", status);
-  window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+  replaceEntryDateScopeUrl([], status);
+  syncEntryDateJumpControl();
 }
 
 function setActivePhotoIndexFolder(folder) {
@@ -8076,6 +9376,12 @@ async function chooseFolder() {
       document.getElementById("crawlStatus").textContent = "Folder selection canceled.";
     }
   } catch (error) {
+    if (isVideoDrop) {
+      state.videoFramePendingToken = "";
+      document.getElementById("videoFrameHelp").textContent = error.message;
+      document.getElementById("videoFrameGrid").innerHTML =
+        `<div class="video-frame-processing">${escapeHtml(error.message)}</div>`;
+    }
     document.getElementById("crawlStatus").textContent = error.message;
   }
 }
@@ -8088,6 +9394,49 @@ async function choosePhoto() {
   try {
     const payload = await fetchJson("/api/choose-photo");
     if (payload.path) await linkCandidatePath(payload.path);
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+  }
+}
+
+function chooseLinkedPhoto() {
+  if (!state.currentEntry) {
+    document.getElementById("crawlStatus").textContent = "Open an entry before linking a photo.";
+    return;
+  }
+  const params = new URLSearchParams({
+    entry_id: state.currentEntry.entry_id,
+    entry_date: state.currentEntry.entry_date || ""
+  });
+  const basePath = window.location.pathname.startsWith("/picker")
+    ? "/picker/link-drop"
+    : "/link-drop";
+  const popup = window.open(
+    `${basePath}?${params.toString()}`,
+    "project365-linked-photo-drop",
+    "width=640,height=460"
+  );
+  if (!popup) {
+    document.getElementById("crawlStatus").textContent =
+      "Allow pop-ups for this page to open the linked-photo drop window.";
+    return;
+  }
+  popup.focus();
+  document.getElementById("crawlStatus").textContent =
+    `Opened linked-photo drop window for ${state.currentEntry.entry_date}.`;
+}
+
+async function handleLinkedDropWindowMessage(event) {
+  const message = event.data || {};
+  if (message.type !== "project365-linked-photo") return;
+  if (!message.entry_id) return;
+  if (state.currentEntry && state.currentEntry.entry_id !== message.entry_id) return;
+  state.entryDetailCache.delete(message.entry_id);
+  document.getElementById("crawlStatus").textContent =
+    message.status || "Linked photo received. Refreshing the entry.";
+  try {
+    await loadSummary();
+    await loadEntry(message.entry_id);
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
   }
@@ -8150,17 +9499,48 @@ function renderCrawlJob(job) {
 }
 
 function isFileDrag(event) {
-  return Array.from(event.dataTransfer?.types || []).includes("Files");
+  const transfer = event.dataTransfer;
+  const types = Array.from(transfer?.types || []);
+  const files = Array.from(transfer?.files || []);
+  const items = Array.from(transfer?.items || []);
+  return types.includes("Files") || files.length > 0 || items.length > 0;
+}
+
+function describePhotoDropTransfer(event) {
+  const transfer = event.dataTransfer;
+  const types = Array.from(transfer?.types || []).join(", ") || "none";
+  const items = Array.from(transfer?.items || [])
+    .map(item => `${item.kind}:${item.type || "unknown"}`)
+    .join(", ") || "none";
+  const files = Array.from(transfer?.files || [])
+    .map(file => `${file.name || "unnamed"} (${file.type || "unknown"}, ${file.size || 0} bytes)`)
+    .join(", ") || "none";
+  return `This drag exposed: types=${types}; items=${items}; files=${files}.`;
 }
 
 function isLinkDrag(event) {
-  const types = Array.from(event.dataTransfer?.types || []);
-  return types.includes("Files") || types.includes("text/uri-list") || types.includes("text/plain");
+  const transfer = event.dataTransfer;
+  if (!transfer) return false;
+  const types = Array.from(transfer.types || []);
+  const files = Array.from(transfer.files || []);
+  const items = Array.from(transfer.items || []);
+  return types.length > 0 || files.length > 0 || items.length > 0;
 }
 
 function droppedLinkPath(event) {
   const transfer = event.dataTransfer;
-  const text = transfer?.getData("text/uri-list") || transfer?.getData("text/plain") || "";
+  const text = [
+    "text/uri-list",
+    "text/plain",
+    "text/x-moz-url",
+    "URL"
+  ].map(type => {
+    try {
+      return transfer?.getData(type) || "";
+    } catch (_) {
+      return "";
+    }
+  }).find(Boolean) || "";
   const line = text.split(/\\r?\\n/).map(value => value.trim()).find(value => value && !value.startsWith("#")) || "";
   if (line.startsWith("file://")) {
     try {
@@ -8178,11 +9558,11 @@ function updatePhotoDropTarget() {
   const hint = document.getElementById("photoDropTargetHint");
   target.classList.toggle("disabled", !state.currentEntry);
   hint.textContent = state.currentEntry
-    ? `Copies into Source Data for ${state.currentEntry.entry_date}`
+    ? `Copies stills for ${state.currentEntry.entry_date}, or opens movie screenshots`
     : "Open an entry before dropping a photo";
 }
 
-async function linkCandidatePath(candidatePath) {
+async function linkCandidatePath(candidatePath, associate = false) {
   const entry = state.currentEntry;
   if (!entry) return;
   document.getElementById("crawlStatus").textContent =
@@ -8190,22 +9570,429 @@ async function linkCandidatePath(candidatePath) {
   const detail = await fetchJson("/api/link-candidate", {
     method: "POST",
     headers: {"content-type": "application/json"},
-    body: JSON.stringify({entry_id: entry.entry_id, candidate_path: candidatePath})
+    body: JSON.stringify({entry_id: entry.entry_id, candidate_path: candidatePath, associate})
   });
   state.currentEntry = detail;
   const entrySummary = state.entries.find(item => item.entry_id === detail.entry_id);
   if (entrySummary) {
     entrySummary.candidate_count = detail.candidate_count;
     entrySummary.status = detail.status;
+    entrySummary.associated_count = detail.associated_count;
+    entrySummary.pending_commit_count = detail.pending_commit_count;
+    entrySummary.commit_ready = detail.commit_ready;
   }
   renderEntries();
   renderEntryDetail();
   document.getElementById("crawlStatus").textContent =
-    `Original photo linked for ${entry.entry_date}. Review it, then select it.`;
+    associate
+      ? `Original photo linked as an associated attachment for ${entry.entry_date}.`
+      : `Original photo linked for ${entry.entry_date}. Review it, then select it.`;
+  scheduleSummaryRefresh();
+}
+
+async function importLinkedFile(file, entry) {
+  document.getElementById("crawlStatus").textContent =
+    `Copying dropped photo as an associated attachment for ${entry.entry_date}.`;
+  const detail = await fetchJson("/api/import-linked-candidate", {
+    method: "POST",
+    headers: {
+      "content-type": file.type || "application/octet-stream",
+      "x-entry-id": encodeURIComponent(entry.entry_id),
+      "x-file-name": encodeURIComponent(file.name)
+    },
+    body: file
+  });
+  state.entryDetailCache.delete(entry.entry_id);
+  state.currentEntry = detail;
+  const entrySummary = state.entries.find(item => item.entry_id === detail.entry_id);
+  if (entrySummary) {
+    entrySummary.candidate_count = detail.candidate_count;
+    entrySummary.status = detail.status;
+    entrySummary.associated_count = detail.associated_count;
+    entrySummary.pending_commit_count = detail.pending_commit_count;
+    entrySummary.commit_ready = detail.commit_ready;
+  }
+  renderEntries();
+  renderEntryDetail();
+  document.getElementById("crawlStatus").textContent =
+    `Dropped photo linked as an associated attachment for ${entry.entry_date}.`;
+  scheduleSummaryRefresh();
+}
+
+function showVideoFrameChooser(payload, entry) {
+  const frames = Array.isArray(payload.frames) ? payload.frames : [];
+  if (!frames.length) {
+    document.getElementById("crawlStatus").textContent = "No screenshots were extracted from that movie.";
+    return;
+  }
+  state.videoFramePendingToken = "";
+  state.videoFrameReview = {
+    payload,
+    entry,
+    currentEntryId: entry.entry_id,
+    nextEntryId: nextEntryIdAfterCurrent()
+  };
+  const modal = document.getElementById("videoFrameModal");
+  const grid = document.getElementById("videoFrameGrid");
+  const player = document.getElementById("videoFramePlayer");
+  document.getElementById("videoFrameSubtitle").textContent =
+    `${payload.filename || "Dropped movie"} · ${videoFrameShotDateLabel(entry.entry_date, payload.capture_timestamp)}`;
+  document.getElementById("videoFrameHelp").textContent =
+    "Pick one main image, and any supplemental attachments. Click a screenshot to inspect it larger.";
+  document.getElementById("videoFrameNoMain").checked = true;
+  const duration = Math.max(0, Number(payload.duration_seconds || 0));
+  const slider = document.getElementById("videoFrameSlider");
+  const addButton = document.getElementById("videoFrameAddCustom");
+  const saveButton = document.getElementById("videoFrameSave");
+  const fallbackMax = Math.max(0, ...frames.map(frame => Number(frame.time_seconds || 0)));
+  slider.max = String(duration || fallbackMax || 0);
+  slider.value = "0";
+  slider.disabled = Number(slider.max || 0) <= 0;
+  addButton.disabled = slider.disabled;
+  saveButton.disabled = false;
+  player.src = payload.video_token ? `/image/${encodeURIComponent(payload.video_token)}` : "";
+  player.onloadedmetadata = syncVideoFrameDurationFromPlayer;
+  player.ontimeupdate = syncVideoFrameSliderToPlayer;
+  player.onplay = updateVideoFramePlayPauseButton;
+  player.onpause = updateVideoFramePlayPauseButton;
+  player.onended = updateVideoFramePlayPauseButton;
+  if (player.src && !slider.disabled) player.currentTime = Number(slider.value || 0);
+  updateVideoFrameSliderLabel();
+  updateVideoFramePlayPauseButton();
+  reviewSortVideoFrames(state.videoFrameReview);
+  renderVideoFrameGrid();
+  modal.classList.add("is-open");
+  modal.setAttribute("aria-hidden", "false");
+  document.getElementById("crawlStatus").textContent =
+    `Choose screenshots from ${payload.filename || "the dropped movie"}.`;
+}
+
+function showVideoFrameProcessing(entry, file) {
+  const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  state.videoFramePendingToken = token;
+  state.videoFrameReview = null;
+  const modal = document.getElementById("videoFrameModal");
+  const grid = document.getElementById("videoFrameGrid");
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  document.getElementById("videoFrameSubtitle").textContent =
+    `${file?.name || "Dropped movie"} · ${entry.entry_date}`;
+  document.getElementById("videoFrameHelp").textContent =
+    "Preparing movie screenshots. Large videos can take a while; this window will fill in when frames are ready.";
+  document.getElementById("videoFrameNoMain").checked = true;
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  slider.max = "0";
+  slider.value = "0";
+  slider.disabled = true;
+  updateVideoFrameSliderLabel();
+  document.getElementById("videoFrameAddCustom").disabled = true;
+  document.getElementById("videoFrameSave").disabled = true;
+  updateVideoFramePlayPauseButton();
+  grid.innerHTML = '<div class="video-frame-processing">Preparing movie screenshots…</div>';
+  modal.classList.add("is-open");
+  modal.setAttribute("aria-hidden", "false");
+  document.getElementById("crawlStatus").textContent =
+    `Preparing screenshots from ${file?.name || "the dropped movie"}.`;
+  return token;
+}
+
+function videoFrameCardHtml(frame) {
+  const imageUrl = `/image/${encodeURIComponent(frame.token)}?max=640`;
+  const fullUrl = `/image/${encodeURIComponent(frame.token)}`;
+  const customClass = frame.custom ? " custom-frame" : "";
+  const title = frame.custom ? "Captured frame" : "";
+  return `
+    <article class="video-frame-card${customClass}" data-preview-url="${escapeHtml(fullUrl)}" data-preview-title="${escapeHtml(frame.label || "")}" title="${escapeHtml(title)}">
+      <button class="image-preview-trigger" type="button" onclick="openVideoFramePreview(this)" data-preview-url="${escapeHtml(fullUrl)}" data-preview-title="${escapeHtml(frame.label || "")}" aria-label="Open larger screenshot ${escapeHtml(frame.label || "")}">
+        <img src="${escapeHtml(imageUrl)}" alt="">
+      </button>
+      <div class="video-frame-controls">
+        <strong>${escapeHtml(frame.label || "")}</strong>
+        <label><input type="radio" name="videoFrameMain" value="${escapeHtml(frame.frame_id)}"> Main</label>
+        <label><input type="checkbox" data-video-supplemental-frame="${escapeHtml(frame.frame_id)}"> Link</label>
+      </div>
+    </article>
+  `;
+}
+
+function reviewSortVideoFrames(review) {
+  if (!review?.payload) return;
+  review.payload.frames = [...(review.payload.frames || [])].sort((left, right) => {
+    const timeCompare = Number(left.time_seconds || 0) - Number(right.time_seconds || 0);
+    if (timeCompare) return timeCompare;
+    const leftCustom = left.custom || String(left.frame_id || "").startsWith("custom-") ? 1 : 0;
+    const rightCustom = right.custom || String(right.frame_id || "").startsWith("custom-") ? 1 : 0;
+    if (leftCustom !== rightCustom) return leftCustom - rightCustom;
+    return String(left.frame_id || "").localeCompare(String(right.frame_id || ""));
+  });
+}
+
+function currentVideoFrameSelection() {
+  return {
+    mainFrame: document.querySelector('input[name="videoFrameMain"]:checked')?.value || "",
+    supplementalFrames: new Set(
+      Array.from(document.querySelectorAll("[data-video-supplemental-frame]:checked"))
+        .map(input => input.dataset.videoSupplementalFrame)
+        .filter(Boolean)
+    )
+  };
+}
+
+function restoreVideoFrameSelection(selection) {
+  const mainInput = document.querySelector(`input[name="videoFrameMain"][value="${CSS.escape(selection.mainFrame || "")}"]`);
+  if (mainInput) {
+    mainInput.checked = true;
+  } else {
+    document.getElementById("videoFrameNoMain").checked = true;
+  }
+  document.querySelectorAll("[data-video-supplemental-frame]").forEach(input => {
+    input.checked = selection.supplementalFrames.has(input.dataset.videoSupplementalFrame || "");
+  });
+}
+
+function renderVideoFrameGrid(selection = currentVideoFrameSelection()) {
+  const review = state.videoFrameReview;
+  const grid = document.getElementById("videoFrameGrid");
+  reviewSortVideoFrames(review);
+  grid.innerHTML = (review?.payload?.frames || []).map(videoFrameCardHtml).join("");
+  restoreVideoFrameSelection(selection);
+}
+
+function videoFrameTimeKey(timeSeconds) {
+  const value = Number(timeSeconds || 0);
+  return Number.isFinite(value) ? value.toFixed(3) : "0.000";
+}
+
+function videoFrameShotDateLabel(entryDate, captureTimestamp) {
+  const entryDateText = String(entryDate || "").trim();
+  const timestamp = String(captureTimestamp || "").trim();
+  if (!timestamp) return entryDateText;
+  const normalized = timestamp.replace("T", " ");
+  if (entryDateText && normalized.startsWith(`${entryDateText} `)) return normalized.slice(0, 19);
+  return normalized.slice(0, 19);
+}
+
+function formatVideoFrameTime(timeSeconds) {
+  const total = Math.max(0, Math.round(Number(timeSeconds || 0)));
+  const seconds = total % 60;
+  const minutesTotal = Math.floor(total / 60);
+  const minutes = minutesTotal % 60;
+  const hours = Math.floor(minutesTotal / 60);
+  if (hours) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function updateVideoFrameSliderLabel() {
+  const slider = document.getElementById("videoFrameSlider");
+  document.getElementById("videoFrameSliderLabel").textContent = formatVideoFrameTime(slider.value);
+}
+
+function syncVideoFrameDurationFromPlayer() {
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  const duration = Number.isFinite(player.duration) ? Math.max(0, player.duration) : 0;
+  if (duration > 0 && (!Number(slider.max) || Number(slider.max) < duration)) {
+    slider.max = String(duration);
+    slider.disabled = false;
+    document.getElementById("videoFrameAddCustom").disabled = false;
+  }
+  syncVideoFrameSliderToPlayer();
+}
+
+function syncVideoFrameSliderToPlayer() {
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  if (!slider.matches(":active") && Number.isFinite(player.currentTime)) {
+    slider.value = String(Math.min(Number(slider.max || player.currentTime), player.currentTime));
+  }
+  updateVideoFrameSliderLabel();
+}
+
+function updateVideoFramePlayPauseButton() {
+  const player = document.getElementById("videoFramePlayer");
+  const button = document.getElementById("videoFramePlayPause");
+  if (!player || !button) return;
+  const canPlay = Boolean(player.src);
+  button.disabled = !canPlay;
+  button.textContent = player.paused || player.ended ? "Play" : "Pause";
+  button.setAttribute("aria-pressed", player.paused || player.ended ? "false" : "true");
+}
+
+function toggleVideoFramePlayback() {
+  const player = document.getElementById("videoFramePlayer");
+  if (!player?.src) return;
+  if (player.paused || player.ended) {
+    player.play().catch(() => {});
+  } else {
+    player.pause();
+  }
+  updateVideoFramePlayPauseButton();
+}
+
+function scrubVideoFrameSlider() {
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  const time = Number(slider.value || 0);
+  if (player.src && Number.isFinite(time)) player.currentTime = time;
+  updateVideoFrameSliderLabel();
+}
+
+function stepVideoFrameTime(deltaSeconds) {
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  const max = Number(slider.max || 0);
+  const current = player.src && Number.isFinite(player.currentTime) ? player.currentTime : Number(slider.value || 0);
+  const next = Math.max(0, Math.min(max || current + deltaSeconds, current + deltaSeconds));
+  slider.value = String(next);
+  if (player.src) player.currentTime = next;
+  updateVideoFrameSliderLabel();
+}
+
+function captureCurrentVideoFrame() {
+  const player = document.getElementById("videoFramePlayer");
+  const slider = document.getElementById("videoFrameSlider");
+  const time = player.src && Number.isFinite(player.currentTime) ? player.currentTime : Number(slider.value || 0);
+  return addCustomVideoFrameAtTime(time);
+}
+
+function openVideoFramePreview(trigger) {
+  openImagePreview(
+    trigger.dataset.previewUrl || "",
+    trigger.dataset.previewTitle || "Movie screenshot",
+    ""
+  );
+}
+
+async function addCustomVideoFrameAtTime(timeSeconds) {
+  const review = state.videoFrameReview;
+  if (!review) return;
+  const requestedKey = videoFrameTimeKey(timeSeconds);
+  const duplicateFrame = (review.payload.frames || []).find(frame => videoFrameTimeKey(frame.time_seconds) === requestedKey);
+  if (duplicateFrame) {
+    const message = `Screenshot ${duplicateFrame.label || formatVideoFrameTime(timeSeconds)} is already in the grid. Move slightly before capturing again.`;
+    document.getElementById("videoFrameHelp").textContent = message;
+    document.getElementById("crawlStatus").textContent = message;
+    return;
+  }
+  const button = document.getElementById("videoFrameAddCustom");
+  button.disabled = true;
+  document.getElementById("crawlStatus").textContent = "Adding movie screenshot.";
+  try {
+    const payload = await fetchJson("/api/extract-video-frame", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        entry_id: review.currentEntryId,
+        session_id: review.payload.session_id,
+        time_seconds: Number(timeSeconds || 0)
+      })
+    });
+    const frame = payload.frame;
+    const selection = currentVideoFrameSelection();
+    review.payload.frames = [...(review.payload.frames || []), frame];
+    renderVideoFrameGrid(selection);
+    document.getElementById("videoFrameHelp").textContent =
+      "Pick one main image, and any supplemental attachments. Click a screenshot to inspect it larger.";
+    document.getElementById("crawlStatus").textContent = `Added screenshot at ${frame.label || formatVideoFrameTime(timeSeconds)}.`;
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+  } finally {
+    button.disabled = document.getElementById("videoFrameSlider").disabled;
+  }
+}
+
+async function discardVideoFrameSession(review) {
+  const payload = review?.payload || {};
+  if (!review?.currentEntryId || !payload.session_id) return;
+  try {
+    await fetchJson("/api/discard-video-frames", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        entry_id: review.currentEntryId,
+        session_id: payload.session_id
+      })
+    });
+  } catch (_) {
+  }
+}
+
+async function closeVideoFrameChooser() {
+  const review = state.videoFrameReview;
+  state.videoFramePendingToken = "";
+  const modal = document.getElementById("videoFrameModal");
+  modal.classList.remove("is-open");
+  modal.setAttribute("aria-hidden", "true");
+  const player = document.getElementById("videoFramePlayer");
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  state.videoFrameReview = null;
+  await discardVideoFrameSession(review);
+}
+
+async function saveVideoFrameChoices() {
+  const review = state.videoFrameReview;
+  if (!review) return;
+  const mainFrame = document.querySelector('input[name="videoFrameMain"]:checked')?.value || "";
+  const supplementalFrames = Array.from(document.querySelectorAll("[data-video-supplemental-frame]:checked"))
+    .map(input => input.dataset.videoSupplementalFrame)
+    .filter(Boolean);
+  if (!mainFrame && !supplementalFrames.length) {
+    document.getElementById("crawlStatus").textContent = "Choose at least one screenshot.";
+    return;
+  }
+  const saveButton = document.getElementById("videoFrameSave");
+  saveButton.disabled = true;
+  document.getElementById("crawlStatus").textContent = "Saving selected movie screenshots.";
+  try {
+    const detail = await fetchJson("/api/import-video-frames", {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({
+        entry_id: review.currentEntryId,
+        session_id: review.payload.session_id,
+        main_frame_id: mainFrame,
+        supplemental_frame_ids: supplementalFrames
+      })
+    });
+    await closeVideoFrameChooser();
+    state.entryDetailCache.delete(review.currentEntryId);
+    state.currentEntry = detail;
+    const entrySummary = state.entries.find(item => item.entry_id === detail.entry_id);
+    if (entrySummary) {
+      entrySummary.candidate_count = detail.candidate_count;
+      entrySummary.status = detail.status;
+      entrySummary.selected_count = detail.selected_count;
+      entrySummary.pending_commit_count = detail.pending_commit_count;
+      entrySummary.commit_ready = detail.commit_ready;
+      entrySummary.accepted_count = detail.accepted_count;
+      entrySummary.associated_count = detail.associated_count;
+      entrySummary.rejected_count = detail.rejected_count;
+      entrySummary.fallback_count = detail.fallback_count;
+    }
+    if (mainFrame) {
+      renderEntries();
+      renderEntryDetail();
+      document.getElementById("crawlStatus").textContent =
+        `Movie screenshot accepted for ${review.entry.entry_date}.`;
+    } else {
+      renderEntries();
+      renderEntryDetail();
+      document.getElementById("crawlStatus").textContent =
+        `Movie screenshots flagged as supplemental for ${review.entry.entry_date}.`;
+    }
+    scheduleSummaryRefresh();
+  } catch (error) {
+    document.getElementById("crawlStatus").textContent = error.message;
+  } finally {
+    saveButton.disabled = false;
+  }
 }
 
 async function handlePhotoDrop(event) {
-  if (!isFileDrag(event)) return;
   event.preventDefault();
   photoDropDragDepth = 0;
   event.currentTarget.classList.remove("active");
@@ -8216,14 +10003,18 @@ async function handlePhotoDrop(event) {
     return;
   }
   if (files.length !== 1) {
-    document.getElementById("crawlStatus").textContent = "Drop one image at a time.";
+    document.getElementById("crawlStatus").textContent =
+      `Safari did not expose one usable image file for this drop. ` +
+      `Try Open drop window, or export from Photos to Finder first. ${describePhotoDropTransfer(event)}`;
     return;
   }
   const file = files[0];
   const currentEntryId = entry.entry_id;
   const nextEntryId = nextEntryIdAfterCurrent();
+  const isVideoDrop = /\\.(mov|mp4|m4v)$/i.test(file.name || "");
+  const videoDropToken = isVideoDrop ? showVideoFrameProcessing(entry, file) : "";
   document.getElementById("crawlStatus").textContent =
-    `Copying dropped photo for ${entry.entry_date}.`;
+    isVideoDrop ? `Preparing screenshots from ${file.name || "the dropped movie"}.` : `Copying dropped photo for ${entry.entry_date}.`;
   try {
     const detail = await fetchJson("/api/import-dropped-candidate", {
       method: "POST",
@@ -8234,6 +10025,17 @@ async function handlePhotoDrop(event) {
       },
       body: file
     });
+    if (detail.kind === "video_frame_choices") {
+      if (state.videoFramePendingToken !== videoDropToken) {
+        await discardVideoFrameSession({
+          currentEntryId,
+          payload: {session_id: detail.session_id}
+        });
+        return;
+      }
+      showVideoFrameChooser(detail, entry);
+      return;
+    }
     state.entryDetailCache.delete(currentEntryId);
     rememberPreviousEntry(entry);
     const index = state.entries.findIndex(item => item.entry_id === currentEntryId);
@@ -8250,25 +10052,53 @@ async function handlePhotoDrop(event) {
 }
 
 async function handleLinkDrop(event) {
-  if (!isLinkDrag(event)) return;
   event.preventDefault();
   photoLinkDragDepth = 0;
-  event.currentTarget.classList.remove("active");
+  linkDropTarget.classList.remove("active");
   if (!state.currentEntry) {
     document.getElementById("crawlStatus").textContent = "Open an entry before linking a photo.";
     return;
   }
+  const entry = state.currentEntry;
+  const files = Array.from(event.dataTransfer?.files || []);
   const candidatePath = droppedLinkPath(event);
-  if (!candidatePath) {
+  if (!candidatePath && files.length !== 1) {
+    const types = Array.from(event.dataTransfer?.types || []).join(", ") || "none";
     document.getElementById("crawlStatus").textContent =
-      "Use Choose photo to link without copying, or drop on the left box to copy.";
+      `Drop one image file or a local file path. This drag exposed: ${types}.`;
     return;
   }
   try {
-    await linkCandidatePath(candidatePath);
+    if (candidatePath) await linkCandidatePath(candidatePath, true);
+    else await importLinkedFile(files[0], entry);
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
   }
+}
+
+function shouldHandleFallbackLinkDrop(event) {
+  if (!state.currentEntry) return false;
+  const target = event.target;
+  if (target?.closest?.("#photoDropTarget")) return false;
+  if (target?.closest?.("input, textarea, select, button, a")) return false;
+  return Boolean(target?.closest?.(".workspace, .main, #photoLinkDropTarget"));
+}
+
+function activateFallbackLinkDrop(event) {
+  if (!shouldHandleFallbackLinkDrop(event)) return;
+  event.preventDefault();
+  linkDropTarget.classList.add("active");
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "link";
+}
+
+function clearFallbackLinkDrop(event) {
+  if (!shouldHandleFallbackLinkDrop(event)) return;
+  linkDropTarget.classList.remove("active");
+}
+
+async function handleFallbackLinkDrop(event) {
+  if (!shouldHandleFallbackLinkDrop(event)) return;
+  await handleLinkDrop(event);
 }
 
 const dropTarget = document.getElementById("photoDropTarget");
@@ -8281,18 +10111,15 @@ document.getElementById("loadMoreEntries").onclick = () => {
   });
 };
 dropTarget.addEventListener("dragenter", event => {
-  if (!isFileDrag(event)) return;
   event.preventDefault();
   photoDropDragDepth += 1;
   dropTarget.classList.add("active");
 });
 dropTarget.addEventListener("dragover", event => {
-  if (!isFileDrag(event)) return;
   event.preventDefault();
-  event.dataTransfer.dropEffect = "copy";
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 });
 dropTarget.addEventListener("dragleave", event => {
-  if (!isFileDrag(event)) return;
   photoDropDragDepth = Math.max(0, photoDropDragDepth - 1);
   if (photoDropDragDepth === 0) dropTarget.classList.remove("active");
 });
@@ -8302,18 +10129,15 @@ dropTarget.addEventListener("dragend", () => {
 });
 dropTarget.addEventListener("drop", handlePhotoDrop);
 linkDropTarget.addEventListener("dragenter", event => {
-  if (!isLinkDrag(event)) return;
   event.preventDefault();
   photoLinkDragDepth += 1;
   linkDropTarget.classList.add("active");
 });
 linkDropTarget.addEventListener("dragover", event => {
-  if (!isLinkDrag(event)) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "link";
 });
 linkDropTarget.addEventListener("dragleave", event => {
-  if (!isLinkDrag(event)) return;
   photoLinkDragDepth = Math.max(0, photoLinkDragDepth - 1);
   if (photoLinkDragDepth === 0) linkDropTarget.classList.remove("active");
 });
@@ -8322,6 +10146,10 @@ linkDropTarget.addEventListener("dragend", () => {
   linkDropTarget.classList.remove("active");
 });
 linkDropTarget.addEventListener("drop", handleLinkDrop);
+document.addEventListener("dragover", activateFallbackLinkDrop, true);
+document.addEventListener("dragleave", clearFallbackLinkDrop, true);
+document.addEventListener("drop", handleFallbackLinkDrop, true);
+window.addEventListener("message", handleLinkedDropWindowMessage);
 document.addEventListener("keydown", handlePickerKeyboardShortcut);
 
 function escapeHtml(value) {
@@ -8346,6 +10174,8 @@ function applyUrlFilters() {
   state.urlEntryIds = params.getAll("entry_id").flatMap(splitFilterValue);
   state.urlEntryDates = params.getAll("entry_date").flatMap(splitFilterValue);
   state.initialBatchId = params.get("batch") || "";
+  const scopedDateLabel = entryDateScopeLabel(state.urlEntryDates);
+  syncEntryDateJumpControl(scopedDateLabel ? `Showing ${scopedDateLabel}.` : "");
   if (params.has("photo_index_folder")) {
     setActivePhotoIndexFolder(params.get("photo_index_folder") || "");
   }
@@ -8362,6 +10192,294 @@ applyUrlFilters();
 loadBatches().then(loadEntries).then(loadSummary).catch(error => {
   document.getElementById("summary").textContent = error.message;
 });
+</script>
+</body>
+</html>
+"""
+
+
+def link_drop_html(api_prefix: str = "/api") -> str:
+    return LINK_DROP_HTML.replace("__API_PREFIX__", api_prefix.rstrip("/"))
+
+
+LINK_DROP_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project365 linked photo drop</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f8fafc;
+  --ink: #111827;
+  --muted: #475569;
+  --line: #cbd5e1;
+  --accent: #2563eb;
+  --good: #166534;
+  --bad: #991b1b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: 18px;
+}
+main {
+  display: grid;
+  grid-template-rows: auto minmax(190px, 1fr) auto;
+  gap: 12px;
+  width: min(100%, 620px);
+  max-height: min(92vh, 460px);
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.14);
+}
+.title {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: baseline;
+}
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+.entry {
+  color: var(--muted);
+  font-size: 13px;
+}
+.drop-zone {
+  border: 2px dashed var(--line);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  min-height: 190px;
+  background: #f8fafc;
+  text-align: center;
+  padding: 20px;
+}
+.drop-zone.active {
+  border-color: var(--accent);
+  background: #eff6ff;
+}
+.drop-copy {
+  display: grid;
+  gap: 8px;
+  max-width: 480px;
+}
+.drop-copy strong {
+  font-size: 20px;
+}
+.drop-copy span {
+  color: var(--muted);
+}
+.status {
+  min-height: 44px;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+.status.good { color: var(--good); }
+.status.bad { color: var(--bad); }
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+  padding: 8px 12px;
+  font: inherit;
+}
+</style>
+</head>
+<body>
+<main>
+  <div class="title">
+    <h1>Linked photo drop</h1>
+    <div id="entryLabel" class="entry"></div>
+  </div>
+  <div id="dropZone" class="drop-zone">
+    <div class="drop-copy">
+      <strong>Drop the linked photo here</strong>
+      <span>This window links the dropped item as an associated attachment for the current Project365 entry.</span>
+    </div>
+  </div>
+  <div id="status" class="status">Waiting for a Photos drag.</div>
+  <div class="actions">
+    <button id="closeWindow" type="button">Close</button>
+  </div>
+</main>
+<script>
+const API_PREFIX = "__API_PREFIX__";
+const params = new URLSearchParams(window.location.search);
+const entryId = params.get("entry_id") || "";
+const entryDate = params.get("entry_date") || "";
+const dropZone = document.getElementById("dropZone");
+const status = document.getElementById("status");
+document.getElementById("entryLabel").textContent = entryDate || entryId || "No entry selected";
+document.getElementById("closeWindow").onclick = () => window.close();
+
+function setStatus(message, kind = "") {
+  status.textContent = message;
+  status.className = `status ${kind}`.trim();
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (_) {
+      payload = {error: text};
+    }
+  }
+  if (!response.ok) {
+    throw new Error(payload.error || payload.message || `${response.status} ${response.statusText}`);
+  }
+  return payload;
+}
+
+function transferTypes(transfer) {
+  return Array.from(transfer?.types || []);
+}
+
+function transferItems(transfer) {
+  return Array.from(transfer?.items || []).map(item => `${item.kind}:${item.type || "unknown"}`);
+}
+
+function describeTransfer(transfer) {
+  const files = Array.from(transfer?.files || []);
+  const names = files.map(file => `${file.name || "unnamed"} (${file.type || "unknown"}, ${file.size || 0} bytes)`);
+  return [
+    `Types: ${transferTypes(transfer).join(", ") || "none"}`,
+    `Items: ${transferItems(transfer).join(", ") || "none"}`,
+    `Files: ${names.join(", ") || "none"}`
+  ].join("\\n");
+}
+
+function droppedLinkPath(transfer) {
+  const text = [
+    "text/uri-list",
+    "text/plain",
+    "text/x-moz-url",
+    "URL"
+  ].map(type => {
+    try {
+      return transfer?.getData(type) || "";
+    } catch (_) {
+      return "";
+    }
+  }).find(Boolean) || "";
+  const line = text.split(/\\r?\\n/).map(value => value.trim()).find(value => value && !value.startsWith("#")) || "";
+  if (line.startsWith("file://")) {
+    try {
+      return decodeURIComponent(new URL(line).pathname);
+    } catch (_) {
+      return "";
+    }
+  }
+  if (line.startsWith("/")) return line;
+  return "";
+}
+
+function notifyParent(detail, message) {
+  if (!window.opener) return;
+  try {
+    window.opener.postMessage({
+      type: "project365-linked-photo",
+      entry_id: detail.entry_id || entryId,
+      status: message
+    }, window.location.origin);
+  } catch (_) {
+  }
+}
+
+async function importLinkedFile(file) {
+  return fetchJson(`${API_PREFIX}/import-linked-candidate`, {
+    method: "POST",
+    headers: {
+      "content-type": file.type || "application/octet-stream",
+      "x-entry-id": encodeURIComponent(entryId),
+      "x-file-name": encodeURIComponent(file.name || "linked-photo")
+    },
+    body: file
+  });
+}
+
+async function linkCandidatePath(candidatePath) {
+  return fetchJson(`${API_PREFIX}/link-candidate`, {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({
+      entry_id: entryId,
+      candidate_path: candidatePath,
+      associate: true
+    })
+  });
+}
+
+async function handleDrop(event) {
+  event.preventDefault();
+  dropZone.classList.remove("active");
+  if (!entryId) {
+    setStatus("No Project365 entry was provided to this drop window.", "bad");
+    return;
+  }
+  const transfer = event.dataTransfer;
+  const files = Array.from(transfer?.files || []);
+  const candidatePath = droppedLinkPath(transfer);
+  setStatus(`Received drop.\\n${describeTransfer(transfer)}`);
+  try {
+    let detail = null;
+    if (files.length === 1) {
+      detail = await importLinkedFile(files[0]);
+    } else if (candidatePath) {
+      detail = await linkCandidatePath(candidatePath);
+    } else {
+      setStatus(
+        `Safari did not expose a usable file or local path for this Photos drag.\\n${describeTransfer(transfer)}`,
+        "bad"
+      );
+      return;
+    }
+    const message = `Linked as associated attachment for ${detail.entry_date || entryDate || entryId}.`;
+    setStatus(message, "good");
+    notifyParent(detail, message);
+  } catch (error) {
+    setStatus(error.message, "bad");
+  }
+}
+
+function activateDrop(event) {
+  event.preventDefault();
+  dropZone.classList.add("active");
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+}
+
+function clearDrop() {
+  dropZone.classList.remove("active");
+}
+
+dropZone.addEventListener("dragenter", activateDrop);
+dropZone.addEventListener("dragover", activateDrop);
+dropZone.addEventListener("dragleave", clearDrop);
+dropZone.addEventListener("drop", handleDrop);
+document.addEventListener("dragover", activateDrop);
+document.addEventListener("drop", handleDrop);
 </script>
 </body>
 </html>

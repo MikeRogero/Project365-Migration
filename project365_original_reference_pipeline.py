@@ -60,6 +60,7 @@ class ApplySummary:
     rejected_count: int
     fallback_count: int = 0
     associated_count: int = 0
+    skipped_unknown_media_count: int = 0
 
     @property
     def applied_count(self) -> int:
@@ -852,6 +853,30 @@ def apply_reviewed_external_references(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
+        reviewed_rows = selected_rows + associated_rows + rejected_rows + fallback_rows
+        reviewed_media_ids = {
+            row.get("project365_media_asset_id", "").strip()
+            for row in reviewed_rows
+            if row.get("project365_media_asset_id", "").strip()
+        }
+        known_media_ids = _known_media_asset_ids(connection, reviewed_media_ids)
+        skipped_unknown_media_count = 0
+
+        def known_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+            nonlocal skipped_unknown_media_count
+            result = []
+            for row in rows:
+                media_id = row.get("project365_media_asset_id", "").strip()
+                if media_id not in known_media_ids:
+                    skipped_unknown_media_count += 1
+                    continue
+                result.append(row)
+            return result
+
+        selected_rows = known_rows(selected_rows)
+        associated_rows = known_rows(associated_rows)
+        rejected_rows = known_rows(rejected_rows)
+        fallback_rows = known_rows(fallback_rows)
         selected_count = 0
         for row in selected_rows:
             _upsert_external_decision(connection, row, "external_original_reference", "available", "confirmed")
@@ -876,6 +901,7 @@ def apply_reviewed_external_references(
         rejected_count=rejected_count,
         fallback_count=fallback_count,
         associated_count=associated_count,
+        skipped_unknown_media_count=skipped_unknown_media_count,
     )
 
 
@@ -893,6 +919,22 @@ def _dedupe_fallback_rows(
         deduped.append(row)
         seen.add(entry_id)
     return deduped
+
+
+def _known_media_asset_ids(connection: sqlite3.Connection, media_ids: set[str]) -> set[str]:
+    if not media_ids:
+        return set()
+    known: set[str] = set()
+    ordered_ids = sorted(media_ids)
+    for index in range(0, len(ordered_ids), 500):
+        chunk = ordered_ids[index : index + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"SELECT id FROM media_assets WHERE id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        known.update(str(row[0]) for row in rows)
+    return known
 
 
 def mark_fallback_external_references(
