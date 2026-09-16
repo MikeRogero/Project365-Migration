@@ -824,6 +824,20 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertNotIn("--date-window-days", command)
         self.assertNotIn("--candidate-scope", command)
 
+    def test_rough_visual_match_command_can_target_fallback_originals(self) -> None:
+        command = control._commands_for_step(
+            "rough_visual_match",
+            {
+                "target_scope": "fallback_originals",
+                "shortlist_size": "1000",
+                "per_band_hit_limit": "50000",
+                "max_results": "20",
+            },
+        )[0]
+
+        self.assertIn("match-no-date", command)
+        self.assertIn("--include-fallback-targets", command)
+
     def test_rough_visual_benchmark_command_reports_prefilter_recall(self) -> None:
         command = control._commands_for_step(
             "rough_visual_benchmark",
@@ -910,6 +924,19 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("--include-low-quality", command)
         self.assertIn("--dry-run", command)
 
+    def test_broad_visual_match_command_can_target_fallback_originals(self) -> None:
+        command = control._commands_for_step(
+            "broad_visual_match",
+            {
+                "target_scope": "fallback_originals",
+                "candidate_scope": "date_window_limited",
+                "date_window_days": "30",
+            },
+        )[0]
+
+        self.assertIn("match", command)
+        self.assertIn("--include-fallback-targets", command)
+
     def test_broad_visual_match_refuses_confirmed_only_accuracy_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "not an unresolved search"):
             control._commands_for_step(
@@ -972,6 +999,7 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('id="broadCandidateRoots"', control.CONTROL_HTML)
         self.assertIn('id="broadTargetScope"', control.CONTROL_HTML)
         self.assertIn('value="all_unresolved"', control.CONTROL_HTML)
+        self.assertIn('value="fallback_originals"', control.CONTROL_HTML)
         self.assertIn('value="entry_ids"', control.CONTROL_HTML)
         self.assertIn('value="date_range"', control.CONTROL_HTML)
         self.assertIn('value="broad_search_needed_list"', control.CONTROL_HTML)

@@ -32,6 +32,7 @@ REJECT_DECISIONS = {"rejected"}
 FALLBACK_DECISIONS = {"keep_project365_export", "keep_fallback", "no_external_candidate", "fallback"}
 CANDIDATE_FILTER_EXPORT_EQUIVALENT = "export_equivalent"
 HIDDEN_CANDIDATE_FILTER_REASONS = {CANDIDATE_FILTER_EXPORT_EQUIVALENT}
+ORIGINAL_PICKER_TARGET_ROLES = ("project365_export_png",)
 REJECT_ALL_RANGE_STATE_FILENAME = "original_photo_reject_all_range_state.json"
 AUTO_EXPAND_RANGE_DAYS = (0, 1, 3, 5, 15)
 AUTO_EXPAND_MAX_RANGE_DAYS = 15
@@ -996,15 +997,30 @@ def prune_applied_review_queue(
     try:
         completed_entry_ids = _completed_external_entry_ids(connection)
         rejected_candidates = _load_rejected_candidates(connection)
+        queued_media_ids = {
+            row.get("project365_media_asset_id", "").strip()
+            for row in rows
+            if row.get("project365_media_asset_id", "").strip()
+        }
+        known_media_ids = _known_media_asset_ids(connection, queued_media_ids)
     finally:
         connection.close()
 
     kept_rows: list[dict[str, object]] = []
     removed_completed_entries: set[str] = set()
+    removed_unknown_media_entries: set[str] = set()
     removed_rejected_candidates = 0
     for entry_id, entry_rows in _rows_by_entry(rows).items():
         if entry_id in completed_entry_ids:
             removed_completed_entries.add(entry_id)
+            continue
+        entry_media_ids = {
+            row.get("project365_media_asset_id", "").strip()
+            for row in entry_rows
+            if row.get("project365_media_asset_id", "").strip()
+        }
+        if entry_media_ids and not (entry_media_ids & known_media_ids):
+            removed_unknown_media_entries.add(entry_id)
             continue
         filtered_rows = []
         for row in entry_rows:
@@ -1035,6 +1051,7 @@ def prune_applied_review_queue(
         "queue_rows": len(kept_rows),
         "entry_count": len({str(row.get("entry_id", "")) for row in kept_rows if row.get("entry_id")}),
         "removed_completed_entries": len(removed_completed_entries),
+        "removed_unknown_media_entries": len(removed_unknown_media_entries),
         "removed_rejected_candidates": removed_rejected_candidates,
         "search_queue_path": str(queue_path),
         "group_report_path": str(report_dir / "original_photo_unclear_groups.csv"),
@@ -1683,6 +1700,14 @@ def _upsert_external_decision(
             """,
             (row["entry_id"],),
         )
+        connection.execute(
+            """
+            DELETE FROM media_assets
+            WHERE entry_id = ?
+                AND role = 'external_original_fallback'
+            """,
+            (row["entry_id"],),
+        )
     elif role == "external_original_rejected":
         connection.execute(
             """
@@ -1777,7 +1802,7 @@ def _load_unclear_exports(
     all_exports = [
         dict(row)
         for row in connection.execute(
-            """
+            f"""
             SELECT
                 entries.id AS entry_id,
                 entries.entry_date,
@@ -1785,9 +1810,10 @@ def _load_unclear_exports(
             FROM entries
             JOIN media_assets
                 ON media_assets.entry_id = entries.id
-                AND media_assets.role = 'project365_export_png'
+                AND media_assets.role IN ({",".join("?" for _ in ORIGINAL_PICKER_TARGET_ROLES)})
             ORDER BY entries.entry_date, entries.id
-            """
+            """,
+            ORIGINAL_PICKER_TARGET_ROLES,
         )
     ]
     exports: list[dict[str, object]] = []

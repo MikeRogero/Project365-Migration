@@ -870,6 +870,8 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             command.extend(["--start-date", start_date])
         if end_date:
             command.extend(["--end-date", end_date])
+        if payload.get("target_scope") == "fallback_originals" or payload.get("include_fallback_targets"):
+            command.append("--include-fallback-targets")
         needed_list = str(payload.get("broad_search_needed_list", "")).strip()
         if needed_list:
             command.extend(["--broad-search-needed-list", needed_list])
@@ -931,6 +933,8 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             command.extend(["--start-date", start_date])
         if end_date:
             command.extend(["--end-date", end_date])
+        if payload.get("target_scope") == "fallback_originals" or payload.get("include_fallback_targets"):
+            command.append("--include-fallback-targets")
         needed_list = str(payload.get("broad_search_needed_list", "")).strip()
         if needed_list:
             command.extend(["--broad-search-needed-list", needed_list])
@@ -4283,8 +4287,9 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 if parsed.path == "/picker/api/import-dropped-candidate":
                     entry_id = urllib.parse.unquote(self.headers.get("x-entry-id", ""))
                     filename = urllib.parse.unquote(self.headers.get("x-file-name", ""))
-                    suffix = Path(filename.replace("\\", "/")).suffix.lower()
-                    if suffix in original_picker.VIDEO_DROP_EXTENSIONS:
+                    content_type = self.headers.get("content-type", "")
+                    suffix = original_picker.video_drop_suffix(filename, content_type)
+                    if suffix:
                         upload_path = self._read_upload_to_temp(
                             original_picker.MAX_VIDEO_DROP_BYTES,
                             suffix,
@@ -4293,6 +4298,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                             entry_id=entry_id,
                             filename=filename,
                             upload_path=upload_path,
+                            content_type=content_type,
                         )
                     else:
                         payload = self._read_bytes(original_picker.MAX_DROP_BYTES)
@@ -4322,6 +4328,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     state.picker_state().discard_video_frame_choices(
                         entry_id=str(payload.get("entry_id", "")),
                         session_id=str(payload.get("session_id", "")),
+                        wait=False,
                     )
                     self._send_json({"ok": True})
                     return
@@ -6422,6 +6429,7 @@ a { color: var(--accent); }
           <label title="Which Project365 entries to search. These dates are the target entries, not candidate-photo metadata dates.">Project365 entries to search</label>
           <select id="broadTargetScope">
             <option value="all_unresolved">All unresolved</option>
+            <option value="fallback_originals">Fallback originals</option>
             <option value="entry_ids">Specific entries</option>
             <option value="date_range">Date range</option>
             <option value="broad_search_needed_list">Broad-search-needed list</option>
@@ -6526,6 +6534,7 @@ a { color: var(--accent); }
           <label title="Which unresolved Project365 entries to search without candidate date constraints.">Project365 entries to search</label>
           <select id="roughTargetScope">
             <option value="all_unresolved">All unresolved</option>
+            <option value="fallback_originals">Fallback originals</option>
             <option value="entry_ids">Specific entries</option>
             <option value="date_range">Date range</option>
             <option value="broad_search_needed_list">Broad-search-needed list</option>

@@ -26,13 +26,20 @@ from typing import Any
 
 from project365_crop_align import suggest_crop
 from project365_original_matcher import IMAGE_EXTENSIONS
-from project365_photo_library_index import _exiftool_capture_metadata, default_index_db, query_index_candidates
+from project365_photo_library_index import (
+    ExiftoolPhotoMetadata,
+    _exiftool_capture_metadata,
+    _exiftool_photo_metadata,
+    default_index_db,
+    query_index_candidates,
+)
 from project365_original_reference_pipeline import (
     ACCEPT_DECISIONS,
     ASSOCIATED_PHOTO_DECISIONS,
     FALLBACK_DECISIONS,
     HIDDEN_CANDIDATE_FILTER_REASONS,
     MANUAL_SEARCH_REQUIRED_MESSAGE,
+    ORIGINAL_PICKER_TARGET_ROLES,
     REJECT_DECISIONS,
     _external_decision_id,
     apply_reviewed_external_references,
@@ -73,12 +80,40 @@ PROJECT_ADDITION_DROP_TIME = dt.time(0, 0, 1)
 DROP_CONVERT_TO_HEIC_EXTENSIONS = {".avif", ".avifs", ".webp"}
 DROP_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS | DROP_CONVERT_TO_HEIC_EXTENSIONS
 VIDEO_DROP_EXTENSIONS = {".mov", ".mp4", ".m4v"}
+VIDEO_DROP_CONTENT_TYPE_SUFFIXES = {
+    "video/quicktime": ".mov",
+    "video/mp4": ".mp4",
+    "video/x-m4v": ".m4v",
+}
 MAX_VIDEO_DROP_BYTES = 2 * 1024 * 1024 * 1024
 VIDEO_FRAME_COUNT = 16
 
 
+def _sql_in_placeholders(values: tuple[str, ...]) -> str:
+    return ",".join("?" for _ in values)
+
+
 def project_originals_source_path(canonical_root: Path) -> Path:
     return (Path(canonical_root).parent / PROJECT_ORIGINALS_SOURCE_RELATIVE_PATH).resolve()
+
+
+def video_drop_suffix(filename: str, content_type: str = "") -> str:
+    suffix = Path(str(filename).replace("\\", "/")).suffix.lower()
+    if suffix in VIDEO_DROP_EXTENSIONS:
+        return suffix
+    normalized_type = str(content_type).split(";", 1)[0].strip().lower()
+    return VIDEO_DROP_CONTENT_TYPE_SUFFIXES.get(normalized_type, "")
+
+
+def video_drop_filename(filename: str, content_type: str = "") -> str:
+    safe_name = Path(str(filename).replace("\\", "/")).name
+    suffix = video_drop_suffix(safe_name, content_type)
+    if not suffix:
+        return safe_name or "dropped-video"
+    if Path(safe_name).suffix.lower() in VIDEO_DROP_EXTENSIONS:
+        return safe_name
+    stem = Path(safe_name).stem if safe_name else ""
+    return f"{stem or 'dropped-video'}{suffix}"
 
 
 def _unique_paths(paths: list[Path]) -> list[Path]:
@@ -91,6 +126,17 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
         seen.add(key)
         unique.append(path)
     return unique
+
+
+def _remove_tree_in_background(path: Path) -> None:
+    def cleanup() -> None:
+        shutil.rmtree(path, ignore_errors=True)
+
+    threading.Thread(
+        target=cleanup,
+        name="project365-picker-video-cleanup",
+        daemon=True,
+    ).start()
 
 
 def _rows_for_fieldnames(rows: list[dict[str, str]], fieldnames: list[str]) -> list[dict[str, str]]:
@@ -131,10 +177,16 @@ class PickerQueueShards:
         self._lock = threading.Lock()
 
     def summaries(self) -> list[dict[str, Any]]:
+        if not self.queue_path.exists():
+            self._manifest = None
+            self._entry_lookup = {}
+            return []
         self._ensure()
         return [dict(entry) for entry in self._manifest.get("entries", [])]
 
     def entry_rows(self, entry_id: str) -> list[dict[str, str]]:
+        if not self.queue_path.exists():
+            return []
         self._ensure()
         entry = self._entry_lookup.get(entry_id)
         if entry is None:
@@ -268,6 +320,7 @@ class PickerState:
         self._video_frame_sets: dict[str, dict[str, Any]] = {}
         self._entry_rows_cache: dict[str, list[dict[str, str]]] = {}
         self._candidate_facts_cache: dict[str, tuple[str, bool]] = {}
+        self._dropped_photo_metadata_cache: dict[str, dict[str, str]] = {}
         self._added_candidate_rows: dict[str, list[dict[str, str]]] = {}
         self._replacement_candidate_rows: dict[str, list[dict[str, str]]] = {}
         self._decision_overrides = self._load_decision_overrides()
@@ -275,6 +328,7 @@ class PickerState:
         self._queue_shards = PickerQueueShards(config.queue_path, config.canonical_root)
         self._source_media = self._load_source_media()
         self._completed_external_entry_ids_cache: set[str] | None = None
+        self._completed_external_reference_entry_ids_cache: set[str] | None = None
         self._completed_queue_prune_signature: tuple[tuple[int, int] | None, tuple[int, int] | None] | None = None
         self._people_cache_signature: tuple[int, int] | None = None
         self._people_by_entry: dict[str, list[str]] = {}
@@ -289,6 +343,7 @@ class PickerState:
             self._replacement_candidate_rows
         )
         seen_entry_ids: set[str] = set()
+        queue_exists = self.config.queue_path.exists()
         for record in self._queue_shards.summaries():
             seen_entry_ids.add(record["entry_id"])
             if record["entry_id"] in affected_entry_ids:
@@ -322,8 +377,47 @@ class PickerState:
                 pending_entries["rejected"] += 1
             if associated_count:
                 pending_entries["associated"] += 1
-        for entry_id in sorted(affected_entry_ids - seen_entry_ids):
+        if not queue_exists:
+            for entry in self._database_entry_summaries(set(), set(), missing_links_only=True):
+                entry_id = entry["entry_id"]
+                if entry_id in seen_entry_ids:
+                    continue
+                status = str(entry.get("status", "search_needed"))
+                status_counts[status] = status_counts.get(status, 0) + 1
+                entry_count += 1
+                seen_entry_ids.add(entry_id)
+        for entry in self._database_entry_summaries(set(), set(), fallback_only=True):
+            entry_id = entry["entry_id"]
+            if entry_id in seen_entry_ids:
+                continue
+            status = str(entry.get("status", "fallback"))
             entry_rows = self._entry_rows(entry_id)
+            accepted_count = sum(
+                row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                for row in entry_rows
+            )
+            rejected_count = sum(
+                row.get("review_decision", "").strip().lower() in REJECT_DECISIONS
+                for row in entry_rows
+            )
+            associated_count = sum(
+                row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+                for row in entry_rows
+            )
+            status_counts[status] = status_counts.get(status, 0) + 1
+            entry_count += 1
+            pending["accepted"] += accepted_count
+            pending["rejected"] += rejected_count
+            pending["associated"] += associated_count
+            if accepted_count:
+                pending_entries["accepted"] += 1
+            if rejected_count:
+                pending_entries["rejected"] += 1
+            if associated_count:
+                pending_entries["associated"] += 1
+            seen_entry_ids.add(entry_id)
+        for entry_id in sorted(affected_entry_ids - seen_entry_ids):
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 continue
             status = _entry_status(entry_rows)
@@ -357,6 +451,7 @@ class PickerState:
             "pending_entry_counts": pending_entries,
             "pending_crop_commits": self.pending_crop_commits(),
             "queue_path": str(self.config.queue_path),
+            "queue_exists": queue_exists,
             "default_photo_index_folder": project_originals_source_folder(self.config.canonical_root),
         }
 
@@ -471,10 +566,13 @@ class PickerState:
                 "returned_count": len(paged_entries),
                 "has_more": limit is not None and offset + len(paged_entries) < len(entries),
             }
+        queue_exists = self.config.queue_path.exists()
+        seen_entry_ids: set[str] = set()
         for record in sorted(self._queue_shards.summaries(), key=_entry_sort_key, reverse=reverse_entry_order):
             entry_id = str(record.get("entry_id", ""))
             if self._entry_has_completed_external_decision(entry_id):
                 continue
+            seen_entry_ids.add(entry_id)
             if entry_id in affected_entry_ids:
                 entry = self._entry_summary(entry_id, self._entry_rows(entry_id))
             else:
@@ -493,6 +591,62 @@ class PickerState:
                 break
             entries.append(entry)
             matched_count += 1
+        if not queue_exists:
+            for entry in self._database_entry_summaries(set(), set(), missing_links_only=True):
+                if entry["entry_id"] in seen_entry_ids:
+                    continue
+                if not _entry_matches_status(entry, status):
+                    continue
+                if matched_count < offset:
+                    matched_count += 1
+                    continue
+                if limit is not None and len(entries) >= limit:
+                    has_more = True
+                    break
+                entries.append(entry)
+                matched_count += 1
+        if status in {"fallback", "all"}:
+            for entry_id in self._database_entry_ids(set(), set(), fallback_only=True):
+                if entry_id in seen_entry_ids:
+                    continue
+                if limit is not None and len(entries) >= limit:
+                    has_more = True
+                    break
+                entry = self._database_entry_summary(entry_id, fallback_only=True)
+                if entry is None:
+                    continue
+                if entry["entry_id"] in seen_entry_ids:
+                    continue
+                if not _entry_matches_status(entry, status):
+                    continue
+                if matched_count < offset:
+                    matched_count += 1
+                    continue
+                if limit is not None and len(entries) >= limit:
+                    has_more = True
+                    break
+                entries.append(entry)
+                matched_count += 1
+                seen_entry_ids.add(entry["entry_id"])
+        current_affected_entry_ids = set(self._decision_overrides) | set(self._added_candidate_rows) | set(
+            self._replacement_candidate_rows
+        )
+        for entry_id in sorted(current_affected_entry_ids - seen_entry_ids):
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
+            if not entry_rows:
+                continue
+            entry = self._entry_summary(entry_id, entry_rows)
+            if not _entry_matches_status(entry, status):
+                continue
+            if matched_count < offset:
+                matched_count += 1
+                continue
+            if limit is not None and len(entries) >= limit:
+                has_more = True
+                break
+            entries.append(entry)
+            matched_count += 1
+            seen_entry_ids.add(entry_id)
         return {
             "entries": entries,
             "offset": offset,
@@ -515,18 +669,26 @@ class PickerState:
         if candidate_offset < 0:
             raise ValueError("candidate_offset must be zero or greater")
         has_local_pending_rows = self._entry_has_local_pending_rows(entry_id)
-        if self._entry_has_completed_external_decision(entry_id) and not has_local_pending_rows:
+        if self._entry_has_completed_external_decision(entry_id, include_fallback=False) and not has_local_pending_rows:
             if include_database:
                 return self._database_entry_detail(entry_id)
             return None
         entry_rows = self._entry_rows(entry_id)
         if not entry_rows:
-            if include_database:
-                return self._database_entry_detail(entry_id)
+            self._recover_project_addition_candidates(entry_id)
+            entry_rows = self._entry_rows(entry_id)
+        if not entry_rows:
+            database_detail = self._database_entry_detail(entry_id)
+            if (
+                database_detail is not None
+                and (include_database or not self.config.queue_path.exists() or database_detail.get("status") == "fallback")
+            ):
+                return database_detail
             return None
         entry_rows = self._ensure_default_filename_index_candidates(entry_id, entry_rows)
         if candidate_limit is None and rank_if_needed:
             entry_rows = self._rank_oversized_entry_if_needed(entry_id, entry_rows)
+        entry_rows = self._with_database_confirmed_roles(entry_id, entry_rows)
         entry = self._entry_summary(entry_id, entry_rows)
         candidate_rows = [
             row
@@ -693,6 +855,9 @@ class PickerState:
     def _candidate_detail(self, row: dict[str, str]) -> dict[str, Any]:
         path_text = row.get("candidate_path", "").strip()
         path = Path(path_text)
+        metadata_values = self._metadata_values_for_manual_drop(row)
+        database_role = row.get("database_confirmed_role", "").strip().lower()
+        decision = row.get("review_decision", "").strip().lower()
         return {
             "path": path_text,
             "filename": row.get("candidate_filename", path.name),
@@ -704,17 +869,20 @@ class PickerState:
             "byte_size": row.get("byte_size", ""),
             "mime_type": row.get("mime_type", ""),
             "dimensions": "",
-            "has_embedded_geolocation": _candidate_row_has_indexed_geolocation(row),
+            "has_embedded_geolocation": _candidate_row_has_indexed_geolocation({**row, **metadata_values}),
             "filename_dates": row.get("filename_dates", ""),
-            "media_creation_dates": row.get("media_creation_dates", ""),
+            "media_creation_dates": metadata_values.get("media_creation_dates", row.get("media_creation_dates", "")),
             "filesystem_dates": row.get("filesystem_dates", ""),
-            "capture_timestamp": row.get("capture_timestamp", ""),
-            "capture_timestamp_source": row.get("capture_timestamp_source", ""),
-            "gps_latitude": row.get("gps_latitude", ""),
-            "gps_longitude": row.get("gps_longitude", ""),
-            "gps_source": row.get("gps_source", ""),
-            "has_gps": row.get("has_gps", ""),
-            "date_distance": row.get("date_distance", ""),
+            "capture_timestamp": metadata_values.get("capture_timestamp", row.get("capture_timestamp", "")),
+            "capture_timestamp_source": metadata_values.get(
+                "capture_timestamp_source",
+                row.get("capture_timestamp_source", ""),
+            ),
+            "gps_latitude": metadata_values.get("gps_latitude", row.get("gps_latitude", "")),
+            "gps_longitude": metadata_values.get("gps_longitude", row.get("gps_longitude", "")),
+            "gps_source": metadata_values.get("gps_source", row.get("gps_source", "")),
+            "has_gps": metadata_values.get("has_gps", row.get("has_gps", "")),
+            "date_distance": metadata_values.get("date_distance", row.get("date_distance", "")),
             "alignment_score": row.get("alignment_score", ""),
             "alignment_confidence": row.get("alignment_confidence", ""),
             "alignment_crop": row.get("alignment_crop", ""),
@@ -734,14 +902,33 @@ class PickerState:
             "visual_method": row.get("visual_method", ""),
             "visual_best_view": row.get("visual_best_view", ""),
             "visual_error": row.get("visual_error", ""),
-            "review_decision": row.get("review_decision", ""),
+            "review_decision": "use_external_original"
+            if database_role == "external_original_reference"
+            else row.get("review_decision", ""),
             "review_notes": row.get("review_notes", ""),
             "associated_entry_date": row.get("associated_entry_date", ""),
             "associated_date_source": row.get("associated_date_source", ""),
             "project_originals_source": _is_project_originals_source_path(path_text),
-            "selected": row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS,
-            "associated": row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS,
+            "selected": decision in ACCEPT_DECISIONS or database_role == "external_original_reference",
+            "associated": database_role != "external_original_reference"
+            and (decision in ASSOCIATED_PHOTO_DECISIONS or database_role == "external_original_associated_photo"),
+            "database_confirmed_role": database_role,
         }
+
+    def _metadata_values_for_manual_drop(self, row: dict[str, str]) -> dict[str, str]:
+        if "manual_drop_copy" not in row.get("evidence", ""):
+            return {}
+        if row.get("capture_timestamp") or row.get("gps_latitude") or row.get("gps_longitude"):
+            return {}
+        path_text = row.get("candidate_path", "").strip()
+        if not path_text:
+            return {}
+        if path_text not in self._dropped_photo_metadata_cache:
+            self._dropped_photo_metadata_cache[path_text] = _dropped_photo_metadata_values(
+                Path(path_text),
+                row.get("entry_date", ""),
+            )
+        return self._dropped_photo_metadata_cache[path_text]
 
     def associated_date_choices(self, entry_id: str, candidate_path: str) -> dict[str, Any]:
         rows = self._entry_rows(entry_id)
@@ -1026,38 +1213,127 @@ class PickerState:
         self,
         entry_ids: set[str],
         entry_dates: set[str],
+        missing_links_only: bool = False,
+        fallback_only: bool = False,
     ) -> list[dict[str, Any]]:
         summaries = []
-        for entry_id in self._database_entry_ids(entry_ids, entry_dates):
-            detail = self._database_entry_detail(entry_id)
-            if not detail:
+        for entry_id in self._database_entry_ids(
+            entry_ids,
+            entry_dates,
+            missing_links_only=missing_links_only,
+            fallback_only=fallback_only,
+        ):
+            summary = self._database_entry_summary(entry_id, fallback_only=fallback_only)
+            if summary is None:
                 continue
-            summary = {key: value for key, value in detail.items() if key != "candidates"}
             summaries.append(summary)
         summaries.sort(key=_entry_sort_key)
         return summaries
 
-    def _database_entry_ids(self, entry_ids: set[str], entry_dates: set[str]) -> list[str]:
+    def _database_entry_summary(self, entry_id: str, fallback_only: bool = False) -> dict[str, Any] | None:
+        if fallback_only:
+            self._recover_project_addition_candidates(entry_id)
+        if self._entry_has_local_pending_rows(entry_id):
+            rows = self._entry_rows_for_manual_candidate(entry_id)
+            if not rows:
+                return None
+            return self._entry_summary(entry_id, rows)
+        detail = self._database_entry_detail(entry_id)
+        if not detail:
+            return None
+        return {key: value for key, value in detail.items() if key != "candidates"}
+
+    def _database_entry_ids(
+        self,
+        entry_ids: set[str],
+        entry_dates: set[str],
+        missing_links_only: bool = False,
+        fallback_only: bool = False,
+    ) -> list[str]:
         db_path = self.config.canonical_root / "canonical.db"
         if not db_path.exists():
             return []
-        clauses = []
+        if missing_links_only and fallback_only:
+            raise ValueError("missing_links_only and fallback_only cannot both be true")
+        scope_clauses = []
+        required_clauses = []
         params: list[str] = []
         if entry_ids:
-            clauses.append(f"entries.id IN ({','.join('?' for _ in entry_ids)})")
+            scope_clauses.append(f"entries.id IN ({','.join('?' for _ in entry_ids)})")
             params.extend(sorted(entry_ids))
         if entry_dates:
-            clauses.append(f"entries.entry_date IN ({','.join('?' for _ in entry_dates)})")
+            scope_clauses.append(f"entries.entry_date IN ({','.join('?' for _ in entry_dates)})")
             params.extend(sorted(entry_dates))
-        if not clauses:
+        if missing_links_only:
+            required_clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM media_assets AS project365_target
+                    WHERE project365_target.entry_id = entries.id
+                        AND project365_target.role IN ({_sql_in_placeholders(ORIGINAL_PICKER_TARGET_ROLES)})
+                )
+                """
+            )
+            params.extend(ORIGINAL_PICKER_TARGET_ROLES)
+            required_clauses.append(
+                """
+                NOT EXISTS (
+                    SELECT 1
+                    FROM media_assets AS completed_external
+                    WHERE completed_external.entry_id = entries.id
+                        AND completed_external.role IN ('external_original_reference', 'external_original_fallback')
+                        AND completed_external.review_status = 'confirmed'
+                )
+                """
+            )
+        if fallback_only:
+            required_clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM media_assets AS project365_target
+                    WHERE project365_target.entry_id = entries.id
+                        AND project365_target.role IN ({_sql_in_placeholders(ORIGINAL_PICKER_TARGET_ROLES)})
+                )
+                """
+            )
+            params.extend(ORIGINAL_PICKER_TARGET_ROLES)
+            required_clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM media_assets AS fallback
+                    WHERE fallback.entry_id = entries.id
+                        AND fallback.role = 'external_original_fallback'
+                        AND fallback.review_status = 'confirmed'
+                )
+                """
+            )
+            required_clauses.append(
+                """
+                NOT EXISTS (
+                    SELECT 1
+                    FROM media_assets AS external_original
+                    WHERE external_original.entry_id = entries.id
+                        AND external_original.role = 'external_original_reference'
+                        AND external_original.review_status = 'confirmed'
+                )
+                """
+            )
+        if not scope_clauses and not required_clauses:
             return []
+        clauses = []
+        if scope_clauses:
+            clauses.append(f"({' OR '.join(scope_clauses)})")
+        clauses.extend(required_clauses)
         connection = sqlite3.connect(db_path)
         try:
             rows = connection.execute(
                 f"""
                 SELECT entries.id
                 FROM entries
-                WHERE {' OR '.join(clauses)}
+                WHERE {' AND '.join(clauses)}
                 ORDER BY entries.entry_date, entries.id
                 """,
                 params,
@@ -1171,6 +1447,178 @@ class PickerState:
         finally:
             connection.close()
         return str(row[0]) if row else ""
+
+    def _database_confirmed_external_roles(self, entry_id: str) -> dict[str, str]:
+        return {
+            row["candidate_path"]: row["database_confirmed_role"]
+            for row in self._database_confirmed_external_candidate_rows(entry_id)
+            if row.get("candidate_path", "").strip()
+        }
+
+    def _database_confirmed_external_candidate_rows(self, entry_id: str) -> list[dict[str, str]]:
+        db_path = self.config.canonical_root / "canonical.db"
+        if not db_path.exists():
+            return []
+        connection = sqlite3.connect(db_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                    entries.entry_date,
+                    media_assets.storage_path,
+                    media_assets.internal_filename,
+                    media_assets.sha256,
+                    media_assets.byte_size,
+                    media_assets.mime_type,
+                    media_assets.role,
+                    media_assets.transformation_json
+                FROM media_assets
+                JOIN entries
+                    ON entries.id = media_assets.entry_id
+                WHERE media_assets.entry_id = ?
+                    AND media_assets.role IN ('external_original_reference', 'external_original_associated_photo')
+                    AND media_assets.review_status = 'confirmed'
+                    AND COALESCE(media_assets.storage_path, '') != ''
+                """,
+                (entry_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            connection.close()
+        project365_media_asset_id = self._database_project365_media_asset_id(entry_id)
+        result = []
+        for row in rows:
+            candidate_path = str(row[1] or "").strip()
+            if not candidate_path:
+                continue
+            path = Path(candidate_path)
+            transformation = _parse_json_object(str(row[7] or ""))
+            candidate_sha256 = str(row[3] or "").strip() or hashlib.sha256(candidate_path.encode("utf-8")).hexdigest()
+            result.append(
+                {
+                    "entry_id": entry_id,
+                    "entry_date": str(row[0] or ""),
+                    "project365_media_asset_id": project365_media_asset_id,
+                    "current_match_status": "",
+                    "current_decision": "",
+                    "candidate_path": candidate_path,
+                    "candidate_filename": str(row[2] or path.name),
+                    "candidate_sha256": candidate_sha256,
+                    "byte_size": str(row[4] or ""),
+                    "mime_type": str(row[5] or ""),
+                    "filename_dates": "",
+                    "media_creation_dates": "",
+                    "filesystem_dates": "",
+                    "capture_timestamp": "",
+                    "capture_timestamp_source": "",
+                    "gps_latitude": "",
+                    "gps_longitude": "",
+                    "gps_source": "",
+                    "has_gps": "",
+                    "date_distance": "",
+                    "evidence": str(transformation.get("evidence", "database_confirmed")),
+                    "candidate_filter_reason": "",
+                    "review_decision": "",
+                    "review_notes": "",
+                    "database_confirmed_role": str(row[6] or ""),
+                }
+            )
+        return result
+
+    def _with_database_confirmed_roles(
+        self,
+        entry_id: str,
+        rows: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        roles_by_path = self._database_confirmed_external_roles(entry_id)
+        if not roles_by_path:
+            return rows
+        existing_paths = {row.get("candidate_path", "").strip() for row in rows}
+        overlaid = []
+        for row in rows:
+            next_row = dict(row)
+            role = roles_by_path.get(next_row.get("candidate_path", "").strip(), "")
+            if role and not next_row.get("database_confirmed_role"):
+                next_row["database_confirmed_role"] = role
+            overlaid.append(next_row)
+        for database_row in self._database_confirmed_external_candidate_rows(entry_id):
+            candidate_path = database_row.get("candidate_path", "").strip()
+            if candidate_path and candidate_path not in existing_paths:
+                overlaid.append(database_row)
+                existing_paths.add(candidate_path)
+        return overlaid
+
+    def _project_addition_candidate_paths(self, entry_date: str) -> list[Path]:
+        try:
+            parsed_date = dt.date.fromisoformat(entry_date)
+        except ValueError:
+            return []
+        source_dir = project_originals_source_path(self.config.canonical_root) / parsed_date.strftime("%Y-%m")
+        if not source_dir.exists():
+            return []
+        prefix = f"{entry_date} {PROJECT_ADDITION_DROP_TIME.strftime('%H%M%S')} ({PROJECT_ADDITION_FILENAME_MARKER})"
+        paths = [
+            path
+            for path in source_dir.glob(f"{prefix}*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        return sorted(paths, key=_project_addition_recovery_sort_key)
+
+    def _recover_project_addition_candidates(self, entry_id: str) -> None:
+        if entry_id in self._added_candidate_rows or entry_id in self._replacement_candidate_rows:
+            return
+        detail = self._database_entry_detail(entry_id)
+        if detail is None or detail.get("status") != "fallback":
+            return
+        template = self._database_manual_candidate_template(entry_id)
+        if template is None:
+            return
+        entry_date = template.get("entry_date", "")
+        candidate_paths = self._project_addition_candidate_paths(entry_date)
+        if not candidate_paths:
+            return
+        existing_paths = {
+            row.get("candidate_path", "").strip()
+            for row in self._entry_rows(entry_id)
+            if row.get("candidate_path", "").strip()
+        }
+        new_paths = [path.resolve() for path in candidate_paths if str(path.resolve()) not in existing_paths]
+        if not new_paths:
+            return
+        selected_path = new_paths[-1]
+        values_list: list[dict[str, Any]] = []
+        for path in new_paths:
+            metadata_values = _dropped_photo_metadata_values(path, entry_date)
+            values_list.append(
+                {
+                    "entry_id": entry_id,
+                    "entry_date": entry_date,
+                    "project365_media_asset_id": template.get("project365_media_asset_id", ""),
+                    "current_match_status": template.get("current_match_status", ""),
+                    "current_decision": template.get("current_decision", ""),
+                    "candidate_path": str(path),
+                    "candidate_filename": path.name,
+                    "candidate_sha256": _sha256_path(path),
+                    "byte_size": str(path.stat().st_size),
+                    "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    "filename_dates": entry_date,
+                    "media_creation_dates": metadata_values.get("media_creation_dates", ""),
+                    "filesystem_dates": entry_date,
+                    "capture_timestamp": metadata_values.get("capture_timestamp", ""),
+                    "capture_timestamp_source": metadata_values.get("capture_timestamp_source", ""),
+                    "gps_latitude": metadata_values.get("gps_latitude", ""),
+                    "gps_longitude": metadata_values.get("gps_longitude", ""),
+                    "gps_source": metadata_values.get("gps_source", ""),
+                    "has_gps": metadata_values.get("has_gps", ""),
+                    "date_distance": metadata_values.get("date_distance", ""),
+                    "evidence": "manual_drop_copy;recovered_project_addition",
+                    "candidate_filter_reason": "",
+                    "review_decision": "use_external_original" if path == selected_path else "",
+                    "review_notes": "Recovered dropped Project365 project file addition.",
+                }
+            )
+        self._store_added_candidates(entry_id, template, values_list)
 
     def _database_crop_source_state(self, entry_id: str, candidate_path: str) -> str:
         if self._staged_crop_record(entry_id, candidate_path) is not None:
@@ -1397,6 +1845,7 @@ class PickerState:
                 self._append_rejected_queue_row(rejected_row)
             if rejected_rows_to_append:
                 self._completed_external_entry_ids_cache = None
+                self._completed_external_reference_entry_ids_cache = None
                 self._completed_queue_prune_signature = None
                 prune_summary = prune_applied_review_queue(
                     canonical_root=self.config.canonical_root,
@@ -1536,7 +1985,7 @@ class PickerState:
             raise ValueError("Unsupported decision")
         rows: list[dict[str, str]]
         with self._lock:
-            rows = self._entry_rows(entry_id)
+            rows = self._entry_rows_for_manual_candidate(entry_id)
             if normalized_decision == "clear":
                 if not rows:
                     raise ValueError("Unknown entry")
@@ -2186,6 +2635,7 @@ class PickerState:
                 converted_temp_path.unlink(missing_ok=True)
             destination = destination.resolve()
             destination_text = str(destination)
+            metadata_values = _dropped_photo_metadata_values(destination, entry_date)
             if not any(row.get("candidate_path") == destination_text for row in entry_rows):
                 template = entry_rows[0]
                 mime_type = "image/heic" if suffix in DROP_CONVERT_TO_HEIC_EXTENSIONS else ""
@@ -2203,8 +2653,15 @@ class PickerState:
                     "byte_size": str(destination.stat().st_size),
                     "mime_type": mime_type,
                     "filename_dates": entry_date,
-                    "media_creation_dates": "",
+                    "media_creation_dates": metadata_values.get("media_creation_dates", ""),
                     "filesystem_dates": entry_date,
+                    "capture_timestamp": metadata_values.get("capture_timestamp", ""),
+                    "capture_timestamp_source": metadata_values.get("capture_timestamp_source", ""),
+                    "gps_latitude": metadata_values.get("gps_latitude", ""),
+                    "gps_longitude": metadata_values.get("gps_longitude", ""),
+                    "gps_source": metadata_values.get("gps_source", ""),
+                    "has_gps": metadata_values.get("has_gps", ""),
+                    "date_distance": metadata_values.get("date_distance", ""),
                     "evidence": "manual_drop_copy",
                     "candidate_filter_reason": "",
                     "review_decision": "",
@@ -2234,13 +2691,14 @@ class PickerState:
         entry_id: str,
         filename: str,
         upload_path: Path,
+        content_type: str = "",
     ) -> dict[str, Any]:
-        safe_name = Path(filename.replace("\\", "/")).name or "dropped-video"
+        safe_name = video_drop_filename(filename, content_type)
         suffix = Path(safe_name).suffix.lower()
         if suffix not in VIDEO_DROP_EXTENSIONS:
             raise ValueError("Drop one supported video file.")
         with self._lock:
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -2408,17 +2866,20 @@ class PickerState:
                     associate=True,
                 )
         finally:
-            self.discard_video_frame_choices(entry_id, session_id)
+            self.discard_video_frame_choices(entry_id, session_id, wait=False)
         return self.entry_detail(entry_id) or detail or {}
 
-    def discard_video_frame_choices(self, entry_id: str, session_id: str) -> None:
+    def discard_video_frame_choices(self, entry_id: str, session_id: str, wait: bool = True) -> None:
         with self._lock:
             frame_set = self._video_frame_sets.pop(session_id, None)
             if not frame_set or frame_set.get("entry_id") != entry_id:
                 return
             frame_dir = Path(str(frame_set.get("frame_dir", "")))
         if frame_dir:
-            shutil.rmtree(frame_dir, ignore_errors=True)
+            if wait:
+                shutil.rmtree(frame_dir, ignore_errors=True)
+            else:
+                _remove_tree_in_background(frame_dir)
 
     def _unused_project_addition_paths_for_entries(self) -> list[Path]:
         paths: list[Path] = []
@@ -2481,6 +2942,7 @@ class PickerState:
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
             self._completed_external_entry_ids_cache = None
+            self._completed_external_reference_entry_ids_cache = None
             self._completed_queue_prune_signature = None
             deleted_unused_project_additions = self._delete_paths(unused_project_additions)
         self._source_media = self._load_source_media()
@@ -2495,6 +2957,7 @@ class PickerState:
             "remaining_queue_rows": prune_summary["queue_rows"],
             "remaining_entries": prune_summary["entry_count"],
             "removed_completed_entries": prune_summary["removed_completed_entries"],
+            "removed_unknown_media_entries": prune_summary["removed_unknown_media_entries"],
             "removed_rejected_candidates": prune_summary["removed_rejected_candidates"],
             "deleted_unused_project_additions": deleted_unused_project_additions,
         }
@@ -2503,7 +2966,7 @@ class PickerState:
         self._prune_completed_queue_entries_if_needed()
         with self._lock:
             fieldnames, _rows = self._read_rows_with_fieldnames()
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             if not any(
@@ -2536,6 +2999,7 @@ class PickerState:
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
             self._completed_external_entry_ids_cache = None
+            self._completed_external_reference_entry_ids_cache = None
             self._completed_queue_prune_signature = None
             deleted_unused_project_additions = self._delete_paths(unused_project_additions)
         self._source_media = self._load_source_media()
@@ -2550,6 +3014,7 @@ class PickerState:
             "remaining_queue_rows": prune_summary["queue_rows"],
             "remaining_entries": prune_summary["entry_count"],
             "removed_completed_entries": prune_summary["removed_completed_entries"],
+            "removed_unknown_media_entries": prune_summary["removed_unknown_media_entries"],
             "removed_rejected_candidates": prune_summary["removed_rejected_candidates"],
             "deleted_unused_project_additions": deleted_unused_project_additions,
         }
@@ -2574,7 +3039,7 @@ class PickerState:
             replace_candidates = bool(search_whole_index)
             if not replace_candidates:
                 self._clear_replacement_candidates(entry_id)
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -2693,7 +3158,7 @@ class PickerState:
             replace_candidates = bool(search_whole_index)
             if not replace_candidates:
                 self._clear_replacement_candidates(entry_id)
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -3080,10 +3545,17 @@ class PickerState:
             for row in candidate_rows
             if row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
         ]
+        database_selected_rows = [
+            row
+            for row in candidate_rows
+            if row.get("database_confirmed_role", "").strip().lower() == "external_original_reference"
+            and row.get("review_decision", "").strip().lower() not in ACCEPT_DECISIONS
+        ]
         associated_rows = [
             row
             for row in candidate_rows
             if row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
+            and row.get("database_confirmed_role", "").strip().lower() != "external_original_reference"
         ]
         fallback_rows = [
             row
@@ -3102,7 +3574,7 @@ class PickerState:
             "entry_date": first.get("entry_date", ""),
             "status": status,
             "candidate_count": remaining_candidate_count,
-            "selected_count": len(selected_rows),
+            "selected_count": len(selected_rows) + len(database_selected_rows),
             "pending_commit_count": len(selected_rows),
             "commit_ready": bool(selected_rows),
             "source_token": self._image_token(source_path) if source_path else "",
@@ -3114,7 +3586,7 @@ class PickerState:
             "current_match_status": first.get("current_match_status", ""),
             "current_decision": first.get("current_decision", ""),
             "manual_search_message": manual_search_message,
-            "accepted_count": len(selected_rows),
+            "accepted_count": len(selected_rows) + len(database_selected_rows),
             "associated_count": len(associated_rows),
             "rejected_count": len(rejected_rows),
             "fallback_count": len(fallback_rows),
@@ -3226,24 +3698,37 @@ class PickerState:
             connection.close()
         return {entry_id: Path(storage_path) for entry_id, storage_path in rows}
 
-    def _entry_has_completed_external_decision(self, entry_id: str) -> bool:
-        if self._completed_external_entry_ids_cache is None:
-            self._completed_external_entry_ids_cache = self._load_completed_external_entry_ids()
-        return entry_id in self._completed_external_entry_ids_cache
+    def _entry_has_completed_external_decision(self, entry_id: str, include_fallback: bool = True) -> bool:
+        if include_fallback:
+            if self._completed_external_entry_ids_cache is None:
+                self._completed_external_entry_ids_cache = self._load_completed_external_entry_ids(
+                    include_fallback=True
+                )
+            return entry_id in self._completed_external_entry_ids_cache
+        if self._completed_external_reference_entry_ids_cache is None:
+            self._completed_external_reference_entry_ids_cache = self._load_completed_external_entry_ids(
+                include_fallback=False
+            )
+        return entry_id in self._completed_external_reference_entry_ids_cache
 
-    def _load_completed_external_entry_ids(self) -> set[str]:
+    def _load_completed_external_entry_ids(self, include_fallback: bool = True) -> set[str]:
         db_path = self.config.canonical_root / "canonical.db"
         if not db_path.exists():
             return set()
+        roles = ["external_original_reference"]
+        if include_fallback:
+            roles.append("external_original_fallback")
+        placeholders = ", ".join("?" for _ in roles)
         connection = sqlite3.connect(db_path)
         try:
             rows = connection.execute(
-                """
+                f"""
                 SELECT DISTINCT entry_id
                 FROM media_assets
-                WHERE role IN ('external_original_reference', 'external_original_fallback')
+                WHERE role IN ({placeholders})
                     AND review_status = 'confirmed'
-                """
+                """,
+                roles,
             ).fetchall()
         except sqlite3.Error:
             return set()
@@ -3275,6 +3760,7 @@ class PickerState:
             if signature == self._completed_queue_prune_signature:
                 return {}
             self._completed_external_entry_ids_cache = None
+            self._completed_external_reference_entry_ids_cache = None
             if not self.config.queue_path.exists():
                 self._completed_queue_prune_signature = signature
                 return {}
@@ -3296,6 +3782,7 @@ class PickerState:
             self._entry_rows_cache = {}
             self._queue_shards.invalidate()
             self._completed_external_entry_ids_cache = None
+            self._completed_external_reference_entry_ids_cache = None
             self._source_media = self._load_source_media()
             self._refresh_image_paths()
             self._completed_queue_prune_signature = self._completed_queue_signature()
@@ -3644,6 +4131,10 @@ class PickerState:
         template = self._database_manual_candidate_template(entry_id)
         if template is None:
             return []
+        self._recover_project_addition_candidates(entry_id)
+        rows = self._entry_rows(entry_id)
+        if rows:
+            return rows
         self._cache_entry_rows(entry_id, [template])
         return [dict(template)]
 
@@ -4075,13 +4566,15 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/import-dropped-candidate":
                     entry_id = urllib.parse.unquote(self.headers.get("x-entry-id", ""))
                     filename = urllib.parse.unquote(self.headers.get("x-file-name", ""))
-                    suffix = Path(filename.replace("\\", "/")).suffix.lower()
-                    if suffix in VIDEO_DROP_EXTENSIONS:
+                    content_type = self.headers.get("content-type", "")
+                    suffix = video_drop_suffix(filename, content_type)
+                    if suffix:
                         upload_path = self._read_upload_to_temp(MAX_VIDEO_DROP_BYTES, suffix)
                         detail = state.prepare_video_frame_choices(
                             entry_id=entry_id,
                             filename=filename,
                             upload_path=upload_path,
+                            content_type=content_type,
                         )
                     else:
                         payload = self._read_bytes(MAX_DROP_BYTES)
@@ -4123,6 +4616,7 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     state.discard_video_frame_choices(
                         entry_id=str(payload.get("entry_id", "")),
                         session_id=str(payload.get("session_id", "")),
+                        wait=False,
                     )
                     self._send_json({"ok": True})
                     return
@@ -4267,6 +4761,14 @@ def _batch_sort_key(batch: dict[str, Any]) -> tuple[str, str, str]:
         str(batch.get("end_date", "")),
         str(batch.get("batch_id", "")),
     )
+
+
+def _project_addition_recovery_sort_key(path: Path) -> tuple[int, int, str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0, str(path))
+    return (int(getattr(stat, "st_ctime_ns", 0)), int(getattr(stat, "st_mtime_ns", 0)), str(path))
 
 
 def _entry_status(entry_rows: list[dict[str, str]]) -> str:
@@ -4521,6 +5023,9 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, str, 
 
 def _candidate_page_sort_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
     decision = str(candidate.get("review_decision", "")).strip().lower()
+    database_role = str(candidate.get("database_confirmed_role", "")).strip().lower()
+    if database_role == "external_original_reference":
+        decision = "use_external_original"
     visual_likely = str(candidate.get("visual_likely", "")).strip().lower() == "true"
     try:
         visual_rank = int(str(candidate.get("visual_rank", "")).strip())
@@ -4964,6 +5469,45 @@ def _valid_geolocation(latitude: Any, longitude: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+def _dropped_photo_metadata_values(path: Path, entry_date: str) -> dict[str, str]:
+    try:
+        metadata = _exiftool_photo_metadata([path]).get(str(path.resolve()))
+    except RuntimeError:
+        return {}
+    if metadata is None:
+        return {}
+    return _photo_metadata_values(metadata, entry_date)
+
+
+def _photo_metadata_values(metadata: ExiftoolPhotoMetadata, entry_date: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if metadata.capture_timestamp and metadata.capture_timestamp_source:
+        values["capture_timestamp"] = metadata.capture_timestamp
+        values["capture_timestamp_source"] = metadata.capture_timestamp_source
+        capture_date = metadata.capture_timestamp[:10]
+        values["media_creation_dates"] = capture_date
+        values["date_distance"] = _capture_date_distance(entry_date, capture_date)
+    if metadata.gps_latitude is not None and metadata.gps_longitude is not None:
+        values["gps_latitude"] = _format_coordinate(metadata.gps_latitude)
+        values["gps_longitude"] = _format_coordinate(metadata.gps_longitude)
+        values["gps_source"] = metadata.gps_source
+        values["has_gps"] = "1" if _valid_geolocation(metadata.gps_latitude, metadata.gps_longitude) else "0"
+    return values
+
+
+def _format_coordinate(value: float) -> str:
+    return f"{float(value):.12f}".rstrip("0").rstrip(".")
+
+
+def _capture_date_distance(entry_date: str, capture_date: str) -> str:
+    try:
+        target = dt.date.fromisoformat(entry_date)
+        captured = dt.date.fromisoformat(capture_date)
+    except ValueError:
+        return ""
+    return str(abs((captured - target).days))
 
 
 def _tiff_has_gps_ifd(payload: bytes) -> bool:
@@ -5467,6 +6011,7 @@ button {
 .summary {
   font-size: 12px;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 .batch-summary {
   min-height: 16px;
@@ -5503,6 +6048,14 @@ button {
   overflow: auto;
   min-height: 0;
 }
+.entry-paging-actions {
+  display: grid;
+  grid-template-columns: 7fr 3fr;
+  gap: 8px;
+}
+.entry-paging-actions .action-button {
+  width: 100%;
+}
 .selection-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -5537,6 +6090,17 @@ button {
   background: #222;
   border: 1px solid var(--line);
   border-radius: 6px;
+}
+.entry-thumb-button {
+  width: 52px;
+  height: 52px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.entry-thumb-button .entry-thumb {
+  display: block;
 }
 .entry-button {
   border: 0;
@@ -5910,6 +6474,17 @@ textarea:focus-visible {
 }
 .source-frame {
   overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.source-frame.is-draggable {
+  cursor: grab;
+}
+.source-frame.is-draggable:active {
+  cursor: grabbing;
+}
+.source-frame.is-draggable .source-image {
+  cursor: grab;
 }
 .source-image {
   display: block;
@@ -5917,6 +6492,9 @@ textarea:focus-visible {
   max-height: calc(100vh - 170px);
   object-fit: contain;
   background: #222;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .source-meta,
 .candidate-meta {
@@ -6466,7 +7044,7 @@ textarea:focus-visible {
         <option value="needs_review">Needs review</option>
         <option value="accepted_not_applied">Accepted not applied</option>
         <option value="selected">Selected</option>
-        <option value="fallback">Fallback</option>
+        <option value="fallback">Fallback: needs better original</option>
         <option value="search_needed">Needs broader search</option>
         <option value="rejected">Rejected</option>
         <option value="all">All entries</option>
@@ -6493,7 +7071,10 @@ textarea:focus-visible {
     <div id="entryList" class="entry-list"></div>
     <div id="entryPaging" class="entry-paging" hidden>
       <div id="entryPagingSummary" class="summary"></div>
-      <button id="loadMoreEntries" class="action-button">Load more</button>
+      <div class="entry-paging-actions">
+        <button id="loadMoreEntries" class="action-button">Load more</button>
+        <button id="loadAllEntries" class="action-button">Load all</button>
+      </div>
     </div>
   </aside>
   <main class="main">
@@ -6576,8 +7157,8 @@ textarea:focus-visible {
             <button id="chooseLinkedPhoto" class="action-button" type="button">Open drop window</button>
           </div>
         </div>
-        <div class="source-frame">
-          <img id="sourceImage" class="source-image" alt="">
+        <div id="sourceFrame" class="source-frame" draggable="false" aria-label="Original Project365 target photo">
+          <img id="sourceImage" class="source-image" alt="" draggable="false">
           <div id="sourceMeta" class="source-meta"></div>
         </div>
       </section>
@@ -6680,6 +7261,8 @@ const state = {
   entryOffset: 0,
   entryHasMore: false,
   entryLoadingMore: false,
+  entryLoadingAll: false,
+  entryLoadAll: false,
   entryRequestId: 0,
   entryDetailCache: new Map(),
   entryDetailRequests: new Map(),
@@ -6699,8 +7282,10 @@ const state = {
   filenameDateScopeDays: 0,
   filenameDateScopeStart: "",
   filenameDateScopeEnd: "",
-  archivedBatchCount: 0
+  archivedBatchCount: 0,
+  lastLinkedPhotoRefreshStamp: ""
 };
+const LINKED_PHOTO_REFRESH_KEY = "project365-linked-photo-refresh";
 
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
@@ -6715,6 +7300,14 @@ function setCrawlStatus(message, running = false) {
   target.classList.toggle("is-running", running);
 }
 
+function updateSourceDragSurface(entry) {
+  const frame = document.getElementById("sourceFrame");
+  const image = document.getElementById("sourceImage");
+  frame.draggable = false;
+  image.draggable = Boolean(entry?.source_token);
+  frame.classList.toggle("is-draggable", Boolean(entry?.source_token));
+}
+
 function statusLabel(status) {
   const labels = {
     needs_action: "needs action",
@@ -6722,7 +7315,7 @@ function statusLabel(status) {
     search_needed: "broaden search",
     accepted_not_applied: "accepted not applied",
     selected: "selected",
-    fallback: "fallback",
+    fallback: "needs better original",
     rejected: "rejected"
   };
   return labels[status] || status.replace("_", " ");
@@ -6784,8 +7377,9 @@ async function loadSummary() {
   const counts = summary.status_counts || {};
   const pending = summary.pending_decisions || {};
   const pendingEntries = summary.pending_entry_counts || {};
+  const queueState = summary.queue_exists === false ? " · search queue missing" : "";
   document.getElementById("summary").textContent =
-    `${summary.entry_count} entries · ${counts.needs_review || 0} review · ${counts.selected || 0} selected · ${counts.search_needed || 0} need broader search`;
+    `${summary.entry_count} entries · ${counts.needs_review || 0} review · ${counts.selected || 0} selected · ${counts.fallback || 0} fallback · ${counts.search_needed || 0} need broader search${queueState}`;
   const acceptedFiles = pending.accepted || 0;
   const acceptedEntries = pendingEntries.accepted ?? acceptedFiles;
   const associatedFiles = pending.associated || 0;
@@ -6834,6 +7428,7 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
   state.entryHasMore = false;
   const filter = document.getElementById("filter").value;
   const explicitScope = explicitEntryScopeActive();
+  const loadAll = explicitScope || state.entryLoadAll;
   const entries = [];
   const seenEntryIds = new Set();
   let payload = {entries: [], has_more: false};
@@ -6853,13 +7448,21 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
       entries.push(entry);
     }
     offset += (payload.entries || []).length || state.entryLimit;
-  } while (explicitScope && payload.has_more);
+    if (loadAll) {
+      state.entries = entries;
+      state.entryOffset = offset;
+      state.entryHasMore = Boolean(payload.has_more);
+      renderEntries();
+      renderEntryPaging();
+      renderBatchSummary();
+    }
+  } while (loadAll && payload.has_more);
   if (explicitScope) {
     entries.sort((left, right) => String(left.entry_date || "").localeCompare(String(right.entry_date || "")) || String(left.entry_id || "").localeCompare(String(right.entry_id || "")));
   }
   state.entries = entries;
-  state.entryOffset = state.entries.length;
-  state.entryHasMore = explicitScope ? false : Boolean(payload.has_more);
+  state.entryOffset = loadAll ? state.entries.length : offset;
+  state.entryHasMore = loadAll ? false : Boolean(payload.has_more);
   renderEntries();
   renderEntryPaging();
   renderBatchSummary();
@@ -6874,7 +7477,7 @@ async function loadEntries(preferredEntryId = "", allowScopeFallback = true, pre
     return;
   }
   const requestedEntryId = preferredEntryId || state.selectedEntryId;
-  if (state.entries.some(entry => entry.entry_id === requestedEntryId)) {
+	  if (state.entries.some(entry => entry.entry_id === requestedEntryId)) {
     state.selectedEntryId = requestedEntryId;
   } else if (preferredEntryDate) {
     const laterEntry = state.entries.find(entry => entry.entry_date > preferredEntryDate);
@@ -6892,8 +7495,27 @@ function replaceEntryDateScopeUrl(dateTexts, status = "all") {
   params.delete("entry_id");
   params.delete("entry_date");
   params.delete("batch");
+  params.delete("load_all");
   params.set("status", status);
   for (const dateText of dateTexts) params.append("entry_date", dateText);
+  window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+}
+
+function setEntryLoadAllUrl(enabled) {
+  state.entryLoadAll = Boolean(enabled);
+  const params = new URLSearchParams(window.location.search);
+  params.set("status", document.getElementById("filter").value);
+  const batchId = document.getElementById("batchFilter").value;
+  if (batchId) {
+    params.set("batch", batchId);
+  } else {
+    params.delete("batch");
+  }
+  if (state.entryLoadAll) {
+    params.set("load_all", "1");
+  } else {
+    params.delete("load_all");
+  }
   window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
 }
 
@@ -6955,25 +7577,42 @@ async function jumpToEntryDate() {
   syncEntryDateJumpControl(state.entries.length ? `Showing ${state.entries.length} entries for ${label}.` : `No entries found for ${label}.`);
 }
 
-async function loadMoreEntries() {
+function entryPageParams(offset) {
+  const filter = document.getElementById("filter").value;
+  const params = new URLSearchParams();
+  params.set("status", filter);
+  params.set("limit", String(state.entryLimit));
+  params.set("offset", String(offset));
+  for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
+  for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
+  return params;
+}
+
+function appendEntryPage(payload) {
+  state.entries = state.entries.concat((payload.entries || []).filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id)));
+  state.entryOffset += (payload.entries || []).length || state.entryLimit;
+  state.entryHasMore = Boolean(payload.has_more);
+}
+
+async function loadMoreEntries(loadAll = false) {
   if (!state.entryHasMore || state.entryLoadingMore) return;
   state.entryLoadingMore = true;
+  state.entryLoadingAll = Boolean(loadAll);
   renderEntryPaging();
   try {
-    const filter = document.getElementById("filter").value;
-    const params = new URLSearchParams();
-    params.set("status", filter);
-    params.set("limit", String(state.entryLimit));
-    params.set("offset", String(state.entryOffset));
-    for (const entryId of activeEntryIds()) params.append("entry_id", entryId);
-    for (const entryDate of activeEntryDates()) params.append("entry_date", entryDate);
-    const payload = await fetchJson(`/api/entries?${params.toString()}`);
-    state.entries = state.entries.concat((payload.entries || []).filter(entry => !state.suppressedCommittedEntryIds.has(entry.entry_id)));
-    state.entryOffset = state.entries.length;
-    state.entryHasMore = Boolean(payload.has_more);
+    do {
+      const payload = await fetchJson(`/api/entries?${entryPageParams(state.entryOffset).toString()}`);
+      appendEntryPage(payload);
+      if (loadAll) {
+        renderEntries();
+        renderEntryPaging();
+        renderBatchSummary();
+      }
+    } while (loadAll && state.entryHasMore);
     renderEntries();
   } finally {
     state.entryLoadingMore = false;
+    state.entryLoadingAll = false;
     renderEntryPaging();
   }
 }
@@ -6995,18 +7634,18 @@ function renderEntries() {
   const list = document.getElementById("entryList");
   list.innerHTML = "";
 	  state.entries.forEach((entry, index) => {
-	    const item = document.createElement("div");
-	    item.className = `entry-item ${entry.entry_id === state.selectedEntryId ? "active" : ""}`;
-	    item.dataset.entryId = entry.entry_id;
-	    const thumb = entry.source_token
-	      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
-	      : `<div class="entry-thumb"></div>`;
+		    const item = document.createElement("div");
+		    item.className = `entry-item ${entry.entry_id === state.selectedEntryId ? "active" : ""}`;
+		    item.dataset.entryId = entry.entry_id;
+		    const thumb = entry.source_token
+		      ? `<img class="entry-thumb" src="/image/${encodeURIComponent(entry.source_token)}?max=96" loading="lazy" decoding="async" alt="">`
+		      : `<div class="entry-thumb"></div>`;
 	    const hasPendingLink = entryHasPendingCommit(entry);
 	    const people = peopleScript(entry.people_names);
-	    item.innerHTML = `
-	      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
-	      ${thumb}
-	      <button class="entry-button" type="button" aria-label="Open ${escapeHtml(entry.entry_date)}">
+		    item.innerHTML = `
+		      <input class="entry-check" type="checkbox" data-index="${index}" data-entry-id="${escapeHtml(entry.entry_id)}" ${state.selectedEntryIds.has(entry.entry_id) ? "checked" : ""}>
+		      <button class="entry-thumb-button" type="button" aria-label="Open ${escapeHtml(entry.entry_date)} target photo">${thumb}</button>
+		      <button class="entry-button" type="button" aria-label="Open ${escapeHtml(entry.entry_date)}">
 	        <div class="entry-row">
           <span class="entry-date">${escapeHtml(entry.entry_date)}</span>
           <span class="badge ${entry.status}">${escapeHtml(statusLabel(entry.status))}</span>
@@ -7018,9 +7657,11 @@ function renderEntries() {
 	    `;
     const checkbox = item.querySelector(".entry-check");
     checkbox.onchange = event => toggleEntrySelection(entry.entry_id, index, event.shiftKey, checkbox.checked);
-    checkbox.onclick = event => event.stopPropagation();
-    const button = item.querySelector(".entry-button");
-    button.onclick = () => loadEntry(entry.entry_id);
+	    checkbox.onclick = event => event.stopPropagation();
+	    const thumbButton = item.querySelector(".entry-thumb-button");
+	    thumbButton.onclick = () => loadEntry(entry.entry_id);
+	    const button = item.querySelector(".entry-button");
+	    button.onclick = () => loadEntry(entry.entry_id);
     const commitButton = item.querySelector('[data-action="commit-entry"]');
     if (commitButton) {
       commitButton.onclick = event => {
@@ -7083,14 +7724,18 @@ function renderEntryPaging() {
   const panel = document.getElementById("entryPaging");
   const summary = document.getElementById("entryPagingSummary");
   const button = document.getElementById("loadMoreEntries");
-  if (!panel || !summary || !button) return;
+  const loadAllButton = document.getElementById("loadAllEntries");
+  if (!panel || !summary || !button || !loadAllButton) return;
   panel.hidden = !state.entries.length && !state.entryHasMore;
   summary.textContent = state.entryHasMore
     ? `${state.entries.length} matching entries loaded. More entries available.`
     : `All ${state.entries.length} matching entries loaded.`;
   button.hidden = !state.entryHasMore;
+  loadAllButton.hidden = !state.entryHasMore;
   button.disabled = state.entryLoadingMore;
-  button.textContent = state.entryLoadingMore ? "Loading..." : "Load more";
+  loadAllButton.disabled = state.entryLoadingMore;
+  button.textContent = state.entryLoadingMore && !state.entryLoadingAll ? "Loading..." : "Load more";
+  loadAllButton.textContent = state.entryLoadingAll ? "Loading..." : "Load all";
 }
 
 async function loadEntry(entryId) {
@@ -7211,6 +7856,7 @@ function renderEmpty() {
   document.getElementById("entrySubhead").textContent = "";
   document.getElementById("entryPosition").textContent = "";
   document.getElementById("sourceImage").removeAttribute("src");
+  updateSourceDragSurface(null);
   document.getElementById("sourceMeta").textContent = "";
   document.getElementById("candidateSummary").textContent = "";
   renderCandidateEvidenceFilter([]);
@@ -7239,12 +7885,15 @@ function renderEntryDetail() {
   const sourceImage = document.getElementById("sourceImage");
   if (entry.source_token) {
     sourceImage.src = `/image/${entry.source_token}?max=1280`;
+    updateSourceDragSurface(entry);
   } else {
     sourceImage.removeAttribute("src");
+    updateSourceDragSurface(null);
   }
   const priorMatcher = formatPriorMatcher(entry);
   const sourceFacts = formatPhotoFacts(entry.source_file_type, entry.source_byte_size, entry.source_dimensions);
   const sourceParts = [escapeHtml(entry.entry_id)];
+  if (entry.status === "fallback") sourceParts.push("Project365 fallback: no external original linked.");
   if (sourceFacts) sourceParts.push(escapeHtml(sourceFacts));
   if (entry.people_names?.length) sourceParts.push(peopleScript(entry.people_names));
   if (priorMatcher) sourceParts.push(priorMatcher);
@@ -7413,12 +8062,12 @@ function candidateIsGeneratedAddition(candidate) {
 }
 
 function linkButtonLabel(candidate) {
-  if (candidate.selected) return "Main";
+  if (candidate.selected) return "Already main";
   return candidate.associated ? "Linked" : "Link";
 }
 
 function linkButtonTitle(candidate) {
-  if (candidate.selected) return "This is the main image selected for this diary entry";
+  if (candidate.selected) return "Already selected as the main image for this diary entry";
   if (candidate.associated) return "This is linked as a supplemental attachment. Click to unlink it.";
   return "Link this as a supplemental attachment for this diary entry";
 }
@@ -8870,11 +9519,15 @@ async function commitEntryDecision(entryId, button = null) {
       body: JSON.stringify({entry_id: entryId})
     });
     const skipped = Number(result.skipped_unknown_media_count || 0);
+    const removedUnknown = Number(result.removed_unknown_media_entries || 0);
     const skippedText = skipped
       ? ` Skipped ${skipped} decision${skipped === 1 ? "" : "s"} because this target is not in the database.`
       : "";
+    const removedUnknownText = removedUnknown
+      ? ` Removed ${removedUnknown} missing target entr${removedUnknown === 1 ? "y" : "ies"} from the queue.`
+      : "";
     document.getElementById("crawlStatus").textContent =
-      `Committed ${result.selected_count || 0} linked original.${skippedText} ${result.remaining_entries || 0} entries remain.`;
+      `Committed ${result.selected_count || 0} linked original.${skippedText}${removedUnknownText} ${result.remaining_entries || 0} entries remain.`;
     if (!Number(result.applied_count || 0)) {
       await loadSummary();
       await loadBatches();
@@ -8911,11 +9564,15 @@ async function applyDecisions() {
       body: JSON.stringify({confirm_apply_decisions: "apply-reviewed-decisions"})
     });
     const skipped = Number(result.skipped_unknown_media_count || 0);
+    const removedUnknown = Number(result.removed_unknown_media_entries || 0);
     const skippedText = skipped
       ? ` Skipped ${skipped} decision${skipped === 1 ? "" : "s"} for test/missing target entries that are not in the database.`
       : "";
+    const removedUnknownText = removedUnknown
+      ? ` Removed ${removedUnknown} missing target entr${removedUnknown === 1 ? "y" : "ies"} from the queue.`
+      : "";
     document.getElementById("crawlStatus").textContent =
-      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.associated_count || 0} linked, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback.${skippedText} ${result.remaining_entries || 0} entries remain.`;
+      `Applied ${result.applied_count || 0}: ${result.selected_count || 0} selected, ${result.associated_count || 0} linked, ${result.rejected_count || 0} rejected, ${result.fallback_count || 0} fallback.${skippedText}${removedUnknownText} ${result.remaining_entries || 0} entries remain.`;
     await loadSummary();
     await loadBatches();
     state.entryDetailCache.clear();
@@ -9279,6 +9936,7 @@ function explicitEntryScopeActive() {
 }
 
 function changeBatchFilter() {
+  setEntryLoadAllUrl(false);
   syncBatchFilterState();
   state.selectedEntryIds.clear();
   state.lastCheckedIndex = null;
@@ -9320,6 +9978,7 @@ function clearBatchFilter() {
 function clearUrlEntryScope(status = "needs_action") {
   state.urlEntryIds = [];
   state.urlEntryDates = [];
+  state.entryLoadAll = false;
   replaceEntryDateScopeUrl([], status);
   syncEntryDateJumpControl();
 }
@@ -9426,11 +10085,10 @@ function chooseLinkedPhoto() {
     `Opened linked-photo drop window for ${state.currentEntry.entry_date}.`;
 }
 
-async function handleLinkedDropWindowMessage(event) {
-  const message = event.data || {};
-  if (message.type !== "project365-linked-photo") return;
-  if (!message.entry_id) return;
+async function refreshLinkedPhotoEntry(message) {
+  if (!message?.entry_id) return;
   if (state.currentEntry && state.currentEntry.entry_id !== message.entry_id) return;
+  if (message.stamp) state.lastLinkedPhotoRefreshStamp = String(message.stamp);
   state.entryDetailCache.delete(message.entry_id);
   document.getElementById("crawlStatus").textContent =
     message.status || "Linked photo received. Refreshing the entry.";
@@ -9440,6 +10098,25 @@ async function handleLinkedDropWindowMessage(event) {
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
   }
+}
+
+async function refreshLinkedPhotoEntryFromStorage() {
+  let message = null;
+  try {
+    message = JSON.parse(localStorage.getItem(LINKED_PHOTO_REFRESH_KEY) || "null");
+  } catch (_) {
+    return;
+  }
+  if (!message?.entry_id || !message.stamp) return;
+  if (String(message.stamp) === state.lastLinkedPhotoRefreshStamp) return;
+  await refreshLinkedPhotoEntry(message);
+}
+
+async function handleLinkedDropWindowMessage(event) {
+  if (event.origin !== window.location.origin) return;
+  const message = event.data || {};
+  if (message.type !== "project365-linked-photo") return;
+  await refreshLinkedPhotoEntry(message);
 }
 
 function appendCrawlRoot(path) {
@@ -9516,6 +10193,33 @@ function describePhotoDropTransfer(event) {
     .map(file => `${file.name || "unnamed"} (${file.type || "unknown"}, ${file.size || 0} bytes)`)
     .join(", ") || "none";
   return `This drag exposed: types=${types}; items=${items}; files=${files}.`;
+}
+
+function droppedFileIsVideo(file) {
+  const type = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
+  return /\\.(mov|mp4|m4v)$/i.test(file?.name || "") ||
+    ["video/quicktime", "video/mp4", "video/x-m4v"].includes(type);
+}
+
+function droppedFileIsImage(file) {
+  const type = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
+  return type.startsWith("image/") ||
+    /\\.(avif|avifs|bmp|gif|heic|heif|jpe?g|png|tiff?|webp)$/i.test(file?.name || "");
+}
+
+function droppedLivePhotoStillFile(files) {
+  const images = files.filter(droppedFileIsImage);
+  const videos = files.filter(droppedFileIsVideo);
+  if (images.length === 1 && videos.length > 0) return images[0];
+  return null;
+}
+
+function linkedPhotoDropFiles(files) {
+  const livePhotoStill = droppedLivePhotoStillFile(files);
+  if (livePhotoStill) return [livePhotoStill];
+  const images = files.filter(droppedFileIsImage);
+  if (images.length) return images;
+  return files.length === 1 ? [files[0]] : [];
 }
 
 function isLinkDrag(event) {
@@ -9919,7 +10623,7 @@ async function discardVideoFrameSession(review) {
   }
 }
 
-async function closeVideoFrameChooser() {
+function closeVideoFrameChooser({discard = true} = {}) {
   const review = state.videoFrameReview;
   state.videoFramePendingToken = "";
   const modal = document.getElementById("videoFrameModal");
@@ -9930,7 +10634,7 @@ async function closeVideoFrameChooser() {
   player.removeAttribute("src");
   player.load();
   state.videoFrameReview = null;
-  await discardVideoFrameSession(review);
+  if (discard) void discardVideoFrameSession(review);
 }
 
 async function saveVideoFrameChoices() {
@@ -9946,7 +10650,10 @@ async function saveVideoFrameChoices() {
   }
   const saveButton = document.getElementById("videoFrameSave");
   saveButton.disabled = true;
+  const originalSaveLabel = saveButton.textContent;
+  saveButton.textContent = "Saving...";
   document.getElementById("crawlStatus").textContent = "Saving selected movie screenshots.";
+  document.getElementById("videoFrameHelp").textContent = "Saving selected movie screenshots.";
   try {
     const detail = await fetchJson("/api/import-video-frames", {
       method: "POST",
@@ -9958,7 +10665,7 @@ async function saveVideoFrameChoices() {
         supplemental_frame_ids: supplementalFrames
       })
     });
-    await closeVideoFrameChooser();
+    closeVideoFrameChooser({discard: false});
     state.entryDetailCache.delete(review.currentEntryId);
     state.currentEntry = detail;
     const entrySummary = state.entries.find(item => item.entry_id === detail.entry_id);
@@ -9987,7 +10694,9 @@ async function saveVideoFrameChoices() {
     scheduleSummaryRefresh();
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
+    document.getElementById("videoFrameHelp").textContent = error.message;
   } finally {
+    saveButton.textContent = originalSaveLabel;
     saveButton.disabled = false;
   }
 }
@@ -10003,15 +10712,23 @@ async function handlePhotoDrop(event) {
     return;
   }
   if (files.length !== 1) {
+    const livePhotoStill = droppedLivePhotoStillFile(files);
+    if (livePhotoStill) {
+      await importDroppedPhotoFile(livePhotoStill, entry);
+      return;
+    }
     document.getElementById("crawlStatus").textContent =
-      `Safari did not expose one usable image file for this drop. ` +
+      `Safari did not expose one usable photo or movie file for this drop. ` +
       `Try Open drop window, or export from Photos to Finder first. ${describePhotoDropTransfer(event)}`;
     return;
   }
-  const file = files[0];
+  await importDroppedPhotoFile(files[0], entry);
+}
+
+async function importDroppedPhotoFile(file, entry) {
   const currentEntryId = entry.entry_id;
   const nextEntryId = nextEntryIdAfterCurrent();
-  const isVideoDrop = /\\.(mov|mp4|m4v)$/i.test(file.name || "");
+  const isVideoDrop = droppedFileIsVideo(file);
   const videoDropToken = isVideoDrop ? showVideoFrameProcessing(entry, file) : "";
   document.getElementById("crawlStatus").textContent =
     isVideoDrop ? `Preparing screenshots from ${file.name || "the dropped movie"}.` : `Copying dropped photo for ${entry.entry_date}.`;
@@ -10061,16 +10778,26 @@ async function handleLinkDrop(event) {
   }
   const entry = state.currentEntry;
   const files = Array.from(event.dataTransfer?.files || []);
+  const filesToImport = linkedPhotoDropFiles(files);
   const candidatePath = droppedLinkPath(event);
-  if (!candidatePath && files.length !== 1) {
+  if (!candidatePath && !filesToImport.length) {
     const types = Array.from(event.dataTransfer?.types || []).join(", ") || "none";
     document.getElementById("crawlStatus").textContent =
-      `Drop one image file or a local file path. This drag exposed: ${types}.`;
+      `Drop one or more image files, or a local file path. This drag exposed: ${types}.`;
     return;
   }
   try {
-    if (candidatePath) await linkCandidatePath(candidatePath, true);
-    else await importLinkedFile(files[0], entry);
+    if (filesToImport.length > 1) {
+      document.getElementById("crawlStatus").textContent =
+        `Copying ${filesToImport.length} dropped photos as associated attachments for ${entry.entry_date}.`;
+      for (const file of filesToImport) await importLinkedFile(file, entry);
+      document.getElementById("crawlStatus").textContent =
+        `Dropped ${filesToImport.length} photos linked as associated attachments for ${entry.entry_date}.`;
+    } else if (candidatePath) {
+      await linkCandidatePath(candidatePath, true);
+    } else {
+      await importLinkedFile(filesToImport[0], entry);
+    }
   } catch (error) {
     document.getElementById("crawlStatus").textContent = error.message;
   }
@@ -10080,6 +10807,7 @@ function shouldHandleFallbackLinkDrop(event) {
   if (!state.currentEntry) return false;
   const target = event.target;
   if (target?.closest?.("#photoDropTarget")) return false;
+  if (target?.closest?.("#sourceFrame")) return false;
   if (target?.closest?.("input, textarea, select, button, a")) return false;
   return Boolean(target?.closest?.(".workspace, .main, #photoLinkDropTarget"));
 }
@@ -10107,6 +10835,12 @@ let photoDropDragDepth = 0;
 let photoLinkDragDepth = 0;
 document.getElementById("loadMoreEntries").onclick = () => {
   loadMoreEntries().catch(error => {
+    document.getElementById("summary").textContent = error.message;
+  });
+};
+document.getElementById("loadAllEntries").onclick = () => {
+  setEntryLoadAllUrl(true);
+  loadMoreEntries(true).catch(error => {
     document.getElementById("summary").textContent = error.message;
   });
 };
@@ -10150,6 +10884,18 @@ document.addEventListener("dragover", activateFallbackLinkDrop, true);
 document.addEventListener("dragleave", clearFallbackLinkDrop, true);
 document.addEventListener("drop", handleFallbackLinkDrop, true);
 window.addEventListener("message", handleLinkedDropWindowMessage);
+window.addEventListener("storage", event => {
+  if (event.key === LINKED_PHOTO_REFRESH_KEY) {
+    refreshLinkedPhotoEntryFromStorage().catch(error => {
+      document.getElementById("crawlStatus").textContent = error.message;
+    });
+  }
+});
+window.addEventListener("focus", () => {
+  refreshLinkedPhotoEntryFromStorage().catch(error => {
+    document.getElementById("crawlStatus").textContent = error.message;
+  });
+});
 document.addEventListener("keydown", handlePickerKeyboardShortcut);
 
 function escapeHtml(value) {
@@ -10174,6 +10920,7 @@ function applyUrlFilters() {
   state.urlEntryIds = params.getAll("entry_id").flatMap(splitFilterValue);
   state.urlEntryDates = params.getAll("entry_date").flatMap(splitFilterValue);
   state.initialBatchId = params.get("batch") || "";
+  state.entryLoadAll = params.get("load_all") === "1";
   const scopedDateLabel = entryDateScopeLabel(state.urlEntryDates);
   syncEntryDateJumpControl(scopedDateLabel ? `Showing ${scopedDateLabel}.` : "");
   if (params.has("photo_index_folder")) {
@@ -10371,6 +11118,33 @@ function describeTransfer(transfer) {
   ].join("\\n");
 }
 
+function droppedFileIsVideo(file) {
+  const type = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
+  return /\\.(mov|mp4|m4v)$/i.test(file?.name || "") ||
+    ["video/quicktime", "video/mp4", "video/x-m4v"].includes(type);
+}
+
+function droppedFileIsImage(file) {
+  const type = String(file?.type || "").split(";", 1)[0].trim().toLowerCase();
+  return type.startsWith("image/") ||
+    /\\.(avif|avifs|bmp|gif|heic|heif|jpe?g|png|tiff?|webp)$/i.test(file?.name || "");
+}
+
+function droppedLivePhotoStillFile(files) {
+  const images = files.filter(droppedFileIsImage);
+  const videos = files.filter(droppedFileIsVideo);
+  if (images.length === 1 && videos.length > 0) return images[0];
+  return null;
+}
+
+function linkedPhotoDropFiles(files) {
+  const livePhotoStill = droppedLivePhotoStillFile(files);
+  if (livePhotoStill) return [livePhotoStill];
+  const images = files.filter(droppedFileIsImage);
+  if (images.length) return images;
+  return files.length === 1 ? [files[0]] : [];
+}
+
 function droppedLinkPath(transfer) {
   const text = [
     "text/uri-list",
@@ -10397,13 +11171,19 @@ function droppedLinkPath(transfer) {
 }
 
 function notifyParent(detail, message) {
+  const payload = {
+    type: "project365-linked-photo",
+    entry_id: detail.entry_id || entryId,
+    status: message,
+    stamp: String(Date.now())
+  };
+  try {
+    localStorage.setItem("project365-linked-photo-refresh", JSON.stringify(payload));
+  } catch (_) {
+  }
   if (!window.opener) return;
   try {
-    window.opener.postMessage({
-      type: "project365-linked-photo",
-      entry_id: detail.entry_id || entryId,
-      status: message
-    }, window.location.origin);
+    window.opener.postMessage(payload, window.location.origin);
   } catch (_) {
   }
 }
@@ -10434,6 +11214,7 @@ async function linkCandidatePath(candidatePath) {
 
 async function handleDrop(event) {
   event.preventDefault();
+  event.stopPropagation();
   dropZone.classList.remove("active");
   if (!entryId) {
     setStatus("No Project365 entry was provided to this drop window.", "bad");
@@ -10441,12 +11222,16 @@ async function handleDrop(event) {
   }
   const transfer = event.dataTransfer;
   const files = Array.from(transfer?.files || []);
+  const filesToImport = linkedPhotoDropFiles(files);
   const candidatePath = droppedLinkPath(transfer);
   setStatus(`Received drop.\\n${describeTransfer(transfer)}`);
   try {
     let detail = null;
-    if (files.length === 1) {
-      detail = await importLinkedFile(files[0]);
+    if (filesToImport.length) {
+      setStatus(
+        `Copying ${filesToImport.length} linked photo${filesToImport.length === 1 ? "" : "s"}.\\n${describeTransfer(transfer)}`
+      );
+      for (const file of filesToImport) detail = await importLinkedFile(file);
     } else if (candidatePath) {
       detail = await linkCandidatePath(candidatePath);
     } else {
@@ -10456,7 +11241,10 @@ async function handleDrop(event) {
       );
       return;
     }
-    const message = `Linked as associated attachment for ${detail.entry_date || entryDate || entryId}.`;
+    const count = filesToImport.length || 1;
+    const message = count === 1
+      ? `Linked as associated attachment for ${detail.entry_date || entryDate || entryId}.`
+      : `Linked ${count} associated attachments for ${detail.entry_date || entryDate || entryId}.`;
     setStatus(message, "good");
     notifyParent(detail, message);
   } catch (error) {
@@ -10466,6 +11254,7 @@ async function handleDrop(event) {
 
 function activateDrop(event) {
   event.preventDefault();
+  event.stopPropagation();
   dropZone.classList.add("active");
   if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 }
@@ -10478,6 +11267,9 @@ dropZone.addEventListener("dragenter", activateDrop);
 dropZone.addEventListener("dragover", activateDrop);
 dropZone.addEventListener("dragleave", clearDrop);
 dropZone.addEventListener("drop", handleDrop);
+window.addEventListener("dragenter", activateDrop, true);
+window.addEventListener("dragover", activateDrop, true);
+window.addEventListener("drop", handleDrop, true);
 document.addEventListener("dragover", activateDrop);
 document.addEventListener("drop", handleDrop);
 </script>

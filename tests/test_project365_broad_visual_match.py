@@ -2739,6 +2739,68 @@ class Project365BroadVisualMatchTests(unittest.TestCase):
         self.assertEqual(row, ("external_original_reference", str(candidate_path.resolve()), "confirmed"))
         self.assertEqual(remaining["returned_count"], 0)
 
+    def test_fallback_target_run_can_confirm_better_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = base / "Project365Canonical"
+            canonical_root.mkdir()
+            candidate_root = base / "candidates"
+            candidate_root.mkdir()
+            db_path = canonical_root / "broad_visual_match.sqlite"
+            pixels = _make_gradient_pixels(100, 40)
+            source_pixels = _crop(pixels, 100, 55, 0, 40, 40)
+            source_path = base / "project365.bmp"
+            candidate_path = candidate_root / "better-original.bmp"
+            _write_bmp(source_path, 40, 40, source_pixels)
+            _write_bmp(candidate_path, 100, 40, pixels)
+            _write_canonical_db(canonical_root / "canonical.db", source_path)
+            _insert_broad_fallback(canonical_root / "canonical.db", "project365:1998-04-12")
+            broad.build_descriptor_index(canonical_root, db_path, [candidate_root], density=11)
+
+            default_targets = broad._target_rows(
+                canonical_root / "canonical.db",
+                {"entry_ids": ["project365:1998-04-12"]},
+            )
+            fallback_targets = broad._target_rows(
+                canonical_root / "canonical.db",
+                {
+                    "entry_ids": ["project365:1998-04-12"],
+                    "include_fallback_targets": True,
+                },
+            )
+            match_summary = broad.run_match_batch(
+                canonical_root,
+                db_path,
+                {
+                    "entry_ids": ["project365:1998-04-12"],
+                    "include_fallback_targets": True,
+                },
+                density=11,
+            )
+            review_page = broad.review_entries(canonical_root, db_path, run_id=match_summary.run_id)
+            result = review_page["entries"][0]["results"][0]
+            confirm_summary = broad.confirm_broad_match(
+                canonical_root=canonical_root,
+                db_path=db_path,
+                result_id=int(result["result_id"]),
+            )
+            remaining = broad.review_entries(canonical_root, db_path, run_id=match_summary.run_id)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                fallback_count = connection.execute(
+                    "SELECT COUNT(*) FROM media_assets WHERE role = 'external_original_fallback'"
+                ).fetchone()[0]
+                original_path = connection.execute(
+                    "SELECT storage_path FROM media_assets WHERE role = 'external_original_reference'"
+                ).fetchone()[0]
+
+        self.assertEqual(default_targets, [])
+        self.assertEqual(len(fallback_targets), 1)
+        self.assertEqual(review_page["returned_count"], 1)
+        self.assertEqual(confirm_summary["decision"], "matched")
+        self.assertEqual(fallback_count, 0)
+        self.assertEqual(original_path, str(candidate_path.resolve()))
+        self.assertEqual(remaining["returned_count"], 0)
+
     def test_confirm_broad_match_refuses_to_overwrite_completed_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -3114,6 +3176,25 @@ def _insert_unresolved_entry(
                 str(source_path),
                 _sha256(source_path),
                 source_path.stat().st_size,
+            ),
+        )
+        connection.commit()
+
+
+def _insert_broad_fallback(db_path: Path, entry_id: str) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO media_assets
+                (id, entry_id, role, internal_filename, storage_path, sha256, byte_size, mime_type, review_status)
+            VALUES (?, ?, 'external_original_fallback', ?, '', ?, 0,
+                'application/x-project365-fallback', 'confirmed')
+            """,
+            (
+                f"{entry_id}:external_original_fallback",
+                entry_id,
+                f"{entry_id}:external_original_fallback",
+                "fallback-sha",
             ),
         )
         connection.commit()

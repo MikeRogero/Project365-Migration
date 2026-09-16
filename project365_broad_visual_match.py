@@ -337,6 +337,7 @@ def _add_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--broad-search-needed-list", default="")
+    parser.add_argument("--include-fallback-targets", action="store_true")
 
 
 def target_scope_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -345,6 +346,7 @@ def target_scope_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "start_date": str(args.start_date or ""),
         "end_date": str(args.end_date or ""),
         "broad_search_needed_list": str(args.broad_search_needed_list or ""),
+        "include_fallback_targets": bool(args.include_fallback_targets),
     }
 
 
@@ -2705,6 +2707,7 @@ def _review_visibility_summary(
 ) -> dict[str, int]:
     connection = connect_broad_db(db_path)
     try:
+        include_fallback_targets = _match_run_includes_fallback_targets(connection, run_id)
         result_entry_ids = {
             str(row[0])
             for row in connection.execute(
@@ -2731,7 +2734,7 @@ def _review_visibility_summary(
                     SELECT DISTINCT entry_id
                     FROM canonical_db.media_assets
                     WHERE entry_id IN ({placeholders})
-                        AND role IN ('external_original_reference', 'external_original_fallback')
+                        AND role IN ({_completed_review_role_placeholders(include_fallback_targets)})
                         AND review_status = 'confirmed'
                     """,
                     sorted(result_entry_ids),
@@ -2840,6 +2843,7 @@ def review_entries(
         if not effective_run_id:
             return {"run_id": "", "entries": [], "returned_count": 0, "has_more": False, "offset": offset, "limit": limit}
         candidate_scope = _match_run_candidate_scope(connection, effective_run_id)
+        include_fallback_targets = _match_run_includes_fallback_targets(connection, effective_run_id)
         _attach_canonical_db(connection, canonical_root / "canonical.db")
         where = ["run_id = ?"]
         params: list[Any] = [effective_run_id]
@@ -2861,7 +2865,7 @@ def review_entries(
                     SELECT 1
                     FROM canonical_db.media_assets AS confirmed
                     WHERE confirmed.entry_id = broad_match_results.entry_id
-                        AND confirmed.role IN ('external_original_reference', 'external_original_fallback')
+                        AND confirmed.role IN ({_completed_review_role_placeholders(include_fallback_targets)})
                         AND confirmed.review_status = 'confirmed'
                 )
                 AND EXISTS (
@@ -3082,7 +3086,11 @@ def confirm_broad_match(
         )
         if not result:
             raise ValueError("Unknown broad visual result.")
-        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", str(result["entry_id"])):
+        if _canonical_entry_has_completed_external_decision(
+            canonical_root / "canonical.db",
+            str(result["entry_id"]),
+            include_fallback=False,
+        ):
             raise ValueError("This entry already has a confirmed original-photo decision.")
         _upsert_canonical_media_decision(
             canonical_root / "canonical.db",
@@ -3131,7 +3139,11 @@ def reject_broad_entry(
         effective_run_id = run_id.strip() or _current_match_run_id(connection, slot)
         if not effective_run_id:
             raise ValueError("No broad visual search run is available.")
-        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", entry_text):
+        if _canonical_entry_has_completed_external_decision(
+            canonical_root / "canonical.db",
+            entry_text,
+            include_fallback=False,
+        ):
             raise ValueError("This entry already has a confirmed original-photo decision.")
         rows = [
             _single_dict(row)
@@ -3194,7 +3206,11 @@ def keep_project365_export_for_broad_entry(
         effective_run_id = run_id.strip() or _current_match_run_id(connection, slot)
         if not effective_run_id:
             raise ValueError("No broad visual search run is available.")
-        if _canonical_entry_has_completed_external_decision(canonical_root / "canonical.db", entry_text):
+        if _canonical_entry_has_completed_external_decision(
+            canonical_root / "canonical.db",
+            entry_text,
+            include_fallback=False,
+        ):
             raise ValueError("This entry already has a confirmed original-photo decision.")
         row = _single_dict(
             connection.execute(
@@ -3530,6 +3546,29 @@ def _exclude_rejected_candidates(
     return filtered
 
 
+def _completed_review_role_placeholders(include_fallback_targets: bool) -> str:
+    roles = ["'external_original_reference'"]
+    if not include_fallback_targets:
+        roles.append("'external_original_fallback'")
+    return ", ".join(roles)
+
+
+def _match_run_includes_fallback_targets(connection: sqlite3.Connection, run_id: str) -> bool:
+    row = connection.execute(
+        "SELECT target_scope_json FROM broad_match_runs WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        scope = json.loads(str(row[0] or "{}"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(scope, dict):
+        return False
+    return bool(scope.get("include_fallback_targets"))
+
+
 def _target_rows(db_path: Path, scope: dict[str, Any]) -> list[dict[str, str]]:
     entry_ids = set(str(value).strip() for value in scope.get("entry_ids", []) if str(value).strip())
     list_path = str(scope.get("broad_search_needed_list", "") or "").strip()
@@ -3538,6 +3577,7 @@ def _target_rows(db_path: Path, scope: dict[str, Any]) -> list[dict[str, str]]:
     start_date = str(scope.get("start_date", "") or "").strip()
     end_date = str(scope.get("end_date", "") or "").strip()
     start_bound, end_bound = _scope_date_bounds(start_date, end_date)
+    include_fallback_targets = bool(scope.get("include_fallback_targets"))
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -3549,11 +3589,23 @@ def _target_rows(db_path: Path, scope: dict[str, Any]) -> list[dict[str, str]]:
                 SELECT 1
                 FROM media_assets AS confirmed
                 WHERE confirmed.entry_id = entries.id
-                    AND confirmed.role IN ('external_original_reference', 'external_original_fallback')
+                    AND confirmed.role IN ({completed_roles})
                     AND confirmed.review_status = 'confirmed'
             )
-            """,
+            """.format(completed_roles=_completed_review_role_placeholders(include_fallback_targets)),
         ]
+        if include_fallback_targets:
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM media_assets AS fallback
+                    WHERE fallback.entry_id = entries.id
+                        AND fallback.role = 'external_original_fallback'
+                        AND fallback.review_status = 'confirmed'
+                )
+                """
+            )
         params: list[Any] = []
         if entry_ids:
             placeholders = ", ".join("?" for _ in entry_ids)
@@ -5098,21 +5150,29 @@ def _delete_canonical_broad_decision(
         connection.close()
 
 
-def _canonical_entry_has_completed_external_decision(canonical_db: Path, entry_id: str) -> bool:
+def _canonical_entry_has_completed_external_decision(
+    canonical_db: Path,
+    entry_id: str,
+    include_fallback: bool = True,
+) -> bool:
     if not canonical_db.exists():
         return False
+    roles = ["external_original_reference"]
+    if include_fallback:
+        roles.append("external_original_fallback")
     connection = sqlite3.connect(canonical_db)
     try:
+        placeholders = ", ".join("?" for _ in roles)
         row = connection.execute(
-            """
+            f"""
             SELECT 1
             FROM media_assets
             WHERE entry_id = ?
-                AND role IN ('external_original_reference', 'external_original_fallback')
+                AND role IN ({placeholders})
                 AND review_status = 'confirmed'
             LIMIT 1
             """,
-            (entry_id,),
+            (entry_id, *roles),
         ).fetchone()
     finally:
         connection.close()
@@ -5205,6 +5265,14 @@ def _upsert_canonical_media_decision(
                 DELETE FROM media_assets
                 WHERE entry_id = ?
                     AND role = 'external_original_rejected'
+                """,
+                (entry_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM media_assets
+                WHERE entry_id = ?
+                    AND role = 'external_original_fallback'
                 """,
                 (entry_id,),
             )
