@@ -138,11 +138,18 @@ def load_image(path: Path) -> ImagePixels:
         return _read_bmp(path)
     with tempfile.TemporaryDirectory() as temp_dir:
         errors = []
-        for converter in (_convert_to_bmp_with_sips, _convert_to_bmp_with_magick):
+        for converter in (
+            _convert_to_bmp_with_sips,
+            _convert_to_bmp_with_quicklook,
+            _convert_to_bmp_with_magick,
+        ):
             bmp_path = Path(temp_dir) / f"{converter.__name__}.bmp"
             try:
                 converter(path, bmp_path)
-                return _read_bmp(bmp_path)
+                image = _read_bmp(bmp_path)
+                if _is_unusable_black_conversion(image):
+                    raise RuntimeError("converted image is all black")
+                return image
             except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError, ValueError) as exc:
                 errors.append(f"{converter.__name__}: {exc}")
         raise ValueError(f"Cannot load image for crop estimation: {path}; {'; '.join(errors)}")
@@ -155,6 +162,27 @@ def _convert_to_bmp_with_sips(source_path: Path, output_path: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _convert_to_bmp_with_quicklook(source_path: Path, output_path: Path) -> None:
+    qlmanage_path = shutil.which("qlmanage")
+    if not qlmanage_path:
+        raise RuntimeError("Quick Look thumbnail generator is not installed")
+    preview_dir = output_path.parent / f"{output_path.stem}_quicklook"
+    preview_dir.mkdir()
+    subprocess.run(
+        [qlmanage_path, "-t", "-s", "4096", "-o", str(preview_dir), str(source_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    preview_path = preview_dir / f"{source_path.name}.png"
+    if not preview_path.exists():
+        previews = sorted(preview_dir.glob("*.png"))
+        if not previews:
+            raise RuntimeError("Quick Look did not produce a PNG thumbnail")
+        preview_path = previews[0]
+    _convert_to_bmp_with_sips(preview_path, output_path)
 
 
 def _convert_to_bmp_with_magick(source_path: Path, output_path: Path) -> None:
@@ -202,6 +230,12 @@ def _read_bmp(path: Path) -> ImagePixels:
             blue, green, red = payload[offset : offset + 3]
             gray[row * width_abs + col] = round(0.299 * red + 0.587 * green + 0.114 * blue)
     return ImagePixels(width=width_abs, height=height, gray=gray)
+
+
+def _is_unusable_black_conversion(image: ImagePixels) -> bool:
+    if image.width <= 1 or image.height <= 1:
+        return False
+    return max(image.gray) == 0
 
 
 def _candidate_crop_sizes(width: int, height: int, aspect: float) -> list[tuple[int, int]]:

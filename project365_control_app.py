@@ -3978,7 +3978,12 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 elif parsed.path == "/crop/api/crop-entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     crop_filter = query.get("crop_filter", ["missing"])[0]
-                    entries = state.picker_state().crop_entries(crop_filter=crop_filter)
+                    entries = state.picker_state().crop_entries(
+                        crop_filter=crop_filter,
+                        entry_dates=set(original_picker._query_values(query, "entry_date")),
+                        start_date=query.get("start_date", [""])[0],
+                        end_date=query.get("end_date", [""])[0],
+                    )
                     limit = original_picker._query_int(query, "limit", None)
                     limited_entries = entries[:limit] if limit and limit > 0 else entries
                     self._send_json(
@@ -4067,9 +4072,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path == "/api/crop-estimate-batch":
                     payload = self._read_json()
+                    target_extensions = payload.get("target_extensions")
+                    if not isinstance(target_extensions, list):
+                        target_extensions = []
                     self._send_json(
                         state.picker_state().start_crop_estimate_batch(
-                            apply_estimates=bool(payload.get("apply_estimates"))
+                            apply_estimates=bool(payload.get("apply_estimates")),
+                            refresh_saved_estimates=bool(payload.get("refresh_saved_estimates")),
+                            target_extensions=[str(value) for value in target_extensions],
                         )
                     )
                     return
@@ -4176,10 +4186,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path == "/crop/api/crop":
                     payload = self._read_json()
+                    source = str(payload.get("source", "manual")).strip().lower()
+                    if source not in {"manual", "estimated"}:
+                        source = "manual"
                     detail = state.picker_state().save_crop(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         crop=payload.get("crop") if isinstance(payload.get("crop"), dict) else {},
+                        source=source,
                     )
                     self._send_json(detail)
                     return
@@ -4215,9 +4229,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path in {"/picker/api/crop-estimate-batch", "/crop/api/crop-estimate-batch"}:
                     payload = self._read_json()
+                    target_extensions = payload.get("target_extensions")
+                    if not isinstance(target_extensions, list):
+                        target_extensions = []
                     self._send_json(
                         state.picker_state().start_crop_estimate_batch(
-                            apply_estimates=bool(payload.get("apply_estimates"))
+                            apply_estimates=bool(payload.get("apply_estimates")),
+                            refresh_saved_estimates=bool(payload.get("refresh_saved_estimates")),
+                            target_extensions=[str(value) for value in target_extensions],
                         )
                     )
                     return
@@ -4891,6 +4910,7 @@ def _embedded_crop_html() -> str:
         original_picker.CROP_HTML
         .replace('fetchJson("/api/', 'fetchJson("/crop/api/')
         .replace('fetchJson(`/api/', 'fetchJson(`/crop/api/')
+        .replace('`/api/crop-entries?${params.toString()}`', '`/crop/api/crop-entries?${params.toString()}`')
         .replace('src="/image/${', 'src="/picker/image/${')
         .replace('`/image/${', '`/picker/image/${')
     )

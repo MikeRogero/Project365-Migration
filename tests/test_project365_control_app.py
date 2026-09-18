@@ -2009,7 +2009,9 @@ class Project365ControlAppTests(unittest.TestCase):
         html = control._embedded_crop_html()
 
         self.assertIn('href="/?step=crop_confirmation"', html)
-        self.assertIn('fetchJson(`/crop/api/crop-entries?crop_filter=${encodeURIComponent(cropFilter)}`)', html)
+        self.assertIn("fetchJson(cropEntriesUrl(cropFilter))", html)
+        self.assertIn("`/crop/api/crop-entries?${params.toString()}`", html)
+        self.assertIn('params.set("start_date", state.cropStartDate);', html)
         self.assertIn('fetchJson(`/crop/api/crop-entry/', html)
         self.assertIn('fetchJson("/crop/api/crop"', html)
         self.assertIn('fetchJson("/crop/api/crop-reset"', html)
@@ -2073,6 +2075,7 @@ class Project365ControlAppTests(unittest.TestCase):
                 "candidate_width": 10,
                 "candidate_height": 12,
             },
+            source="manual",
         )
 
     def test_control_routes_crop_reset(self) -> None:
@@ -2177,7 +2180,7 @@ class Project365ControlAppTests(unittest.TestCase):
         thread.start()
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing&limit=1",
+                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing&limit=1&entry_date=1998-04-12&start_date=1998-04-01&end_date=1998-04-30",
                 timeout=5,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
@@ -2200,7 +2203,12 @@ class Project365ControlAppTests(unittest.TestCase):
                 "message": "could not load image for crop estimation",
             },
         )
-        picker_state.crop_entries.assert_called_once_with(crop_filter="missing")
+        picker_state.crop_entries.assert_called_once_with(
+            crop_filter="missing",
+            entry_dates={"1998-04-12"},
+            start_date="1998-04-01",
+            end_date="1998-04-30",
+        )
         picker_state.pending_crop_commits.assert_called_once_with()
         picker_state.latest_crop_estimate_job.assert_called_once_with()
 
@@ -2243,7 +2251,11 @@ class Project365ControlAppTests(unittest.TestCase):
 
         self.assertEqual(picker_state.start_crop_estimate_batch.call_count, 3)
         picker_state.start_crop_estimate_batch.assert_has_calls(
-            [mock.call(apply_estimates=True), mock.call(apply_estimates=True), mock.call(apply_estimates=True)]
+            [
+                mock.call(apply_estimates=True, refresh_saved_estimates=False, target_extensions=[]),
+                mock.call(apply_estimates=True, refresh_saved_estimates=False, target_extensions=[]),
+                mock.call(apply_estimates=True, refresh_saved_estimates=False, target_extensions=[]),
+            ]
         )
         self.assertEqual(picker_state.crop_estimate_job.call_count, 3)
         picker_state.crop_estimate_job.assert_called_with("job-1")

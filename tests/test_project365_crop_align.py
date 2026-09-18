@@ -120,13 +120,50 @@ class Project365CropAlignTests(unittest.TestCase):
                     _write_bmp(output, 1, 1, [(255, 0, 0)])
                 return mock.Mock(returncode=0)
 
-            with mock.patch.object(crop_align.shutil, "which", return_value="/usr/local/bin/magick"):
+            def fake_which(name: str) -> str | None:
+                if name == "magick":
+                    return "/usr/local/bin/magick"
+                return None
+
+            with mock.patch.object(crop_align.shutil, "which", side_effect=fake_which):
                 with mock.patch.object(crop_align.subprocess, "run", side_effect=fake_run) as run:
                     image = crop_align.load_image(source_path)
 
             self.assertEqual(image.width, 1)
             self.assertEqual(image.height, 1)
             self.assertEqual(run.call_count, 2)
+
+    def test_load_image_falls_back_when_sips_writes_black_bmp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "sample.heic"
+            source_path.write_bytes(b"not-real-heic")
+
+            def fake_run(command: list[str], **_kwargs: object) -> mock.Mock:
+                if command[0] == "sips" and Path(command[4]).suffix == ".heic":
+                    _write_bmp(Path(command[-1]), 2, 2, [(0, 0, 0)] * 4)
+                    return mock.Mock(returncode=0)
+                if command[0] == "/usr/bin/qlmanage":
+                    preview_dir = Path(command[5])
+                    _write_bmp(preview_dir / f"{source_path.name}.png", 2, 2, [(0, 0, 0)] * 4)
+                    return mock.Mock(returncode=0)
+                if command[0] == "sips":
+                    _write_bmp(Path(command[-1]), 2, 2, [(0, 0, 0), (80, 80, 80), (160, 160, 160), (255, 255, 255)])
+                    return mock.Mock(returncode=0)
+                raise AssertionError(command)
+
+            def fake_which(name: str) -> str | None:
+                if name == "qlmanage":
+                    return "/usr/bin/qlmanage"
+                return None
+
+            with mock.patch.object(crop_align.shutil, "which", side_effect=fake_which):
+                with mock.patch.object(crop_align.subprocess, "run", side_effect=fake_run) as run:
+                    image = crop_align.load_image(source_path)
+
+            self.assertEqual(image.width, 2)
+            self.assertEqual(image.height, 2)
+            self.assertGreater(max(image.gray), 0)
+            self.assertEqual(run.call_count, 3)
 
 
 def _make_gradient_pixels(width: int, height: int) -> list[tuple[int, int, int]]:

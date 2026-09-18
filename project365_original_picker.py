@@ -815,7 +815,13 @@ class PickerState:
             mark_estimated_viewed=mark_estimated_viewed,
         )
 
-    def crop_entries(self, crop_filter: str = "missing") -> list[dict[str, Any]]:
+    def crop_entries(
+        self,
+        crop_filter: str = "missing",
+        entry_dates: set[str] | None = None,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[dict[str, Any]]:
         if crop_filter not in {"all", "missing", "with_crop", "estimated", "confirmed"}:
             raise ValueError("Unsupported crop filter")
         entries: list[dict[str, Any]] = []
@@ -837,6 +843,11 @@ class PickerState:
             entries.append(self._crop_summary(entry, candidate, "accepted_not_applied"))
         entries.extend(self._database_crop_entries(exclude_entry_ids=queued_entry_ids))
         entries = [entry for entry in entries if _crop_filter_matches(entry, crop_filter)]
+        entries = [
+            entry
+            for entry in entries
+            if _crop_entry_in_date_scope(entry, entry_dates or set(), start_date, end_date)
+        ]
         entries.sort(key=lambda entry: (entry.get("entry_date", ""), entry.get("entry_id", "")))
         return entries
 
@@ -1038,8 +1049,14 @@ class PickerState:
     ) -> dict[str, Any]:
         has_crop = _candidate_has_review_crop(candidate)
         crop_source = str(candidate.get("review_crop_source", "")).strip().lower()
+        entry_id = str(entry.get("entry_id", ""))
+        candidate_path = str(candidate.get("path", ""))
+        staged_record = self._staged_crop_record(entry_id, candidate_path)
+        crop_commit_pending = bool(
+            staged_record is not None and self._staged_crop_commit_pending(staged_record)
+        )
         return {
-            "entry_id": entry.get("entry_id", ""),
+            "entry_id": entry_id,
             "entry_date": entry.get("entry_date", ""),
             "status": entry.get("status", "selected"),
             "source_token": entry.get("source_token", ""),
@@ -1055,6 +1072,7 @@ class PickerState:
             "crop_has_crop": has_crop,
             "crop_source": crop_source,
             "crop_source_state": source_state,
+            "crop_commit_pending": crop_commit_pending,
             "crop_status": _crop_status_label(has_crop, crop_source),
         }
 
@@ -1174,6 +1192,8 @@ class PickerState:
             "review_decision": "use_external_original",
             "review_notes": "",
             "selected": True,
+            "associated": False,
+            "database_confirmed_role": "external_original_reference",
         }
         self._apply_staged_crop_to_candidate(
             str(row["entry_id"]),
@@ -1181,16 +1201,22 @@ class PickerState:
             mark_estimated_viewed=mark_estimated_viewed,
         )
         crop_source_state = self._database_crop_source_state(str(row["entry_id"]), candidate_path_text)
+        confirmed_candidates = [candidate]
+        for database_row in self._database_confirmed_external_candidate_rows(str(row["entry_id"])):
+            if database_row.get("candidate_path", "").strip() == candidate_path_text:
+                continue
+            confirmed_candidates.append(self._candidate_detail(database_row))
+        associated_count = sum(1 for item in confirmed_candidates if item.get("associated"))
         entry = {
             "entry_id": str(row["entry_id"]),
             "entry_date": str(row["entry_date"]),
             "status": "selected",
-            "candidate_count": 1,
+            "candidate_count": len(confirmed_candidates),
             "selected_count": 1,
             "pending_commit_count": 0,
             "commit_ready": False,
             "accepted_count": 1,
-            "associated_count": 0,
+            "associated_count": associated_count,
             "rejected_count": 0,
             "fallback_count": 0,
             "source_token": self._image_token(source_path) if source_path else "",
@@ -1205,7 +1231,7 @@ class PickerState:
             "used_range_days": [],
             "crop_source_state": crop_source_state,
             "crop_has_crop": _candidate_has_review_crop(candidate),
-            "candidates": [candidate],
+            "candidates": confirmed_candidates,
         }
         return entry
 
@@ -1986,6 +2012,11 @@ class PickerState:
         rows: list[dict[str, str]]
         with self._lock:
             rows = self._entry_rows_for_manual_candidate(entry_id)
+            if (
+                normalized_decision in ASSOCIATED_PHOTO_DECISIONS
+                and self._database_crop_candidate_exists(entry_id, candidate_path)
+            ):
+                raise ValueError("This photo is already the selected original.")
             if normalized_decision == "clear":
                 if not rows:
                     raise ValueError("Unknown entry")
@@ -2021,6 +2052,7 @@ class PickerState:
                     if row.get("candidate_path") == candidate_path:
                         found_candidate = True
                         current_decision = row.get("review_decision", "").strip().lower()
+                        database_role = row.get("database_confirmed_role", "").strip().lower()
                         if normalized_decision == "unlink_associated_photo":
                             if current_decision in ASSOCIATED_PHOTO_DECISIONS:
                                 row["review_decision"] = ""
@@ -2031,6 +2063,11 @@ class PickerState:
                         row["review_decision"] = normalized_decision
                         row["review_notes"] = notes
                         if normalized_decision in ASSOCIATED_PHOTO_DECISIONS:
+                            if (
+                                current_decision in ACCEPT_DECISIONS
+                                or database_role == "external_original_reference"
+                            ):
+                                raise ValueError("This photo is already the selected original.")
                             associated_date = _normalized_associated_entry_date(associated_entry_date)
                             row["associated_entry_date"] = associated_date or row.get("entry_date", "")
                             row["associated_date_source"] = associated_date_source.strip() or "manual"
@@ -2433,21 +2470,35 @@ class PickerState:
             estimated_crop["fill_color"] = fill_color
         return estimated_crop
 
-    def start_crop_estimate_batch(self, apply_estimates: bool = False) -> dict[str, Any]:
+    def start_crop_estimate_batch(
+        self,
+        apply_estimates: bool = False,
+        refresh_saved_estimates: bool = False,
+        target_extensions: list[str] | set[str] | None = None,
+    ) -> dict[str, Any]:
         with self._job_lock:
             active_job = self._latest_crop_estimate_job_locked(active_only=True)
             if active_job is not None:
                 return dict(active_job)
+        normalized_extensions = _normalized_target_extensions(target_extensions)
+        crop_filter = "estimated" if refresh_saved_estimates else "missing"
         targets = [
             {
                 "entry_id": entry["entry_id"],
                 "candidate_path": entry["candidate_path"],
             }
-            for entry in self.crop_entries(crop_filter="missing")
+            for entry in self.crop_entries(crop_filter=crop_filter)
             if entry.get("entry_id") and entry.get("candidate_path")
+            and (
+                not normalized_extensions
+                or Path(str(entry.get("candidate_path", ""))).suffix.lower() in normalized_extensions
+            )
         ]
         job_id = hashlib.sha256(
-            f"crop-estimate:{dt.datetime.now(dt.UTC).isoformat()}:{targets}".encode("utf-8")
+            (
+                f"crop-estimate:{dt.datetime.now(dt.UTC).isoformat()}:"
+                f"{refresh_saved_estimates}:{normalized_extensions}:{targets}"
+            ).encode("utf-8")
         ).hexdigest()[:16]
         job = {
             "id": job_id,
@@ -2455,6 +2506,8 @@ class PickerState:
             "target_count": len(targets),
             "processed_count": 0,
             "estimated_count": 0,
+            "changed_count": 0,
+            "unchanged_count": 0,
             "skipped_count": 0,
             "failed_count": 0,
             "current_entry_id": "",
@@ -2463,21 +2516,28 @@ class PickerState:
             "last_update_at": dt.datetime.now(dt.UTC).isoformat(),
             "errors": [],
             "apply_estimates": bool(apply_estimates),
+            "refresh_saved_estimates": bool(refresh_saved_estimates),
+            "target_extensions": sorted(normalized_extensions),
             "message": "",
         }
         with self._job_lock:
             self._crop_estimate_jobs[job_id] = job
         if not targets:
+            message = (
+                "No saved crop estimates to refresh."
+                if refresh_saved_estimates
+                else "No missing crop estimates to run."
+            )
             self._update_crop_estimate_job(
                 job_id,
                 status="pass",
                 finished_at=dt.datetime.now(dt.UTC).isoformat(),
-                message="No missing crop estimates to run.",
+                message=message,
             )
             return self.crop_estimate_job(job_id) or dict(job)
         thread = threading.Thread(
             target=self._run_crop_estimate_batch,
-            args=(job_id, targets, bool(apply_estimates)),
+            args=(job_id, targets, bool(apply_estimates), bool(refresh_saved_estimates)),
             daemon=True,
         )
         thread.start()
@@ -2533,6 +2593,8 @@ class PickerState:
             except ValueError as exc:
                 raise ValueError("Entry has an invalid date") from exc
             original_path_text = str(original_path)
+            if associate and self._database_crop_candidate_exists(entry_id, original_path_text):
+                raise ValueError("This photo is already the selected original.")
             if not any(row.get("candidate_path") == original_path_text for row in entry_rows):
                 template = entry_rows[0]
                 content_type = mimetypes.guess_type(original_path.name)[0] or "application/octet-stream"
@@ -3268,7 +3330,7 @@ class PickerState:
             replace_candidates = search_whole_index
             if not replace_candidates:
                 self._clear_replacement_candidates(entry_id)
-            entry_rows = self._entry_rows(entry_id)
+            entry_rows = self._entry_rows_for_manual_candidate(entry_id)
             if not entry_rows:
                 raise ValueError("Unknown entry")
             entry_date = entry_rows[0].get("entry_date", "")
@@ -3451,6 +3513,7 @@ class PickerState:
         job_id: str,
         targets: list[dict[str, str]],
         apply_estimates: bool,
+        refresh_saved_estimates: bool,
     ) -> None:
         self._update_crop_estimate_job(job_id, status="running", started_at=dt.datetime.now(dt.UTC).isoformat())
         try:
@@ -3459,7 +3522,33 @@ class PickerState:
                 candidate_path = target["candidate_path"]
                 self._update_crop_estimate_job(job_id, current_entry_id=entry_id)
                 try:
-                    if self._crop_candidate_has_review_crop(entry_id, candidate_path):
+                    if refresh_saved_estimates:
+                        prior_crop = self._refreshable_saved_estimate_crop(entry_id, candidate_path)
+                        if prior_crop is None:
+                            self._increment_crop_estimate_job(job_id, "skipped_count")
+                        else:
+                            estimated_crop = self._estimated_crop_for_candidate(
+                                entry_id,
+                                candidate_path,
+                                prior_crop,
+                            )
+                            if not _crop_values_differ(prior_crop, estimated_crop):
+                                self._increment_crop_estimate_job(job_id, "unchanged_count")
+                            elif not apply_estimates:
+                                self._increment_crop_estimate_job(job_id, "changed_count")
+                            elif self._refreshable_saved_estimate_crop(entry_id, candidate_path) is None:
+                                self._increment_crop_estimate_job(job_id, "skipped_count")
+                            else:
+                                self.save_crop(
+                                    entry_id,
+                                    candidate_path,
+                                    estimated_crop,
+                                    source="estimated",
+                                    commit_pending=False,
+                                )
+                                self._increment_crop_estimate_job(job_id, "changed_count")
+                            self._increment_crop_estimate_job(job_id, "estimated_count")
+                    elif self._crop_candidate_has_review_crop(entry_id, candidate_path):
                         self._increment_crop_estimate_job(job_id, "skipped_count")
                     else:
                         estimated_crop = self._estimated_crop_for_candidate(entry_id, candidate_path)
@@ -3497,6 +3586,29 @@ class PickerState:
             if str(candidate.get("path", "")) == candidate_path:
                 return _candidate_has_review_crop(candidate)
         return False
+
+    def _refreshable_saved_estimate_crop(
+        self,
+        entry_id: str,
+        candidate_path: str,
+    ) -> dict[str, object] | None:
+        record = self._staged_crop_record(entry_id, candidate_path)
+        if record is not None and self._staged_crop_commit_pending(record):
+            return None
+        detail = self.crop_entry_detail(entry_id, mark_estimated_viewed=False)
+        if detail is None:
+            return None
+        for candidate in detail.get("candidates", []):
+            if str(candidate.get("path", "")) != candidate_path:
+                continue
+            if str(candidate.get("review_crop_source", "")).strip().lower() != "estimated":
+                return None
+            crop = _review_crop_from_candidate(candidate)
+            if crop is None:
+                return None
+            crop["source"] = "estimated"
+            return crop
+        return None
 
     def _update_crop_estimate_job(self, job_id: str, **updates: Any) -> None:
         with self._job_lock:
@@ -4368,9 +4480,16 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                 elif parsed.path == "/api/crop-entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     crop_filter = query.get("crop_filter", ["missing"])[0]
+                    entries = state.crop_entries(
+                        crop_filter=crop_filter,
+                        entry_dates=set(_query_values(query, "entry_date")),
+                        start_date=query.get("start_date", [""])[0],
+                        end_date=query.get("end_date", [""])[0],
+                    )
                     self._send_json(
                         {
-                            "entries": state.crop_entries(crop_filter=crop_filter),
+                            "entries": entries,
+                            "total_count": len(entries),
                             "pending_crop_commits": state.pending_crop_commits(),
                             "crop_estimate_batch": state.latest_crop_estimate_job() or {},
                         }
@@ -4461,10 +4580,14 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/crop":
                     payload = self._read_json()
+                    source = str(payload.get("source", "manual")).strip().lower()
+                    if source not in {"manual", "estimated"}:
+                        source = "manual"
                     detail = state.save_crop(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         crop=payload.get("crop") if isinstance(payload.get("crop"), dict) else {},
+                        source=source,
                     )
                     self._send_json(detail)
                     return
@@ -4500,9 +4623,14 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/crop-estimate-batch":
                     payload = self._read_json()
+                    target_extensions = payload.get("target_extensions")
+                    if not isinstance(target_extensions, list):
+                        target_extensions = []
                     self._send_json(
                         state.start_crop_estimate_batch(
-                            apply_estimates=bool(payload.get("apply_estimates"))
+                            apply_estimates=bool(payload.get("apply_estimates")),
+                            refresh_saved_estimates=bool(payload.get("refresh_saved_estimates")),
+                            target_extensions=[str(value) for value in target_extensions],
                         )
                     )
                     return
@@ -5727,10 +5855,55 @@ def _crop_filter_matches(entry: dict[str, Any], crop_filter: str) -> bool:
     if crop_filter == "with_crop":
         return bool(entry.get("crop_has_crop"))
     if crop_filter == "estimated":
-        return bool(entry.get("crop_has_crop")) and crop_source == "estimated"
+        return (
+            bool(entry.get("crop_has_crop"))
+            and crop_source == "estimated"
+            and not bool(entry.get("crop_commit_pending"))
+        )
     if crop_filter == "confirmed":
         return bool(entry.get("crop_has_crop")) and crop_source != "estimated"
     return False
+
+
+def _normalized_target_extensions(target_extensions: list[str] | set[str] | None) -> set[str]:
+    extensions: set[str] = set()
+    for value in target_extensions or []:
+        text = str(value).strip().lower()
+        if not text:
+            continue
+        extensions.add(text if text.startswith(".") else f".{text}")
+    return extensions
+
+
+def _crop_values_differ(current: dict[str, object], proposed: dict[str, object]) -> bool:
+    for key in (
+        "x",
+        "y",
+        "size",
+        "candidate_width",
+        "candidate_height",
+        "fill_color",
+        "rotation_degrees",
+    ):
+        if str(current.get(key, "")).strip() != str(proposed.get(key, "")).strip():
+            return True
+    return False
+
+
+def _crop_entry_in_date_scope(
+    entry: dict[str, Any],
+    entry_dates: set[str],
+    start_date: str,
+    end_date: str,
+) -> bool:
+    entry_date = str(entry.get("entry_date", "")).strip()
+    if entry_dates and entry_date not in entry_dates:
+        return False
+    if start_date and entry_date < start_date:
+        return False
+    if end_date and entry_date > end_date:
+        return False
+    return bool(entry_date or not (entry_dates or start_date or end_date))
 
 
 def _entry_id_in_date_scope(entry_id: str, start_date: str, end_date: str) -> bool:
@@ -7283,7 +7456,9 @@ const state = {
   filenameDateScopeStart: "",
   filenameDateScopeEnd: "",
   archivedBatchCount: 0,
-  lastLinkedPhotoRefreshStamp: ""
+  lastLinkedPhotoRefreshStamp: "",
+  linkedPhotoDropEntryId: "",
+  linkedPhotoPopupPoller: null
 };
 const LINKED_PHOTO_REFRESH_KEY = "project365-linked-photo-refresh";
 
@@ -10080,15 +10255,46 @@ function chooseLinkedPhoto() {
       "Allow pop-ups for this page to open the linked-photo drop window.";
     return;
   }
+  state.linkedPhotoDropEntryId = state.currentEntry.entry_id;
+  monitorLinkedPhotoPopup(popup, state.currentEntry.entry_id);
   popup.focus();
   document.getElementById("crawlStatus").textContent =
     `Opened linked-photo drop window for ${state.currentEntry.entry_date}.`;
 }
 
+function monitorLinkedPhotoPopup(popup, entryId) {
+  if (state.linkedPhotoPopupPoller) window.clearInterval(state.linkedPhotoPopupPoller);
+  state.linkedPhotoPopupPoller = window.setInterval(() => {
+    let closed = false;
+    try {
+      closed = Boolean(popup.closed);
+    } catch (_) {
+      closed = true;
+    }
+    if (!closed) return;
+    window.clearInterval(state.linkedPhotoPopupPoller);
+    state.linkedPhotoPopupPoller = null;
+    if (state.linkedPhotoDropEntryId !== entryId) return;
+    refreshLinkedPhotoEntry({
+      entry_id: entryId,
+      status: "Linked-photo window closed. Refreshing the entry.",
+      stamp: `closed-${Date.now()}`
+    }).catch(error => {
+      document.getElementById("crawlStatus").textContent = error.message;
+    });
+  }, 500);
+}
+
 async function refreshLinkedPhotoEntry(message) {
   if (!message?.entry_id) return;
-  if (state.currentEntry && state.currentEntry.entry_id !== message.entry_id) return;
+  const activeEntryId = state.currentEntry?.entry_id || state.selectedEntryId || "";
+  if (!activeEntryId || activeEntryId !== message.entry_id) return;
   if (message.stamp) state.lastLinkedPhotoRefreshStamp = String(message.stamp);
+  if (state.linkedPhotoDropEntryId === message.entry_id) state.linkedPhotoDropEntryId = "";
+  if (state.linkedPhotoPopupPoller) {
+    window.clearInterval(state.linkedPhotoPopupPoller);
+    state.linkedPhotoPopupPoller = null;
+  }
   state.entryDetailCache.delete(message.entry_id);
   document.getElementById("crawlStatus").textContent =
     message.status || "Linked photo received. Refreshing the entry.";
@@ -11377,7 +11583,8 @@ main {
   color: var(--subtle);
   font-size: 12px;
 }
-.sidebar-controls select {
+.sidebar-controls select,
+.sidebar-controls input {
   width: 100%;
   min-height: 34px;
   border: 1px solid var(--line);
@@ -11386,6 +11593,25 @@ main {
   color: var(--text);
   padding: 0 8px;
   font: inherit;
+}
+.date-scope-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.date-scope-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.date-scope-actions button {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
 }
 .entry-list {
   overflow: auto;
@@ -11894,6 +12120,20 @@ button.subtle-danger:hover {
 	          <option value="all">All linked originals</option>
 	        </select>
 	      </label>
+        <div class="date-scope-controls">
+          <label>
+            From
+            <input id="cropStartDate" type="date">
+          </label>
+          <label>
+            To
+            <input id="cropEndDate" type="date">
+          </label>
+        </div>
+        <div class="date-scope-actions">
+          <button id="applyCropDateScopeButton" type="button">Apply</button>
+          <button id="clearCropDateScopeButton" type="button">Clear</button>
+        </div>
 	    </div>
     <div id="summary" class="summary">Loading linked originals...</div>
     <div id="cropListHint" class="summary crop-list-hint" hidden>Expand a year and month to choose a linked original for crop confirmation.</div>
@@ -11983,6 +12223,10 @@ const state = {
 	  pendingCropCommits: {pending_count: 0},
 	  cropEstimateBatch: {},
 	  cropFilterTouched: false,
+	  cropEntryDates: [],
+    cropStartDate: "",
+    cropEndDate: "",
+    cropScopeFallbackMessage: "",
 	  openYears: new Set(),
 	  openMonths: new Set()
 	};
@@ -11997,19 +12241,39 @@ async function fetchJson(url, options) {
 async function loadEntries(preferredEntryId = "") {
   const filterControl = document.getElementById("cropFilter");
   let cropFilter = filterControl.value;
-  const body = await fetchJson(`/api/crop-entries?crop_filter=${encodeURIComponent(cropFilter)}`);
+  let body = await fetchJson(cropEntriesUrl(cropFilter));
   state.cropEstimateBatch = body.crop_estimate_batch || {};
   if (shouldPreferSavedEstimateFilter(cropFilter, state.cropEstimateBatch)) {
     filterControl.value = "estimated";
     cropFilter = "estimated";
     return loadEntries(preferredEntryId);
   }
+  if (shouldProbePersistedSavedEstimateFilter(cropFilter, body)) {
+    const estimatedBody = await fetchJson(cropEntriesUrl("estimated"));
+    if ((estimatedBody.entries || []).length) {
+      filterControl.value = "estimated";
+      cropFilter = "estimated";
+      body = estimatedBody;
+      state.cropEstimateBatch = body.crop_estimate_batch || {};
+    }
+  }
+  state.cropScopeFallbackMessage = "";
+  if (shouldFallBackToAllForDirectCropScope(cropFilter, body)) {
+    const allBody = await fetchJson(cropEntriesUrl("all"));
+    if ((allBody.entries || []).length) {
+      filterControl.value = "all";
+      cropFilter = "all";
+      body = allBody;
+      state.cropEstimateBatch = body.crop_estimate_batch || {};
+      state.cropScopeFallbackMessage = directCropScopeFallbackMessage(allBody.entries);
+    }
+  }
   state.entries = body.entries || [];
   state.pendingCropCommits = body.pending_crop_commits || {pending_count: 0};
   updatePendingCropCommitControl();
   const missingCount = state.entries.filter(entry => !entry.crop_has_crop).length;
   document.getElementById("summary").textContent =
-    cropSummaryText(cropFilter, state.entries, missingCount) + cropEstimateBatchSummary(state.cropEstimateBatch);
+    cropSummaryText(cropFilter, state.entries, missingCount) + cropDateScopeSummary() + cropScopeFallbackSummary() + cropEstimateBatchSummary(state.cropEstimateBatch);
   if (!state.entries.length) {
     state.selectedEntryId = "";
     state.currentEntry = null;
@@ -12029,11 +12293,53 @@ async function loadEntries(preferredEntryId = "") {
   await loadEntry(state.selectedEntryId);
 }
 
+function cropEntriesUrl(cropFilter) {
+  const params = new URLSearchParams({crop_filter: cropFilter});
+  for (const entryDate of state.cropEntryDates) params.append("entry_date", entryDate);
+  if (state.cropStartDate) params.set("start_date", state.cropStartDate);
+  if (state.cropEndDate) params.set("end_date", state.cropEndDate);
+  return `/api/crop-entries?${params.toString()}`;
+}
+
 function shouldPreferSavedEstimateFilter(cropFilter, job) {
   if (state.cropFilterTouched || cropFilter !== "missing") return false;
   if (!job || !job.apply_estimates) return false;
+  if (job.refresh_saved_estimates) return false;
   if (!["queued", "running"].includes(job.status || "")) return false;
   return Number(job.estimated_count || 0) > 0;
+}
+
+function shouldProbePersistedSavedEstimateFilter(cropFilter, body) {
+  if (state.cropFilterTouched || cropFilter !== "missing") return false;
+  return Number(body?.total_count || 0) === 0 && !(body?.entries || []).length;
+}
+
+function shouldFallBackToAllForDirectCropScope(cropFilter, body) {
+  if (cropFilter === "all") return false;
+  if (!hasDirectCropDateScope()) return false;
+  return Number(body?.total_count || 0) === 0 && !(body?.entries || []).length;
+}
+
+function hasDirectCropDateScope() {
+  if (state.cropEntryDates.length === 1) return true;
+  return Boolean(state.cropStartDate && state.cropEndDate && state.cropStartDate === state.cropEndDate);
+}
+
+function directCropScopeFallbackMessage(entries) {
+  const entry = entries[0] || {};
+  return ` Current state: ${cropEntryStateText(entry)}.`;
+}
+
+function cropEntryStateText(entry) {
+  if (!entry.crop_has_crop) return "no saved crop information";
+  const source = String(entry.crop_source || "").trim().toLowerCase();
+  const stateText = String(entry.crop_source_state || "").trim().toLowerCase();
+  const pending = Boolean(entry.crop_commit_pending);
+  if (source === "estimated" && pending) return "saved estimate already opened and pending commit";
+  if (source === "estimated" && stateText === "staged") return "saved estimate";
+  if (source === "manual" && pending) return "staged manual crop pending commit";
+  if (source === "manual") return stateText === "applied" ? "committed manual crop" : "saved manual crop";
+  return stateText === "applied" ? "committed saved crop" : "saved crop";
 }
 
 function cropSummaryText(cropFilter, entries, missingCount) {
@@ -12044,13 +12350,32 @@ function cropSummaryText(cropFilter, entries, missingCount) {
   return `${countText} · ${missingCount} without saved crop data.`;
 }
 
+function cropScopeFallbackSummary() {
+  return state.cropScopeFallbackMessage || "";
+}
+
 function cropEstimateBatchSummary(job) {
   if (!job || !job.id || !["queued", "running"].includes(job.status || "")) return "";
   const processed = Number(job.processed_count || 0);
   const total = Number(job.target_count || 0);
   const estimated = Number(job.estimated_count || 0);
   const mode = job.apply_estimates ? "saved" : "previewed";
+  if (job.refresh_saved_estimates) {
+    const changed = Number(job.changed_count || 0);
+    const unchanged = Number(job.unchanged_count || 0);
+    return ` Saved-estimate refresh running: ${processed}/${total} checked, ${changed} changed, ${unchanged} unchanged.`;
+  }
   return ` Batch estimate running: ${processed}/${total} checked, ${estimated} ${mode}.`;
+}
+
+function cropDateScopeSummary() {
+  if (state.cropEntryDates.length === 1) return ` Date ${state.cropEntryDates[0]}.`;
+  if (state.cropEntryDates.length > 1) return ` ${state.cropEntryDates.length} dates.`;
+  if (state.cropStartDate && state.cropEndDate && state.cropStartDate === state.cropEndDate) return ` Date ${state.cropStartDate}.`;
+  if (state.cropStartDate && state.cropEndDate) return ` ${state.cropStartDate} to ${state.cropEndDate}.`;
+  if (state.cropStartDate) return ` From ${state.cropStartDate}.`;
+  if (state.cropEndDate) return ` Through ${state.cropEndDate}.`;
+  return "";
 }
 
 async function loadEntry(entryId) {
@@ -12266,6 +12591,22 @@ function savedCropForCandidate(candidate) {
   };
   if ([crop.x, crop.y, crop.size, crop.candidate_width, crop.candidate_height].every(Number.isFinite) && crop.size > 0) return crop;
   return null;
+}
+
+function sourceForCropSave() {
+  const source = String(state.selectedCandidate?.review_crop_source || "").trim().toLowerCase();
+  if (source !== "estimated") return "manual";
+  const saved = savedCropForCandidate(state.selectedCandidate);
+  if (!saved || !state.cropDraft) return "manual";
+  return cropsMatchForSourcePreservation(saved, state.cropDraft) ? "estimated" : "manual";
+}
+
+function cropsMatchForSourcePreservation(saved, draft) {
+  const numericFields = ["x", "y", "size", "candidate_width", "candidate_height", "rotation_degrees"];
+  const sameNumbers = numericFields.every(field => Number(saved[field]) === Number(draft[field]));
+  const savedFill = normalizeFillColor(saved.fill_color) || defaultFillColor();
+  const draftFill = normalizeFillColor(draft.fill_color) || defaultFillColor();
+  return sameNumbers && savedFill === draftFill;
 }
 
 function hasSavedCropForCandidate(candidate) {
@@ -12883,7 +13224,8 @@ async function saveCropForCurrentCandidate() {
       body: JSON.stringify({
         entry_id: state.currentEntry.entry_id,
         candidate_path: state.selectedCandidate.path,
-        crop: state.cropDraft
+        crop: state.cropDraft,
+        source: sourceForCropSave()
       })
     });
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.selected) || state.selectedCandidate;
@@ -13122,6 +13464,19 @@ document.getElementById("cropFilter").onchange = () => {
   state.cropFilterTouched = true;
   loadEntries();
 };
+document.getElementById("applyCropDateScopeButton").onclick = () => {
+  applyCropDateScopeControls();
+  loadEntries();
+};
+document.getElementById("clearCropDateScopeButton").onclick = () => {
+  state.cropEntryDates = [];
+  state.cropStartDate = "";
+  state.cropEndDate = "";
+  state.cropScopeFallbackMessage = "";
+  document.getElementById("cropStartDate").value = "";
+  document.getElementById("cropEndDate").value = "";
+  loadEntries();
+};
 document.getElementById("suggestCropButton").onclick = estimateCropForCurrentCandidate;
 document.getElementById("resetCropButton").onclick = resetCropForCurrentCandidate;
 document.getElementById("rejectOriginalButton").onclick = rejectOriginalForCurrentCrop;
@@ -13186,13 +13541,47 @@ document.addEventListener("keydown", handleCropKeyboardShortcut);
 window.addEventListener("resize", positionCropBox);
 
 function applyInitialCropFilterFromUrl() {
-  const requested = new URLSearchParams(window.location.search).get("crop_filter") || "";
+  const params = new URLSearchParams(window.location.search);
+  const requested = params.get("crop_filter") || "";
   if (!["missing", "estimated", "confirmed", "all"].includes(requested)) return;
   document.getElementById("cropFilter").value = requested;
   state.cropFilterTouched = true;
 }
 
+function applyInitialCropDateScopeFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const entryDates = params.getAll("entry_date").flatMap(splitCropDateValues).filter(Boolean);
+  const directDate = normalizeCropDate(params.get("date") || (entryDates.length === 1 ? entryDates[0] : ""));
+  const startDate = normalizeCropDate(params.get("start_date") || directDate);
+  const endDate = normalizeCropDate(params.get("end_date") || directDate);
+  state.cropEntryDates = entryDates.map(normalizeCropDate).filter(Boolean);
+  state.cropStartDate = startDate;
+  state.cropEndDate = endDate;
+  document.getElementById("cropStartDate").value = startDate;
+  document.getElementById("cropEndDate").value = endDate;
+}
+
+function applyCropDateScopeControls() {
+  const startDate = normalizeCropDate(document.getElementById("cropStartDate").value);
+  const endDate = normalizeCropDate(document.getElementById("cropEndDate").value || startDate);
+  state.cropEntryDates = [];
+  state.cropStartDate = startDate;
+  state.cropEndDate = endDate;
+  document.getElementById("cropStartDate").value = startDate;
+  document.getElementById("cropEndDate").value = endDate;
+}
+
+function splitCropDateValues(value) {
+  return String(value || "").split(";").map(item => item.trim()).filter(Boolean);
+}
+
+function normalizeCropDate(value) {
+  const text = String(value || "").trim().replace(/^project365:/, "");
+  return /^\\d{4}-\\d{2}-\\d{2}$/.test(text) ? text : "";
+}
+
 applyInitialCropFilterFromUrl();
+applyInitialCropDateScopeFromUrl();
 loadEntries().catch(error => {
   document.getElementById("summary").textContent = error.message;
 });

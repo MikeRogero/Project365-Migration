@@ -814,6 +814,40 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertEqual(fallback_count, 0)
         self.assertEqual(original_count, 1)
 
+    def test_picker_custom_index_date_search_supports_fallback_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            queue_path = canonical_root / "exports" / "verification_reports" / "original_photo_external_search_queue.csv"
+            _write_queue(queue_path)
+            _insert_picker_fallback(canonical_root, "project365:1998-04-12")
+            library_root = _project_originals_root(base)
+            candidate_path = library_root / "1998-05-01 manual date.jpg"
+            candidate_path.write_bytes(_jpeg_with_dimensions(18, 12))
+            from project365_photo_library_index import build_photo_library_index, default_index_db
+
+            build_photo_library_index(default_index_db(canonical_root), [library_root], reset=True)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+
+            result = state.search_index_date_range(
+                "project365:1998-04-12",
+                "1998-05-01",
+                "1998-05-01",
+                search_whole_index=True,
+            )
+
+        self.assertTrue(result["search_whole_index"])
+        self.assertTrue(result["replace_candidates"])
+        self.assertEqual(result["added_count"], 1)
+        self.assertEqual(result["entry"]["status"], "needs_review")
+        self.assertEqual(result["entry"]["candidate_count"], 1)
+        candidate = result["entry"]["candidates"][0]
+        self.assertEqual(candidate["filename"], "1998-05-01 manual date.jpg")
+        self.assertIn("manual_index_date_search", candidate["evidence"])
+        self.assertIn("manual_index_scope_whole_index", candidate["evidence"])
+
     def test_picker_fallback_page_limit_stops_database_summary_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -2643,6 +2677,30 @@ class Project365OriginalPickerTests(unittest.TestCase):
             estimated_entries = state.crop_entries(crop_filter="estimated")
             self.assertEqual([entry["entry_id"] for entry in estimated_entries], ["project365:1998-04-12"])
             self.assertEqual(estimated_entries[0]["crop_status"], "saved estimate")
+            self.assertEqual(
+                [entry["entry_id"] for entry in state.crop_entries(crop_filter="estimated", entry_dates={"1998-04-12"})],
+                ["project365:1998-04-12"],
+            )
+            self.assertEqual(state.crop_entries(crop_filter="estimated", entry_dates={"1998-04-13"}), [])
+            self.assertEqual(
+                [
+                    entry["entry_id"]
+                    for entry in state.crop_entries(
+                        crop_filter="estimated",
+                        start_date="1998-04-11",
+                        end_date="1998-04-12",
+                    )
+                ],
+                ["project365:1998-04-12"],
+            )
+            self.assertEqual(
+                state.crop_entries(
+                    crop_filter="estimated",
+                    start_date="1998-04-13",
+                    end_date="1998-04-14",
+                ),
+                [],
+            )
 
             self.assertEqual(state.pending_crop_commits()["pending_count"], 0)
 
@@ -2655,6 +2713,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertEqual(candidate["review_crop_candidate_width"], "80")
             self.assertEqual(candidate["review_crop_candidate_height"], "60")
             self.assertEqual(state.pending_crop_commits()["pending_count"], 1)
+            self.assertEqual(state.crop_entries(crop_filter="estimated"), [])
             self.assertEqual(state.crop_entries(crop_filter="missing"), [])
             self.assertEqual(state.crop_entries(crop_filter="confirmed"), [])
 
@@ -2681,6 +2740,133 @@ class Project365OriginalPickerTests(unittest.TestCase):
                     ("project365:1998-04-12",),
                 ).fetchone()[0]
             self.assertIsNone(picker._review_crop_from_transformation_text(transformation_text))
+
+    def test_crop_estimate_batch_refreshes_unopened_saved_estimates_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            source_root = base / "external"
+            source_root.mkdir()
+            source_root.joinpath("1998-04-12 original.jpg").write_bytes(_jpeg_with_dimensions(80, 60))
+            summary = pipeline.build_external_original_search_queue(
+                canonical_root=canonical_root,
+                search_roots=[source_root],
+                review_queue_path=base / "missing_review_queue.csv",
+                report_dir=canonical_root / "exports" / "verification_reports",
+                scan_metadata_dates=False,
+            )
+            queue_path = Path(summary.search_queue_path)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            detail = state.entry_detail("project365:1998-04-12")
+            candidate_path = detail["candidates"][0]["path"]
+            state.save_decision(
+                entry_id="project365:1998-04-12",
+                candidate_path=candidate_path,
+                decision="use_external_original",
+                notes="apply first",
+            )
+            state.apply_decisions()
+            state.save_crop(
+                "project365:1998-04-12",
+                candidate_path,
+                {
+                    "x": 10,
+                    "y": 5,
+                    "size": 40,
+                    "candidate_width": 80,
+                    "candidate_height": 60,
+                    "rotation_degrees": 0,
+                },
+                source="estimated",
+                commit_pending=False,
+            )
+
+            suggestion = crop_align.CropSuggestion(
+                x=11,
+                y=6,
+                width=38,
+                height=38,
+                score=1.0,
+                confidence="high",
+                reference_width=1,
+                reference_height=1,
+                candidate_width=80,
+                candidate_height=60,
+            )
+            with mock.patch("project365_original_picker.suggest_crop", return_value=suggestion) as suggest:
+                job = state.start_crop_estimate_batch(
+                    apply_estimates=True,
+                    refresh_saved_estimates=True,
+                    target_extensions=["jpg"],
+                )
+                finished = _wait_for_crop_estimate_job(state, job["id"])
+
+            self.assertEqual(finished["status"], "pass")
+            self.assertTrue(finished["refresh_saved_estimates"])
+            self.assertEqual(finished["target_extensions"], [".jpg"])
+            self.assertEqual(finished["target_count"], 1)
+            self.assertEqual(finished["estimated_count"], 1)
+            self.assertEqual(finished["changed_count"], 1)
+            self.assertEqual(finished["unchanged_count"], 0)
+            self.assertEqual(finished["skipped_count"], 0)
+            self.assertEqual(state.pending_crop_commits()["pending_count"], 0)
+            staged_crop = state._staged_crop_record("project365:1998-04-12", candidate_path)["crop"]
+            self.assertEqual(staged_crop["x"], 11)
+            self.assertEqual(staged_crop["y"], 6)
+            self.assertEqual(staged_crop["size"], 38)
+            suggest.assert_called_once_with(
+                mock.ANY,
+                Path(candidate_path),
+                candidate_rotation_degrees=0.0,
+            )
+
+            state.reset_crop("project365:1998-04-12", candidate_path, preserve_estimate=True)
+            later_suggestion = crop_align.CropSuggestion(
+                x=12,
+                y=7,
+                width=36,
+                height=36,
+                score=1.0,
+                confidence="high",
+                reference_width=1,
+                reference_height=1,
+                candidate_width=80,
+                candidate_height=60,
+            )
+
+            original_estimate = state._estimated_crop_for_candidate
+
+            def estimate_after_opening(
+                entry_id: str,
+                candidate_path_text: str,
+                crop: dict[str, object] | None = None,
+            ) -> dict[str, object]:
+                estimated = original_estimate(entry_id, candidate_path_text, crop)
+                state.crop_entry_detail(entry_id)
+                return estimated
+
+            with (
+                mock.patch("project365_original_picker.suggest_crop", return_value=later_suggestion),
+                mock.patch.object(state, "_estimated_crop_for_candidate", side_effect=estimate_after_opening),
+            ):
+                job = state.start_crop_estimate_batch(
+                    apply_estimates=True,
+                    refresh_saved_estimates=True,
+                )
+                finished = _wait_for_crop_estimate_job(state, job["id"])
+
+            self.assertEqual(finished["status"], "pass")
+            self.assertEqual(finished["target_count"], 1)
+            self.assertEqual(finished["estimated_count"], 1)
+            self.assertEqual(finished["changed_count"], 0)
+            self.assertEqual(finished["skipped_count"], 1)
+            staged_crop = state._staged_crop_record("project365:1998-04-12", candidate_path)["crop"]
+            self.assertEqual(str(staged_crop["x"]), "11")
+            self.assertEqual(str(staged_crop["y"]), "6")
+            self.assertEqual(str(staged_crop["size"]), "38")
+            self.assertEqual(state.pending_crop_commits()["pending_count"], 1)
 
     def test_applied_crop_save_ignores_unaccepted_queue_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4347,6 +4533,11 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('"width=640,height=460"', picker.PICKER_HTML)
         self.assertIn('window.addEventListener("message", handleLinkedDropWindowMessage);', picker.PICKER_HTML)
         self.assertIn('const LINKED_PHOTO_REFRESH_KEY = "project365-linked-photo-refresh";', picker.PICKER_HTML)
+        self.assertIn("linkedPhotoDropEntryId", picker.PICKER_HTML)
+        self.assertIn("function monitorLinkedPhotoPopup(popup, entryId)", picker.PICKER_HTML)
+        self.assertIn("Linked-photo window closed. Refreshing the entry.", picker.PICKER_HTML)
+        self.assertIn('const activeEntryId = state.currentEntry?.entry_id || state.selectedEntryId || "";', picker.PICKER_HTML)
+        self.assertIn("if (!activeEntryId || activeEntryId !== message.entry_id) return;", picker.PICKER_HTML)
         self.assertIn("function linkedPhotoDropFiles(files)", picker.PICKER_HTML)
         self.assertIn("for (const file of filesToImport) await importLinkedFile(file, entry);", picker.PICKER_HTML)
         self.assertIn('window.addEventListener("storage"', picker.PICKER_HTML)
@@ -4718,6 +4909,49 @@ class Project365OriginalPickerTests(unittest.TestCase):
             self.assertEqual(len(associated), 1)
             self.assertTrue(associated[0]["associated"])
             self.assertEqual(state.summary()["pending_decisions"]["associated"], 1)
+
+    def test_picker_refuses_to_link_selected_database_original_as_associated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            canonical_root = _import_sample(base, {"1998-04-12.png": _tiny_png()})
+            queue_path = canonical_root / "exports" / "verification_reports" / "queue.csv"
+            _write_queue(queue_path)
+            _append_search_entry(queue_path)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            with mock.patch.object(picker, "_set_project_addition_timestamps"):
+                selected_detail = state.add_copied_candidate(
+                    "project365:1998-04-12",
+                    "accepted-original.jpg",
+                    "image/jpeg",
+                    _jpeg_with_dimensions(30, 20),
+                )
+            selected_path = selected_detail["candidates"][0]["path"]
+            self.assertEqual(state.apply_decisions()["selected_count"], 1)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+
+            with self.assertRaisesRegex(ValueError, "already the selected original"):
+                state.add_linked_candidate(
+                    "project365:1998-04-12",
+                    selected_path,
+                    associate=True,
+                )
+
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                roles = connection.execute(
+                    """
+                    SELECT role, COUNT(*)
+                    FROM media_assets
+                    WHERE entry_id = ?
+                        AND role IN ('external_original_reference', 'external_original_associated_photo')
+                    GROUP BY role
+                    """,
+                    ("project365:1998-04-12",),
+                ).fetchall()
+            self.assertEqual(dict(roles), {"external_original_reference": 1})
 
     def test_picker_copies_dropped_image_into_managed_source_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5146,6 +5380,43 @@ class Project365OriginalPickerTests(unittest.TestCase):
             result = state.apply_decisions()
             self.assertEqual(result["associated_count"], 1)
             self.assertEqual(result["skipped_unknown_media_count"], 0)
+            state = picker.PickerState(
+                picker.PickerConfig(canonical_root=canonical_root, queue_path=queue_path)
+            )
+            persisted_detail = state.entry_detail(
+                "project365:1998-04-12",
+                include_database=True,
+            )
+            self.assertIsNotNone(persisted_detail)
+            self.assertEqual(persisted_detail["candidate_count"], 2)
+            self.assertEqual(persisted_detail["selected_count"], 1)
+            self.assertEqual(persisted_detail["associated_count"], 1)
+            persisted_selected = [
+                candidate
+                for candidate in persisted_detail["candidates"]
+                if candidate["database_confirmed_role"] == "external_original_reference"
+            ]
+            persisted_associated = [
+                candidate
+                for candidate in persisted_detail["candidates"]
+                if candidate["database_confirmed_role"] == "external_original_associated_photo"
+            ]
+            self.assertEqual(len(persisted_selected), 1)
+            self.assertEqual(len(persisted_associated), 1)
+            self.assertTrue(persisted_selected[0]["selected"])
+            self.assertTrue(persisted_associated[0]["associated"])
+            crop_entries = state.crop_entries(crop_filter="all")
+            self.assertEqual(len(crop_entries), 1)
+            self.assertEqual(crop_entries[0]["candidate_path"], persisted_selected[0]["path"])
+            self.assertNotEqual(crop_entries[0]["candidate_path"], persisted_associated[0]["path"])
+            crop_detail = state.crop_entry_detail("project365:1998-04-12")
+            crop_selected = [candidate for candidate in crop_detail["candidates"] if candidate["selected"]]
+            self.assertEqual(len(crop_selected), 1)
+            self.assertEqual(crop_selected[0]["path"], persisted_selected[0]["path"])
+            page = state.entry_page(status="all", entry_dates={"1998-04-12"}, limit=None)
+            self.assertEqual(page["returned_count"], 1)
+            self.assertEqual(page["entries"][0]["candidate_count"], 2)
+            self.assertEqual(page["entries"][0]["associated_count"], 1)
             with sqlite3.connect(canonical_root / "canonical.db") as connection:
                 roles = connection.execute(
                     """
@@ -5389,8 +5660,23 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertNotIn(".controls {\n  display: grid;", picker.CROP_HTML)
         self.assertIn("crop_estimate_batch", picker.CROP_HTML)
         self.assertIn("function shouldPreferSavedEstimateFilter(cropFilter, job)", picker.CROP_HTML)
+        self.assertIn("function shouldProbePersistedSavedEstimateFilter(cropFilter, body)", picker.CROP_HTML)
+        self.assertIn('const estimatedBody = await fetchJson(cropEntriesUrl("estimated"));', picker.CROP_HTML)
+        self.assertIn("filterControl.value = \"estimated\";", picker.CROP_HTML)
+        self.assertIn("Number(body?.total_count || 0) === 0", picker.CROP_HTML)
+        self.assertIn("function shouldFallBackToAllForDirectCropScope(cropFilter, body)", picker.CROP_HTML)
+        self.assertIn('const allBody = await fetchJson(cropEntriesUrl("all"));', picker.CROP_HTML)
+        self.assertIn("function cropEntryStateText(entry)", picker.CROP_HTML)
+        self.assertIn("saved estimate already opened and pending commit", picker.CROP_HTML)
         self.assertIn("function cropEstimateBatchSummary(job)", picker.CROP_HTML)
         self.assertIn("function applyInitialCropFilterFromUrl()", picker.CROP_HTML)
+        self.assertIn("function applyInitialCropDateScopeFromUrl()", picker.CROP_HTML)
+        self.assertIn("function cropEntriesUrl(cropFilter)", picker.CROP_HTML)
+        self.assertIn('params.append("entry_date", entryDate);', picker.CROP_HTML)
+        self.assertIn('params.set("start_date", state.cropStartDate);', picker.CROP_HTML)
+        self.assertIn('id="cropStartDate"', picker.CROP_HTML)
+        self.assertIn('id="cropEndDate"', picker.CROP_HTML)
+        self.assertIn('id="applyCropDateScopeButton"', picker.CROP_HTML)
         self.assertIn('state.cropFilterTouched = true;', picker.CROP_HTML)
         self.assertIn("grid-template-columns: 1fr", picker.CROP_HTML)
         self.assertIn("justify-content: start;", picker.CROP_HTML)
@@ -5572,7 +5858,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("function hasOpenVisibleCropMonth()", picker.CROP_HTML)
         self.assertIn("rememberOpenGroups(cropEntryById(state.selectedEntryId) || state.entries[0]);", picker.CROP_HTML)
         self.assertIn("if (collection.has(key) && element) element.open = true;", picker.CROP_HTML)
-        self.assertIn('fetchJson(`/api/crop-entries?crop_filter=${encodeURIComponent(cropFilter)}`)', picker.CROP_HTML)
+        self.assertIn("fetchJson(cropEntriesUrl(cropFilter))", picker.CROP_HTML)
         self.assertIn('fetchJson(`/api/crop-entry/', picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop"', picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop-reset"', picker.CROP_HTML)
