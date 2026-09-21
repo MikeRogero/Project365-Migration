@@ -68,11 +68,45 @@ def suggest_crop(
     sample_size: int = 24,
     candidate_rotation_degrees: float = 0.0,
 ) -> CropSuggestion:
+    rotation_degrees, suggestion = suggest_crop_for_rotations(
+        reference_path=reference_path,
+        candidate_path=candidate_path,
+        rotations=[candidate_rotation_degrees],
+        sample_size=sample_size,
+    )
+    return suggestion
+
+
+def suggest_crop_for_rotations(
+    reference_path: Path,
+    candidate_path: Path,
+    rotations: list[float] | tuple[float, ...],
+    sample_size: int = 24,
+) -> tuple[float, CropSuggestion]:
     if sample_size < 8:
         raise ValueError("sample-size must be at least 8")
+    if not rotations:
+        raise ValueError("At least one rotation is required")
     reference = load_image(reference_path)
     candidate = load_image(candidate_path)
     reference_sample = _resize_grayscale(reference, sample_size, sample_size)
+    suggestions = [
+        (
+            _normalized_rotation_degrees(rotation),
+            _suggest_crop_from_images(reference, candidate, reference_sample, sample_size, rotation),
+        )
+        for rotation in rotations
+    ]
+    return min(suggestions, key=lambda item: item[1].score)
+
+
+def _suggest_crop_from_images(
+    reference: ImagePixels,
+    candidate: ImagePixels,
+    reference_sample: list[int],
+    sample_size: int,
+    candidate_rotation_degrees: float = 0.0,
+) -> CropSuggestion:
     rotation_degrees = _normalized_rotation_degrees(candidate_rotation_degrees)
 
     aspect = reference.width / reference.height

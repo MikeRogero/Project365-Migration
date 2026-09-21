@@ -639,6 +639,7 @@ def _step_timeout_seconds(step: str) -> int:
         "broad_visual_match",
         "rough_prefilter_build",
         "rough_visual_match",
+        "generate_derivatives",
     }:
         return 12 * 60 * 60
     return 60 * 60
@@ -1118,6 +1119,8 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             "2560",
             "--quality",
             "88",
+            "--progress-interval",
+            "25",
         ]
         start_date = str(payload.get("start_date", "")).strip()
         end_date = str(payload.get("end_date", "")).strip()
@@ -1783,10 +1786,12 @@ def _summary_metrics(
             {"label": "Benchmark errors", "value": str(latest_benchmark.get("error_count", 0))},
         ]
     if step == "generate_derivatives":
+        progress = _latest_derivative_progress(outputs)
         return [
-            {"label": "Generated working copies", "value": parsed.get("Generated", "0")},
-            {"label": "Skipped unchanged copies", "value": parsed.get("Skipped", "0")},
-            {"label": "Not ready for export", "value": parsed.get("Not ready", "0")},
+            {"label": "Processed working-copy sources", "value": progress.get("processed", "0") if progress else parsed.get("Processed", "0")},
+            {"label": "Generated working copies", "value": parsed.get("Generated", progress.get("generated", "0") if progress else "0")},
+            {"label": "Skipped unchanged copies", "value": parsed.get("Skipped", progress.get("skipped", "0") if progress else "0")},
+            {"label": "Not ready for export", "value": parsed.get("Not ready", progress.get("not_ready", "0") if progress else "0")},
             {"label": "Not ready dates", "value": parsed.get("Not ready dates", "") or "none"},
             _delta_metric("Derivative records", db_before.get("diarium_derivatives"), db_after.get("diarium_derivatives")),
         ]
@@ -2011,6 +2016,25 @@ def _parse_key_value_output(outputs: list[dict[str, Any]]) -> dict[str, str]:
     return values
 
 
+def _latest_derivative_progress(outputs: list[dict[str, Any]]) -> dict[str, str]:
+    pattern = re.compile(
+        r"^Progress:\s+"
+        r"(?P<processed>\d+)/(?P<total>\d+)\s+sources\s+·\s+"
+        r"generated\s+(?P<generated>\d+)\s+·\s+"
+        r"skipped\s+(?P<skipped>\d+)\s+·\s+"
+        r"not ready\s+(?P<not_ready>\d+)"
+        r"(?:\s+·\s+current\s+(?P<current>\S+))?"
+    )
+    latest: dict[str, str] = {}
+    for output in outputs:
+        for line in str(output.get("output", "")).splitlines():
+            match = pattern.match(line.strip())
+            if not match:
+                continue
+            latest = {key: value or "" for key, value in match.groupdict().items()}
+    return latest
+
+
 def _delta_metric(label: str, before: Any, after: Any) -> dict[str, str]:
     before_number = _to_int(before)
     after_number = _to_int(after)
@@ -2066,7 +2090,19 @@ def _safe_error(error: str, outputs: list[dict[str, Any]]) -> str:
     failing = [item for item in outputs if item.get("returncode") not in {0, None}]
     if not failing:
         return ""
-    return str(failing[-1].get("output", ""))[-2000:]
+    output = str(failing[-1].get("output", ""))
+    timeout_match = re.search(r"Timed out after (\d+) seconds\.", output)
+    if timeout_match:
+        progress = _latest_derivative_progress([failing[-1]])
+        if progress:
+            return (
+                f"Timed out after {timeout_match.group(1)} seconds. "
+                f"Last progress: {progress['processed']}/{progress['total']} sources, "
+                f"generated {progress['generated']}, skipped {progress['skipped']}, "
+                f"not ready {progress['not_ready']}, current {progress.get('current') or 'unknown'}."
+            )
+        return timeout_match.group(0)
+    return output[-2000:]
 
 
 def _step_title(step: str) -> str:
@@ -2454,6 +2490,12 @@ def _database_status(db_path: Path) -> dict[str, Any]:
         "working_copy_not_ready_count": derivative_readiness.not_ready_count,
         "working_copy_current_count": derivative_readiness.current_count,
         "working_copy_needs_update_count": derivative_readiness.needs_update_count,
+        "working_copy_primary_source_count": getattr(derivative_readiness, "primary_source_count", 0),
+        "working_copy_primary_ready_count": getattr(derivative_readiness, "primary_ready_count", 0),
+        "working_copy_primary_not_ready_count": getattr(derivative_readiness, "primary_not_ready_count", 0),
+        "working_copy_associated_source_count": getattr(derivative_readiness, "associated_source_count", 0),
+        "working_copy_associated_ready_count": getattr(derivative_readiness, "associated_ready_count", 0),
+        "working_copy_associated_not_ready_count": getattr(derivative_readiness, "associated_not_ready_count", 0),
         "source_counts": [dict(row) for row in source_rows],
         "media": [dict(row) for row in rows],
     }
@@ -2476,6 +2518,12 @@ def _working_copy_readiness_status(start_date: str = "", end_date: str = "") -> 
             "working_copy_not_ready_count": readiness.not_ready_count,
             "working_copy_current_count": readiness.current_count,
             "working_copy_needs_update_count": readiness.needs_update_count,
+            "working_copy_primary_source_count": getattr(readiness, "primary_source_count", 0),
+            "working_copy_primary_ready_count": getattr(readiness, "primary_ready_count", 0),
+            "working_copy_primary_not_ready_count": getattr(readiness, "primary_not_ready_count", 0),
+            "working_copy_associated_source_count": getattr(readiness, "associated_source_count", 0),
+            "working_copy_associated_ready_count": getattr(readiness, "associated_ready_count", 0),
+            "working_copy_associated_not_ready_count": getattr(readiness, "associated_not_ready_count", 0),
         },
     }
 
@@ -3998,14 +4046,14 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                 elif parsed.path.startswith("/crop/api/entry/"):
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/entry/"))
-                    detail = state.picker_state().crop_entry_detail(entry_id)
+                    detail = state.picker_state().crop_entry_detail(entry_id, mark_estimated_viewed=False)
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
                         self._send_json(detail)
                 elif parsed.path.startswith("/crop/api/crop-entry/"):
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/crop-entry/"))
-                    detail = state.picker_state().crop_entry_detail(entry_id)
+                    detail = state.picker_state().crop_entry_detail(entry_id, mark_estimated_viewed=False)
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
@@ -6491,7 +6539,7 @@ a { color: var(--accent); }
         </div>
         <div class="field">
           <label title="Last Project365 entry date for a date-range target scope. Candidate filtering is controlled by Original candidates to compare.">Target end date</label>
-          <input id="broadEndDate" placeholder="YYYY-MM-DD or YYYY-MM">
+          <input id="broadEndDate" placeholder="optional end">
         </div>
         <div class="field">
           <label title="Optional file containing Project365 entry IDs that need broad search.">Broad-search-needed list</label>
@@ -6587,7 +6635,7 @@ a { color: var(--accent); }
         </div>
         <div class="field">
           <label title="Last unresolved target date for a bounded no-date run. Candidate dates are ignored.">Target end date</label>
-          <input id="roughEndDate" placeholder="YYYY-MM-DD or YYYY-MM">
+          <input id="roughEndDate" placeholder="optional end">
         </div>
         <div class="field">
           <label title="Optional file containing Project365 entry IDs that need broad search.">Broad-search-needed list</label>
@@ -6658,11 +6706,11 @@ a { color: var(--accent); }
       <div class="grid">
         <div class="field">
           <label>Start date</label>
-          <input id="workingCopyStartDate" placeholder="YYYY-MM-DD">
+          <input id="workingCopyStartDate" placeholder="YYYY-MM-DD or YYYY-MM">
         </div>
         <div class="field">
           <label>End date</label>
-          <input id="workingCopyEndDate" placeholder="YYYY-MM-DD">
+          <input id="workingCopyEndDate" placeholder="optional end">
         </div>
         <label class="checkbox-line inline-checkbox">
           <input id="forceWorkingCopies" type="checkbox">
@@ -6738,11 +6786,11 @@ a { color: var(--accent); }
       <div class="grid">
         <div class="field">
           <label>Start date</label>
-          <input id="diaryEnrichmentStartDate" placeholder="YYYY-MM-DD">
+          <input id="diaryEnrichmentStartDate" placeholder="YYYY-MM-DD or YYYY-MM">
         </div>
         <div class="field">
           <label>End date</label>
-          <input id="diaryEnrichmentEndDate" placeholder="YYYY-MM-DD">
+          <input id="diaryEnrichmentEndDate" placeholder="optional end">
         </div>
         <div class="field">
           <label>Entry limit</label>
@@ -6767,11 +6815,11 @@ a { color: var(--accent); }
       <div class="subtle">Generate a Day One ZIP. In Diarium, use Settings > Diary > Migrate from other app > Day One. Do not use Import diary; that expects a Diarium database backup and will say the ZIP is not a database.</div>
       <div class="field">
         <label>Start date</label>
-        <input id="startDate" placeholder="auto">
+        <input id="startDate" placeholder="auto, YYYY-MM-DD, or YYYY-MM">
       </div>
       <div class="field">
         <label>End date</label>
-        <input id="endDate" placeholder="auto">
+        <input id="endDate" placeholder="optional end">
       </div>
       <div class="field">
         <label>Limit</label>
@@ -6917,7 +6965,7 @@ function renderWorkingCopyReadiness(payload) {
   const needsUpdate = Number(db.working_copy_needs_update_count || 0);
   target.innerHTML = `
     <div class="result-metric"><span>Ready for export</span><strong>${ready}</strong></div>
-    <div class="result-metric"><span>Source chosen</span><strong>${sources}</strong></div>
+    <div class="result-metric"><span>Primary targets</span><strong>${sources}</strong></div>
     <div class="result-metric"><span>Already current</span><strong>${current}</strong></div>
     <div class="result-metric"><span>Need update</span><strong>${needsUpdate}</strong></div>
     <div class="result-metric"><span>Not ready</span><strong>${notReady}</strong></div>
@@ -6925,14 +6973,19 @@ function renderWorkingCopyReadiness(payload) {
 }
 
 function workingCopyDateScope() {
-  return {
-    startDate: document.getElementById("workingCopyStartDate")?.value.trim() || "",
-    endDate: document.getElementById("workingCopyEndDate")?.value.trim() || ""
-  };
+  return dateScopeFromInputValues(
+    document.getElementById("workingCopyStartDate")?.value || "",
+    document.getElementById("workingCopyEndDate")?.value || "",
+    {allowBlank: true}
+  );
 }
 
 async function refreshWorkingCopyReadiness() {
   const scope = workingCopyDateScope();
+  if (!scope.ok) {
+    setWorkingCopyMessage(scope.message, true);
+    return;
+  }
   const params = new URLSearchParams();
   if (scope.startDate) params.set("start_date", scope.startDate);
   if (scope.endDate) params.set("end_date", scope.endDate);
@@ -7080,39 +7133,71 @@ function validIsoDate(value) {
   return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
 }
 
+function dateScopeFromInputValues(startValue, endValue = "", options = {}) {
+  const startText = String(startValue || "").trim();
+  const endText = String(endValue || "").trim();
+  if (!startText && !endText && options.allowBlank) {
+    return {ok: true, startDate: "", endDate: ""};
+  }
+  if (!startText) return {ok: false, message: "Enter a date as YYYY-MM-DD or YYYY-MM."};
+  const startScope = parseDateScopeValue(startText);
+  if (!startScope) return {ok: false, message: "Enter a date as YYYY-MM-DD or YYYY-MM."};
+  const endScope = endText ? parseDateScopeValue(endText) : startScope;
+  if (!endScope) return {ok: false, message: "Enter the end date as YYYY-MM-DD or YYYY-MM."};
+  if (endScope.endDate < startScope.startDate) {
+    return {ok: false, message: "End date must be on or after start date."};
+  }
+  return {ok: true, startDate: startScope.startDate, endDate: endScope.endDate};
+}
+
+function parseDateScopeValue(value) {
+  const text = String(value || "").trim().replace(/^project365:/, "");
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (dateMatch) {
+    const parsed = new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])));
+    const normalized = parsed.toISOString().slice(0, 10);
+    return normalized === text ? {startDate: normalized, endDate: normalized} : null;
+  }
+  const monthMatch = /^(\d{4})-(\d{2})$/.exec(text);
+  if (!monthMatch) return null;
+  const year = Number(monthMatch[1]);
+  const month = Number(monthMatch[2]);
+  if (month < 1 || month > 12) return null;
+  return {
+    startDate: `${monthMatch[1]}-${monthMatch[2]}-01`,
+    endDate: new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10)
+  };
+}
+
 function openDiaryIntake() {
   window.location.assign(new URL("/intake", window.location.href).toString());
 }
 
 function openDiaryEnrichment() {
-  const startDate = document.getElementById("diaryEnrichmentStartDate").value.trim();
-  const endDate = document.getElementById("diaryEnrichmentEndDate").value.trim();
+  const scope = dateScopeFromInputValues(
+    document.getElementById("diaryEnrichmentStartDate").value,
+    document.getElementById("diaryEnrichmentEndDate").value
+  );
   const limit = Number(document.getElementById("diaryEnrichmentLimit").value || "200");
-  if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
-    setDiaryEnrichmentMessage("Enter both start and end dates as YYYY-MM-DD.", true);
-    return;
-  }
-  if (startDate > endDate) {
-    setDiaryEnrichmentMessage("Start date must be before or equal to end date.", true);
+  if (!scope.ok) {
+    setDiaryEnrichmentMessage(scope.message, true);
     return;
   }
   const boundedLimit = Math.max(1, Math.min(Math.round(Number.isFinite(limit) ? limit : 200), 1000));
   const url = new URL("/enrich", window.location.href);
-  url.searchParams.set("start_date", startDate);
-  url.searchParams.set("end_date", endDate);
+  url.searchParams.set("start_date", scope.startDate);
+  url.searchParams.set("end_date", scope.endDate);
   url.searchParams.set("limit", String(boundedLimit));
   window.location.assign(url.toString());
 }
 
 async function runWorkingCopies() {
-  const startDate = document.getElementById("workingCopyStartDate").value.trim();
-  const endDate = document.getElementById("workingCopyEndDate").value.trim();
-  if (!validIsoDate(startDate) || !validIsoDate(endDate)) {
-    setWorkingCopyMessage("Enter both start and end dates as YYYY-MM-DD.", true);
-    return;
-  }
-  if (startDate > endDate) {
-    setWorkingCopyMessage("Start date must be before or equal to end date.", true);
+  const scope = dateScopeFromInputValues(
+    document.getElementById("workingCopyStartDate").value,
+    document.getElementById("workingCopyEndDate").value
+  );
+  if (!scope.ok) {
+    setWorkingCopyMessage(scope.message, true);
     return;
   }
   setWorkingCopyMessage(
@@ -7121,8 +7206,8 @@ async function runWorkingCopies() {
       : "Starting selected dates; unchanged copies will be skipped."
   );
   await runStep("generate_derivatives", {
-    start_date: startDate,
-    end_date: endDate,
+    start_date: scope.startDate,
+    end_date: scope.endDate,
     force: Boolean(document.getElementById("forceWorkingCopies").checked)
   });
   await refreshWorkingCopyReadiness();
@@ -7373,6 +7458,10 @@ function jobProgressPercent(job) {
   if (step === "rough_visual_match") {
     const run = job.rough_visual_run || {};
     return percentComplete(run.processed_target_count, run.target_count);
+  }
+  if (step === "generate_derivatives") {
+    const progress = latestWorkingCopyProgress(job);
+    if (progress) return percentComplete(progress.done, progress.total);
   }
   return null;
 }
@@ -8234,6 +8323,10 @@ async function refreshPhotoIndexMetadata() {
 
 async function buildBroadVisualIndex() {
   const settings = broadVisualSettings();
+  if (settings.date_scope_error) {
+    setStepMessage("broad_visual_index", settings.date_scope_error, "error");
+    return;
+  }
   if (settings.confirmed_only && settings.target_scope === "all_unresolved") {
     setStepMessage("broad_visual_index", "Choose a date range, entry IDs, or list for a constrained confirmed-only index.", "error");
     return;
@@ -8247,6 +8340,10 @@ async function buildBroadVisualIndex() {
 async function runBroadVisualMatch() {
   const settings = broadVisualSettings();
   const trigger = activeButton();
+  if (settings.date_scope_error) {
+    setStepMessage("broad_visual_match", settings.date_scope_error, "error");
+    return;
+  }
   if (settings.confirmed_only) {
     setStepMessage("broad_visual_match", "Fingerprint already confirmed originals is for Build fingerprints plus Measure accuracy. Uncheck it before searching unresolved photos.", "error");
     return;
@@ -8256,7 +8353,7 @@ async function runBroadVisualMatch() {
     return;
   }
   if (settings.target_scope === "date_range" && (!settings.start_date || !settings.end_date)) {
-    setStepMessage("broad_visual_match", "Enter both start and end dates.", "error");
+    setStepMessage("broad_visual_match", "Enter a target start date.", "error");
     return;
   }
   if (settings.target_scope === "broad_search_needed_list" && !settings.broad_search_needed_list) {
@@ -8295,16 +8392,24 @@ async function runBroadVisualMatch() {
 
 async function runBroadVisualBenchmark() {
   const settings = broadVisualSettings();
+  if (settings.date_scope_error) {
+    setStepMessage("broad_visual_match", settings.date_scope_error, "error");
+    return;
+  }
   await runStep("broad_visual_benchmark", settings);
 }
 
 function roughVisualSettings() {
   const scope = document.getElementById("roughTargetScope")?.value || "all_unresolved";
+  const dateScope = scope === "date_range"
+    ? dateScopeFromInputValues(document.getElementById("roughStartDate").value, document.getElementById("roughEndDate").value)
+    : {ok: true, startDate: "", endDate: ""};
   return {
     target_scope: scope,
     entry_ids: scope === "entry_ids" ? parseDelimited("roughEntryIds").map(normalizeProject365EntryJump).filter(Boolean) : [],
-    start_date: scope === "date_range" ? document.getElementById("roughStartDate").value.trim() : "",
-    end_date: scope === "date_range" ? document.getElementById("roughEndDate").value.trim() : "",
+    start_date: dateScope.ok ? dateScope.startDate : "",
+    end_date: dateScope.ok ? dateScope.endDate : "",
+    date_scope_error: dateScope.ok ? "" : dateScope.message,
     broad_search_needed_list: scope === "broad_search_needed_list" ? document.getElementById("roughNeededList").value.trim() : "",
     shortlist_size: Number(document.getElementById("roughShortlistSize").value || "1000"),
     per_band_hit_limit: Number(document.getElementById("roughPerBandHitLimit").value || "50000"),
@@ -8320,6 +8425,10 @@ function roughVisualSettings() {
 
 async function buildRoughPrefilter() {
   const settings = roughVisualSettings();
+  if (settings.date_scope_error) {
+    setStepMessage("rough_visual_match", settings.date_scope_error, "error");
+    return;
+  }
   await runStep("rough_prefilter_build", settings);
 }
 
@@ -8341,12 +8450,16 @@ async function checkRoughPrefilterReadiness() {
 
 async function runRoughVisualMatch() {
   const settings = roughVisualSettings();
+  if (settings.date_scope_error) {
+    setStepMessage("rough_visual_match", settings.date_scope_error, "error");
+    return;
+  }
   if (settings.target_scope === "entry_ids" && !settings.entry_ids.length) {
     setStepMessage("rough_visual_match", "Enter at least one entry ID.", "error");
     return;
   }
   if (settings.target_scope === "date_range" && (!settings.start_date || !settings.end_date)) {
-    setStepMessage("rough_visual_match", "Enter both target start and end dates.", "error");
+    setStepMessage("rough_visual_match", "Enter a target start date.", "error");
     return;
   }
   if (settings.target_scope === "broad_search_needed_list" && !settings.broad_search_needed_list) {
@@ -8366,6 +8479,10 @@ async function runRoughVisualMatch() {
 
 async function runRoughVisualBenchmark() {
   const settings = roughVisualSettings();
+  if (settings.date_scope_error) {
+    setStepMessage("rough_visual_match", settings.date_scope_error, "error");
+    return;
+  }
   await runStep("rough_visual_benchmark", settings);
 }
 
@@ -8399,12 +8516,16 @@ function openRoughVisualReview() {
 
 function broadVisualSettings() {
   const scope = document.getElementById("broadTargetScope")?.value || "all_unresolved";
+  const dateScope = scope === "date_range"
+    ? dateScopeFromInputValues(document.getElementById("broadStartDate").value, document.getElementById("broadEndDate").value)
+    : {ok: true, startDate: "", endDate: ""};
   return {
     candidate_roots: parseDelimited("broadCandidateRoots"),
     target_scope: scope,
     entry_ids: scope === "entry_ids" ? parseDelimited("broadEntryIds").map(normalizeProject365EntryJump).filter(Boolean) : [],
-    start_date: scope === "date_range" ? document.getElementById("broadStartDate").value.trim() : "",
-    end_date: scope === "date_range" ? document.getElementById("broadEndDate").value.trim() : "",
+    start_date: dateScope.ok ? dateScope.startDate : "",
+    end_date: dateScope.ok ? dateScope.endDate : "",
+    date_scope_error: dateScope.ok ? "" : dateScope.message,
     broad_search_needed_list: scope === "broad_search_needed_list" ? document.getElementById("broadNeededList").value.trim() : "",
     candidate_scope: document.getElementById("broadCandidateScope").value,
     max_results: Number(document.getElementById("broadMaxResults").value || "20"),
@@ -8604,9 +8725,18 @@ function splitAttemptList(value) {
 }
 
 async function runDiariumPackage() {
+  const scope = dateScopeFromInputValues(
+    document.getElementById("startDate").value,
+    document.getElementById("endDate").value,
+    {allowBlank: true}
+  );
+  if (!scope.ok) {
+    setStepMessage("generate_diarium_package", scope.message, "error");
+    return;
+  }
   await runStep("generate_diarium_package", {
-    start_date: document.getElementById("startDate").value.trim(),
-    end_date: document.getElementById("endDate").value.trim(),
+    start_date: scope.startDate,
+    end_date: scope.endDate,
     limit: Number(document.getElementById("limit").value || "100000")
   });
 }
@@ -8933,6 +9063,17 @@ function formatHeartbeatAge(value) {
 
 function workingCopyProgressDetail(job) {
   const latest = latestOutput(job);
+  const progress = latestWorkingCopyProgress(job);
+  if (progress) {
+    const pieces = [
+      `${progress.done}/${progress.total} sources`,
+      `generated ${progress.generated}`,
+      `skipped ${progress.skipped}`,
+      `not ready ${progress.notReady}`
+    ];
+    if (progress.current) pieces.push(`current ${progress.current}`);
+    return pieces.join(" · ");
+  }
   const parsed = parseColonLines(latest);
   const generated = parsed.Generated || "";
   const skipped = parsed.Skipped || "";
@@ -8950,6 +9091,23 @@ function workingCopyProgressDetail(job) {
   if (job.status === "pass") return "Working copies finished.";
   if (job.status === "fail") return job.error || "Working-copy generation failed.";
   return "Generating working copies.";
+}
+
+function latestWorkingCopyProgress(job) {
+  const lines = latestOutput(job).trim().split("\n").filter(Boolean).reverse();
+  for (const line of lines) {
+    const match = line.match(/^Progress:\s+(\d+)\/(\d+)\s+sources\s+·\s+generated\s+(\d+)\s+·\s+skipped\s+(\d+)\s+·\s+not ready\s+(\d+)(?:\s+·\s+current\s+(.+))?$/);
+    if (!match) continue;
+    return {
+      done: Number(match[1] || 0),
+      total: Number(match[2] || 0),
+      generated: Number(match[3] || 0),
+      skipped: Number(match[4] || 0),
+      notReady: Number(match[5] || 0),
+      current: match[6] || ""
+    };
+  }
+  return null;
 }
 
 function genericRunningProgressDetail(job) {

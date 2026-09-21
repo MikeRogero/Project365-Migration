@@ -61,6 +61,46 @@ class Project365CropAlignTests(unittest.TestCase):
             self.assertEqual(suggestion.width, 40)
             self.assertEqual(suggestion.height, 40)
 
+    def test_suggests_best_rotation_without_reloading_images(self) -> None:
+        reference = crop_align.ImagePixels(width=40, height=40, gray=[0] * 1600)
+        candidate = crop_align.ImagePixels(width=80, height=40, gray=[0] * 3200)
+
+        def fake_suggest(
+            _reference: crop_align.ImagePixels,
+            _candidate: crop_align.ImagePixels,
+            _reference_sample: list[int],
+            _sample_size: int,
+            candidate_rotation_degrees: float = 0.0,
+        ) -> crop_align.CropSuggestion:
+            scores = {0.0: 50.0, 90.0: 5.0, -90.0: 20.0}
+            return crop_align.CropSuggestion(
+                x=0,
+                y=0,
+                width=40,
+                height=40,
+                score=scores[candidate_rotation_degrees],
+                confidence="high",
+                reference_width=40,
+                reference_height=40,
+                candidate_width=80,
+                candidate_height=40,
+            )
+
+        with (
+            mock.patch.object(crop_align, "load_image", side_effect=[reference, candidate]) as load_image,
+            mock.patch.object(crop_align, "_suggest_crop_from_images", side_effect=fake_suggest) as suggest,
+        ):
+            rotation, suggestion = crop_align.suggest_crop_for_rotations(
+                Path("reference.heic"),
+                Path("candidate.heic"),
+                rotations=[0, 90, -90],
+            )
+
+        self.assertEqual(rotation, 90.0)
+        self.assertEqual(suggestion.score, 5.0)
+        self.assertEqual(load_image.call_count, 2)
+        self.assertEqual(suggest.call_count, 3)
+
     def test_refines_low_confidence_largest_crop_between_scan_positions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)

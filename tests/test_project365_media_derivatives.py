@@ -53,6 +53,10 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             derivative_path = Path(rows[0]["derivative_path"])
             self.assertTrue(derivative_path.exists())
+            self.assertEqual(
+                derivative_path.name,
+                "Project365 Working Copy - 1998-04-12 - sq64.jpg",
+            )
             self.assertEqual(rows[0]["format"], "jpeg")
 
             with sqlite3.connect(canonical_root / "canonical.db") as connection:
@@ -84,11 +88,21 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             associated_path.write_bytes(_tiny_png())
             _insert_associated_original(canonical_root, associated_path)
 
+            default_readiness = derivatives.derivative_readiness_summary(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            self.assertEqual(default_readiness.source_count, 1)
+            self.assertEqual(default_readiness.associated_source_count, 0)
+
             summary = derivatives.generate_derivatives(
                 canonical_root=canonical_root,
                 output_format="jpeg",
                 long_edge=64,
                 quality=80,
+                include_associated=True,
             )
 
             self.assertEqual(summary.generated_count, 2)
@@ -112,6 +126,18 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             associated_transformation = json.loads(rows[0][2])
             self.assertEqual(associated_transformation["source_role"], "associated")
             self.assertEqual(associated_transformation["derivative_role"], "diarium_associated_derivative")
+            with Path(summary.report_path).open(newline="") as handle:
+                report_rows = list(csv.DictReader(handle))
+            associated_path = next(
+                Path(row["derivative_path"])
+                for row in report_rows
+                if ":diarium_associated_derivative:" in row["derivative_media_asset_id"]
+            )
+            self.assertTrue(
+                associated_path.name.startswith(
+                    "Project365 Working Copy - 1998-04-12 - associated sq64 - "
+                )
+            )
 
     def test_missing_review_crop_is_not_ready_for_derivative_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -142,6 +168,43 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "not_ready_missing_crop")
             self.assertFalse(Path(rows[0]["derivative_path"]).exists())
+
+    def test_progress_sink_reports_processed_totals_during_derivative_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {
+                    "1998-04-12.png": _tiny_png(),
+                    "1998-04-13.png": _tiny_png(),
+                },
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            progress_messages: list[str] = []
+
+            derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+                progress_interval=1,
+                progress_sink=progress_messages.append,
+            )
+
+            self.assertEqual(
+                progress_messages,
+                [
+                    "Progress: 0/2 sources · generated 0 · skipped 0 · not ready 0",
+                    "Progress: 1/2 sources · generated 0 · skipped 0 · not ready 1 · current project365:1998-04-12",
+                    "Progress: 2/2 sources · generated 0 · skipped 0 · not ready 2 · current project365:1998-04-13",
+                ],
+            )
 
     def test_staged_estimate_makes_derivative_ready_without_confirming_source_crop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -329,6 +392,61 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             self.assertEqual(summary.skipped_count, 0)
             self.assertEqual(convert.call_count, 1)
 
+    def test_force_reuses_recent_existing_working_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+            existing_path = (
+                canonical_root
+                / "media"
+                / "diarium_derivatives"
+                / "jpeg_64_q80"
+                / "1998-04"
+                / "Project365 Working Copy - 1998-04-12 - sq64.jpg"
+            )
+            existing_path.parent.mkdir(parents=True)
+            existing_path.write_bytes(_tiny_png())
+
+            with mock.patch.object(derivatives, "_convert_image_atomically", side_effect=AssertionError("should reuse")), mock.patch.object(
+                derivatives,
+                "_image_dimensions",
+                return_value=(1, 1),
+            ):
+                summary = derivatives.generate_derivatives(
+                    canonical_root=canonical_root,
+                    output_format="jpeg",
+                    long_edge=64,
+                    quality=80,
+                    force=True,
+                    reuse_existing_newer_than="2000-01-01T00:00:00+00:00",
+                )
+
+            self.assertEqual(summary.generated_count, 0)
+            self.assertEqual(summary.skipped_count, 1)
+            with Path(summary.report_path).open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["status"], "skipped_recent_existing")
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                storage_path = connection.execute(
+                    """
+                    SELECT storage_path
+                    FROM media_assets
+                    WHERE role = 'diarium_derivative'
+                    """
+                ).fetchone()[0]
+            self.assertEqual(storage_path, str(existing_path))
+
     def test_changed_crop_regenerates_existing_derivative(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -394,7 +512,7 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             self.assertEqual(second_summary.skipped_count, 0)
             self.assertEqual(convert.call_count, 1)
 
-    def test_missing_preferred_external_original_fails_clearly(self) -> None:
+    def test_missing_preferred_external_original_is_reported_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             import_dir = base / "Import"
@@ -427,13 +545,80 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                 )
                 connection.commit()
 
-            with self.assertRaisesRegex(FileNotFoundError, "Missing source media"):
-                derivatives.generate_derivatives(
+            readiness = derivatives.derivative_readiness_summary(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            self.assertEqual(readiness.ready_count, 0)
+            self.assertEqual(readiness.not_ready_count, 1)
+
+            summary = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+
+            self.assertEqual(summary.generated_count, 0)
+            self.assertEqual(summary.not_ready_count, 1)
+            self.assertEqual(summary.not_ready_dates, ("1998-04-12",))
+            with Path(summary.report_path).open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["status"], "not_ready_missing_source")
+            self.assertFalse(Path(rows[0]["derivative_path"]).exists())
+
+    def test_conversion_failure_is_reported_not_ready_and_does_not_abort_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {
+                    "1998-04-12.png": _tiny_png(),
+                    "1998-04-13.png": _tiny_png(),
+                },
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+
+            def fake_convert(
+                source_path: Path,
+                output_path: Path,
+                output_format: str,
+                long_edge: int,
+                quality: int,
+                crop: dict[str, object],
+            ) -> None:
+                if output_path.name == "Project365 Working Copy - 1998-04-12 - sq64.jpg":
+                    raise subprocess.CalledProcessError(13, ["sips", str(source_path)])
+                output_path.write_bytes(_tiny_png())
+
+            with mock.patch.object(derivatives, "_convert_image_atomically", side_effect=fake_convert):
+                summary = derivatives.generate_derivatives(
                     canonical_root=canonical_root,
                     output_format="jpeg",
                     long_edge=64,
                     quality=80,
                 )
+
+            self.assertEqual(summary.generated_count, 1)
+            self.assertEqual(summary.not_ready_count, 1)
+            with Path(summary.report_path).open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            by_entry = {row["entry_id"]: row for row in rows}
+            self.assertEqual(
+                by_entry["project365:1998-04-12"]["status"],
+                "not_ready_conversion_failed",
+            )
+            self.assertIn("returned exit status 13", by_entry["project365:1998-04-12"]["error"])
+            self.assertEqual(by_entry["project365:1998-04-13"]["status"], "generated")
 
     def test_conversion_applies_square_crop_before_resizing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

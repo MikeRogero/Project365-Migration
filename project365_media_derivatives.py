@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 DEFAULT_DERIVATIVE_POLICY = "Project365_square_2560_q88"
@@ -39,6 +40,12 @@ class DerivativeReadinessSummary:
     not_ready_count: int
     current_count: int
     needs_update_count: int
+    primary_source_count: int = 0
+    primary_ready_count: int = 0
+    primary_not_ready_count: int = 0
+    associated_source_count: int = 0
+    associated_ready_count: int = 0
+    associated_not_ready_count: int = 0
 
 
 def main() -> int:
@@ -57,6 +64,28 @@ def main() -> int:
         action="store_true",
         help="Regenerate every derivative even when an existing output is current.",
     )
+    parser.add_argument(
+        "--include-associated",
+        action="store_true",
+        help="Also generate derivatives for associated photos linked to diary entries.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=0,
+        help="Print progress every N source rows. Disabled by default.",
+    )
+    parser.add_argument(
+        "--reuse-existing-newer-than",
+        default="",
+        help="When forcing, adopt an existing derivative file newer than this ISO timestamp instead of rewriting it.",
+    )
+    parser.add_argument(
+        "--commit-interval",
+        type=int,
+        default=100,
+        help="Commit derivative metadata every N processed rows. Use 0 to commit only at the end.",
+    )
     args = parser.parse_args()
 
     summary = generate_derivatives(
@@ -68,6 +97,11 @@ def main() -> int:
         start_date=args.start_date,
         end_date=args.end_date,
         force=args.force,
+        include_associated=args.include_associated,
+        progress_interval=args.progress_interval,
+        progress_sink=lambda message: print(message, flush=True),
+        reuse_existing_newer_than=args.reuse_existing_newer_than,
+        commit_interval=args.commit_interval,
     )
     print("Project365 media derivative generation: PASS")
     print(f"Output: {summary.output_dir}")
@@ -93,6 +127,11 @@ def generate_derivatives(
     start_date: str = "",
     end_date: str = "",
     force: bool = False,
+    include_associated: bool = False,
+    progress_interval: int = 0,
+    progress_sink: Callable[[str], None] | None = None,
+    reuse_existing_newer_than: str = "",
+    commit_interval: int = 100,
 ) -> DerivativeSummary:
     if output_format not in {"jpeg", "heic"}:
         raise ValueError("output_format must be jpeg or heic")
@@ -110,34 +149,83 @@ def generate_derivatives(
     report_path = canonical_root / "exports" / "verification_reports" / f"media_derivatives_{policy}.csv"
     output_root.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    reuse_existing_after = _parse_optional_datetime(reuse_existing_newer_than)
 
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        rows = _load_source_media(connection, policy, limit, start_date, end_date)
+        rows = _load_source_media(
+            connection,
+            policy,
+            limit,
+            start_date,
+            end_date,
+            include_associated=include_associated,
+        )
         staged_crops = _load_staged_review_crops(canonical_root)
         report_rows = []
         generated_count = 0
         skipped_count = 0
         not_ready_count = 0
         not_ready_dates: set[str] = set()
+        total_count = len(rows)
+        processed_count = 0
+        _emit_derivative_progress(
+            progress_sink,
+            progress_interval,
+            processed_count,
+            total_count,
+            generated_count,
+            skipped_count,
+            not_ready_count,
+        )
         for row in rows:
             source_path = Path(row["storage_path"])
-            if not source_path.exists():
-                raise FileNotFoundError(f"Missing source media for derivative: {source_path}")
             month = row["entry_date"][:7]
             extension = "jpg" if output_format == "jpeg" else "heic"
-            output_stem = _derivative_output_stem(row)
+            output_stem = _derivative_output_stem(row, long_edge)
             output_path = output_root / month / f"{output_stem}.{extension}"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             crop = _review_crop_from_transformation(row["source_transformation_json"])
             crop = _staged_review_crop_for_row(staged_crops, row) or crop
             derivative_id = str(row["derivative_id"])
             derivative_role = str(row["derivative_role"])
+            if not source_path.exists():
+                not_ready_count += 1
+                not_ready_dates.add(str(row["entry_date"]))
+                _mark_derivative_not_ready(connection, row, derivative_id, "missing_source_media")
+                report_rows.append(
+                    _report_row(
+                        row=row,
+                        derivative_id=derivative_id,
+                        output_path=output_path,
+                        output_format=output_format,
+                        long_edge=long_edge,
+                        quality=quality,
+                        crop=crop,
+                        width="",
+                        height="",
+                        byte_size=int(row["derivative_byte_size"] or 0),
+                        sha256=str(row["derivative_sha256"] or ""),
+                        status="not_ready_missing_source",
+                    )
+                )
+                processed_count += 1
+                _emit_derivative_progress(
+                    progress_sink,
+                    progress_interval,
+                    processed_count,
+                    total_count,
+                    generated_count,
+                    skipped_count,
+                    not_ready_count,
+                    str(row["entry_id"]),
+                )
+                continue
             if crop is None:
                 not_ready_count += 1
                 not_ready_dates.add(str(row["entry_date"]))
-                _mark_derivative_not_ready(connection, row, derivative_id)
+                _mark_derivative_not_ready(connection, row, derivative_id, "missing_review_crop")
                 report_rows.append(
                     _report_row(
                         row=row,
@@ -153,6 +241,17 @@ def generate_derivatives(
                         sha256=str(row["derivative_sha256"] or ""),
                         status="not_ready_missing_crop",
                     )
+                )
+                processed_count += 1
+                _emit_derivative_progress(
+                    progress_sink,
+                    progress_interval,
+                    processed_count,
+                    total_count,
+                    generated_count,
+                    skipped_count,
+                    not_ready_count,
+                    str(row["entry_id"]),
                 )
                 continue
             transformation = {
@@ -185,71 +284,124 @@ def generate_derivatives(
                         status="skipped",
                     )
                 )
+                processed_count += 1
+                _emit_derivative_progress(
+                    progress_sink,
+                    progress_interval,
+                    processed_count,
+                    total_count,
+                    generated_count,
+                    skipped_count,
+                    not_ready_count,
+                    str(row["entry_id"]),
+                )
+                _commit_progress(connection, processed_count, commit_interval)
                 continue
 
-            _convert_image_atomically(source_path, output_path, output_format, long_edge, quality, crop)
-            if not output_path.exists():
-                raise FileNotFoundError(f"Derivative conversion did not create output: {output_path}")
-            sha256 = _sha256_file(output_path)
-            byte_size = output_path.stat().st_size
-            width, height = _image_dimensions(output_path)
-            if width != height:
-                output_path.unlink(missing_ok=True)
-                raise ValueError(
-                    f"Derivative output is not square for {row['entry_id']}: {width} x {height}"
+            if force and _can_reuse_existing_derivative(output_path, reuse_existing_after):
+                sha256 = _sha256_file(output_path)
+                byte_size = output_path.stat().st_size
+                width, height = _image_dimensions(output_path)
+                if width == height:
+                    _upsert_derivative_asset(
+                        connection=connection,
+                        row=row,
+                        derivative_id=derivative_id,
+                        derivative_role=derivative_role,
+                        output_path=output_path,
+                        sha256=sha256,
+                        byte_size=byte_size,
+                        output_format=output_format,
+                        transformation=transformation,
+                    )
+                    skipped_count += 1
+                    report_rows.append(
+                        _report_row(
+                            row=row,
+                            derivative_id=derivative_id,
+                            output_path=output_path,
+                            output_format=output_format,
+                            long_edge=long_edge,
+                            quality=quality,
+                            crop=crop,
+                            width=width,
+                            height=height,
+                            byte_size=byte_size,
+                            sha256=sha256,
+                            status="skipped_recent_existing",
+                        )
+                    )
+                    processed_count += 1
+                    _emit_derivative_progress(
+                        progress_sink,
+                        progress_interval,
+                        processed_count,
+                        total_count,
+                        generated_count,
+                        skipped_count,
+                        not_ready_count,
+                        str(row["entry_id"]),
+                    )
+                    _commit_progress(connection, processed_count, commit_interval)
+                    continue
+
+            try:
+                _convert_image_atomically(source_path, output_path, output_format, long_edge, quality, crop)
+                if not output_path.exists():
+                    raise FileNotFoundError(f"Derivative conversion did not create output: {output_path}")
+                sha256 = _sha256_file(output_path)
+                byte_size = output_path.stat().st_size
+                width, height = _image_dimensions(output_path)
+                if width != height:
+                    output_path.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"Derivative output is not square for {row['entry_id']}: {width} x {height}"
+                    )
+            except (subprocess.CalledProcessError, RuntimeError, FileNotFoundError, ValueError) as exc:
+                not_ready_count += 1
+                not_ready_dates.add(str(row["entry_date"]))
+                _mark_derivative_not_ready(connection, row, derivative_id, "conversion_failed")
+                report_rows.append(
+                    _report_row(
+                        row=row,
+                        derivative_id=derivative_id,
+                        output_path=output_path,
+                        output_format=output_format,
+                        long_edge=long_edge,
+                        quality=quality,
+                        crop=crop,
+                        width="",
+                        height="",
+                        byte_size=int(row["derivative_byte_size"] or 0),
+                        sha256=str(row["derivative_sha256"] or ""),
+                        status="not_ready_conversion_failed",
+                        error=_format_derivative_error(exc),
+                    )
                 )
+                processed_count += 1
+                _emit_derivative_progress(
+                    progress_sink,
+                    progress_interval,
+                    processed_count,
+                    total_count,
+                    generated_count,
+                    skipped_count,
+                    not_ready_count,
+                    str(row["entry_id"]),
+                )
+                continue
             now = dt.datetime.now(dt.UTC).isoformat()
-            connection.execute(
-                """
-                INSERT INTO media_assets (
-                    id,
-                    entry_id,
-                    role,
-                    source_file_id,
-                    internal_filename,
-                    storage_path,
-                    sha256,
-                    byte_size,
-                    mime_type,
-                    status,
-                    review_status,
-                    selected_default,
-                    transformation_json,
-                    import_batch_id,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available',
-                        'unreviewed', 0, ?, ?, ?, ?)
-                ON CONFLICT(id)
-                DO UPDATE SET
-                    source_file_id = excluded.source_file_id,
-                    internal_filename = excluded.internal_filename,
-                    storage_path = excluded.storage_path,
-                    sha256 = excluded.sha256,
-                    byte_size = excluded.byte_size,
-                    mime_type = excluded.mime_type,
-                    status = excluded.status,
-                    review_status = excluded.review_status,
-                    transformation_json = excluded.transformation_json,
-                    import_batch_id = excluded.import_batch_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    derivative_id,
-                    row["entry_id"],
-                    derivative_role,
-                    row["source_file_id"],
-                    output_path.name,
-                    str(output_path),
-                    sha256,
-                    byte_size,
-                    _mime_type(output_format),
-                    json.dumps(transformation, sort_keys=True),
-                    row["import_batch_id"],
-                    now,
-                    now,
-                ),
+            _upsert_derivative_asset(
+                connection=connection,
+                row=row,
+                derivative_id=derivative_id,
+                derivative_role=derivative_role,
+                output_path=output_path,
+                sha256=sha256,
+                byte_size=byte_size,
+                output_format=output_format,
+                transformation=transformation,
+                now=now,
             )
             generated_count += 1
             report_rows.append(
@@ -268,6 +420,18 @@ def generate_derivatives(
                     status="generated",
                 )
             )
+            processed_count += 1
+            _emit_derivative_progress(
+                progress_sink,
+                progress_interval,
+                processed_count,
+                total_count,
+                generated_count,
+                skipped_count,
+                not_ready_count,
+                str(row["entry_id"]),
+            )
+            _commit_progress(connection, processed_count, commit_interval)
         connection.commit()
     finally:
         connection.close()
@@ -285,6 +449,134 @@ def generate_derivatives(
     )
 
 
+def _emit_derivative_progress(
+    progress_sink: Callable[[str], None] | None,
+    progress_interval: int,
+    processed_count: int,
+    total_count: int,
+    generated_count: int,
+    skipped_count: int,
+    not_ready_count: int,
+    current_entry_id: str = "",
+) -> None:
+    if progress_sink is None or progress_interval <= 0:
+        return
+    if processed_count not in {0, total_count} and processed_count % progress_interval != 0:
+        return
+    current = f" · current {current_entry_id}" if current_entry_id else ""
+    progress_sink(
+        "Progress: "
+        f"{processed_count}/{total_count} sources · "
+        f"generated {generated_count} · "
+        f"skipped {skipped_count} · "
+        f"not ready {not_ready_count}"
+        f"{current}"
+    )
+
+
+def _parse_optional_datetime(value: str) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    parsed = dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def _can_reuse_existing_derivative(output_path: Path, newer_than: dt.datetime | None) -> bool:
+    if newer_than is None or not output_path.exists():
+        return False
+    output_mtime = dt.datetime.fromtimestamp(output_path.stat().st_mtime, dt.UTC)
+    return output_mtime >= newer_than
+
+
+def _commit_progress(
+    connection: sqlite3.Connection,
+    processed_count: int,
+    commit_interval: int,
+) -> None:
+    if commit_interval > 0 and processed_count > 0 and processed_count % commit_interval == 0:
+        connection.commit()
+
+
+def _upsert_derivative_asset(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    derivative_id: str,
+    derivative_role: str,
+    output_path: Path,
+    sha256: str,
+    byte_size: int,
+    output_format: str,
+    transformation: dict[str, object],
+    now: str | None = None,
+) -> None:
+    timestamp = now or dt.datetime.now(dt.UTC).isoformat()
+    connection.execute(
+        """
+        INSERT INTO media_assets (
+            id,
+            entry_id,
+            role,
+            source_file_id,
+            internal_filename,
+            storage_path,
+            sha256,
+            byte_size,
+            mime_type,
+            status,
+            review_status,
+            selected_default,
+            transformation_json,
+            import_batch_id,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available',
+                'unreviewed', 0, ?, ?, ?, ?)
+        ON CONFLICT(id)
+        DO UPDATE SET
+            source_file_id = excluded.source_file_id,
+            internal_filename = excluded.internal_filename,
+            storage_path = excluded.storage_path,
+            sha256 = excluded.sha256,
+            byte_size = excluded.byte_size,
+            mime_type = excluded.mime_type,
+            status = excluded.status,
+            review_status = excluded.review_status,
+            transformation_json = excluded.transformation_json,
+            import_batch_id = excluded.import_batch_id,
+            updated_at = excluded.updated_at
+        """,
+        (
+            derivative_id,
+            row["entry_id"],
+            derivative_role,
+            row["source_file_id"],
+            output_path.name,
+            str(output_path),
+            sha256,
+            byte_size,
+            _mime_type(output_format),
+            json.dumps(transformation, sort_keys=True),
+            row["import_batch_id"],
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def _format_derivative_error(error: BaseException) -> str:
+    text = str(error).replace("\n", " ").strip()
+    if isinstance(error, subprocess.CalledProcessError):
+        command = " ".join(str(part) for part in error.cmd)
+        text = f"{command} returned exit status {error.returncode}"
+    return text[:500]
+
+
 def derivative_policy_name(output_format: str, long_edge: int, quality: int) -> str:
     if output_format == "jpeg" and long_edge == 2560 and quality == 88:
         return DEFAULT_DERIVATIVE_POLICY
@@ -298,6 +590,7 @@ def derivative_readiness_summary(
     quality: int = 88,
     start_date: str = "",
     end_date: str = "",
+    include_associated: bool = False,
 ) -> DerivativeReadinessSummary:
     db_path = canonical_root / "canonical.db"
     if not db_path.exists():
@@ -314,7 +607,14 @@ def derivative_readiness_summary(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
-        rows = _load_source_media(connection, policy, None, start_date, end_date)
+        rows = _load_source_media(
+            connection,
+            policy,
+            None,
+            start_date,
+            end_date,
+            include_associated=include_associated,
+        )
         staged_crops = _load_staged_review_crops(canonical_root)
     except sqlite3.Error:
         return DerivativeReadinessSummary(
@@ -330,18 +630,33 @@ def derivative_readiness_summary(
     ready_count = 0
     current_count = 0
     needs_update_count = 0
+    primary_source_count = 0
+    primary_ready_count = 0
+    associated_source_count = 0
+    associated_ready_count = 0
     extension = "jpg" if output_format == "jpeg" else "heic"
     for row in rows:
+        is_associated = str(row["source_role"]) == "associated"
+        if is_associated:
+            associated_source_count += 1
+        else:
+            primary_source_count += 1
         try:
             crop = _review_crop_from_transformation(row["source_transformation_json"])
         except (TypeError, ValueError):
             crop = None
         crop = _staged_review_crop_for_row(staged_crops, row) or crop
+        if not Path(row["storage_path"]).exists():
+            continue
         if crop is None:
             continue
         ready_count += 1
+        if is_associated:
+            associated_ready_count += 1
+        else:
+            primary_ready_count += 1
         month = row["entry_date"][:7]
-        output_path = output_root / month / f"{_derivative_output_stem(row)}.{extension}"
+        output_path = output_root / month / f"{_derivative_output_stem(row, long_edge)}.{extension}"
         transformation = {
             "source_media_asset_id": row["media_asset_id"],
             "source_role": row["source_role"],
@@ -364,6 +679,12 @@ def derivative_readiness_summary(
         not_ready_count=len(rows) - ready_count,
         current_count=current_count,
         needs_update_count=needs_update_count,
+        primary_source_count=primary_source_count,
+        primary_ready_count=primary_ready_count,
+        primary_not_ready_count=primary_source_count - primary_ready_count,
+        associated_source_count=associated_source_count,
+        associated_ready_count=associated_ready_count,
+        associated_not_ready_count=associated_source_count - associated_ready_count,
     )
 
 
@@ -414,6 +735,7 @@ def _load_source_media(
     limit: int | None,
     start_date: str = "",
     end_date: str = "",
+    include_associated: bool = False,
 ) -> list[sqlite3.Row]:
     query = """
         WITH source_rows AS (
@@ -446,6 +768,10 @@ def _load_source_media(
                 ON fallback_media.entry_id = entries.id
                 AND fallback_media.selected_default = 1
             WHERE COALESCE(external_media.id, fallback_media.id) IS NOT NULL
+    """
+    params: list[object] = [policy]
+    if include_associated:
+        query += """
             UNION ALL
             SELECT
                 entries.id AS entry_id,
@@ -468,6 +794,9 @@ def _load_source_media(
                 AND associated_media.review_status = 'confirmed'
                 AND associated_media.status = 'available'
                 AND COALESCE(associated_media.storage_path, '') != ''
+        """
+        params.append(policy)
+    query += """
         )
         SELECT
             source_rows.entry_id,
@@ -495,7 +824,6 @@ def _load_source_media(
             ON derivative_media.id = source_rows.derivative_id
         WHERE 1 = 1
     """
-    params: list[object] = [policy, policy]
     if str(start_date or "").strip():
         query += " AND source_rows.entry_date >= ?\n"
         params.append(str(start_date).strip())
@@ -511,12 +839,13 @@ def _load_source_media(
     return list(connection.execute(query, params))
 
 
-def _derivative_output_stem(row: sqlite3.Row) -> str:
-    entry_stem = str(row["entry_id"]).replace(":", "_")
+def _derivative_output_stem(row: sqlite3.Row, long_edge: int) -> str:
+    entry_date = str(row["entry_date"])
+    size_token = f"sq{long_edge}"
     if str(row["source_role"]) != "associated":
-        return entry_stem
+        return f"Project365 Working Copy - {entry_date} - {size_token}"
     digest = hashlib.sha256(str(row["media_asset_id"]).encode("utf-8")).hexdigest()[:12]
-    return f"{entry_stem}_associated_{digest}"
+    return f"Project365 Working Copy - {entry_date} - associated {size_token} - {digest}"
 
 
 def _derivative_is_current(
@@ -575,22 +904,29 @@ def _mark_derivative_not_ready(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
     derivative_id: str,
+    reason: str,
 ) -> None:
     if not row["derivative_media_asset_id"]:
         return
     now = dt.datetime.now(dt.UTC).isoformat()
     transformation = _parse_json_object(row["derivative_transformation_json"])
-    transformation["not_ready_reason"] = "missing_review_crop"
+    transformation["not_ready_reason"] = reason
+    if reason == "missing_source_media":
+        review_status = "needs_source"
+    elif reason == "conversion_failed":
+        review_status = "needs_conversion"
+    else:
+        review_status = "needs_crop"
     connection.execute(
         """
         UPDATE media_assets
         SET status = 'not_ready',
-            review_status = 'needs_crop',
+            review_status = ?,
             transformation_json = ?,
             updated_at = ?
         WHERE id = ?
         """,
-        (json.dumps(transformation, sort_keys=True), now, derivative_id),
+        (review_status, json.dumps(transformation, sort_keys=True), now, derivative_id),
     )
 
 
@@ -966,6 +1302,7 @@ def _report_row(
     byte_size: int,
     sha256: str,
     status: str,
+    error: str = "",
 ) -> dict[str, object]:
     return {
         "entry_id": row["entry_id"],
@@ -982,6 +1319,7 @@ def _report_row(
         "byte_size": byte_size,
         "sha256": sha256,
         "status": status,
+        "error": error,
     }
 
 
@@ -1001,6 +1339,7 @@ def _write_report(path: Path, rows: list[dict[str, object]]) -> None:
         "byte_size",
         "sha256",
         "status",
+        "error",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)

@@ -671,6 +671,52 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("original_photo_external_search_queue.csv", " ".join(commands[0]))
         self.assertIn("original_photo_external_search_queue.csv", " ".join(commands[1]))
 
+    def test_generate_derivatives_command_requests_progress_output(self) -> None:
+        command = control._commands_for_step("generate_derivatives", {})[0]
+
+        self.assertIn("--progress-interval", command)
+        self.assertIn("25", command)
+
+    def test_generate_derivatives_uses_long_running_timeout(self) -> None:
+        self.assertEqual(control._step_timeout_seconds("generate_derivatives"), 12 * 60 * 60)
+
+    def test_generate_derivatives_timeout_summary_uses_latest_progress(self) -> None:
+        outputs = [
+            {
+                "command": "generate",
+                "returncode": -9,
+                "output": (
+                    "Progress: 1825/8361 sources · generated 1811 · skipped 0 · not ready 14 · current project365:2007-09-11\n"
+                    "Progress: 1850/8361 sources · generated 1836 · skipped 0 · not ready 14 · current project365:2007-10-13\n"
+                    "\nTimed out after 3600 seconds.\n"
+                ),
+            }
+        ]
+
+        summary = control._workflow_run_summary(
+            step="generate_derivatives",
+            status="fail",
+            payload={},
+            before={"database": {"diarium_derivatives": 868}},
+            after={"database": {"diarium_derivatives": 868}},
+            outputs=outputs,
+            error="",
+        )
+
+        self.assertEqual(
+            [(item["label"], item["value"]) for item in summary["metrics"][:4]],
+            [
+                ("Processed working-copy sources", "1850"),
+                ("Generated working copies", "1836"),
+                ("Skipped unchanged copies", "0"),
+                ("Not ready for export", "14"),
+            ],
+        )
+        self.assertEqual(
+            summary["error"],
+            "Timed out after 3600 seconds. Last progress: 1850/8361 sources, generated 1836, skipped 0, not ready 14, current project365:2007-10-13.",
+        )
+
     def test_mark_fallback_step_requires_and_passes_batch_filters(self) -> None:
         with self.assertRaises(ValueError):
             control._commands_for_step("mark_original_fallback", {})
@@ -1533,8 +1579,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('id="diaryEnrichmentEndDate"', control.CONTROL_HTML)
         self.assertIn('id="diaryEnrichmentLimit"', control.CONTROL_HTML)
         self.assertIn("function openDiaryEnrichment()", control.CONTROL_HTML)
-        self.assertIn('url.searchParams.set("start_date", startDate)', control.CONTROL_HTML)
-        self.assertIn('url.searchParams.set("end_date", endDate)', control.CONTROL_HTML)
+        self.assertIn("function dateScopeFromInputValues(startValue, endValue = \"\", options = {})", control.CONTROL_HTML)
+        self.assertIn("function parseDateScopeValue(value)", control.CONTROL_HTML)
+        self.assertIn('url.searchParams.set("start_date", scope.startDate)', control.CONTROL_HTML)
+        self.assertIn('url.searchParams.set("end_date", scope.endDate)', control.CONTROL_HTML)
         self.assertIn('url.searchParams.set("limit", String(boundedLimit))', control.CONTROL_HTML)
         self.assertIn('id="limitEasyMatchToIndexFolder"', control.CONTROL_HTML)
         self.assertIn('id="easyMatchIndexFolder"', control.CONTROL_HTML)
@@ -2382,7 +2430,10 @@ class Project365ControlAppTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertEqual(result["entry_id"], "project365:1998-04-11")
-        picker_state.crop_entry_detail.assert_called_once_with("project365:1998-04-11")
+        picker_state.crop_entry_detail.assert_called_once_with(
+            "project365:1998-04-11",
+            mark_estimated_viewed=False,
+        )
         picker_state.entry_detail.assert_not_called()
 
     def test_control_routes_picker_date_range_expansion(self) -> None:
@@ -2650,6 +2701,12 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("@keyframes live-pulse", control.CONTROL_HTML)
         self.assertIn("function genericRunningProgressDetail(job)", control.CONTROL_HTML)
         self.assertIn("Still running · no detailed progress output yet", control.CONTROL_HTML)
+
+    def test_working_copy_progress_parses_live_totals(self) -> None:
+        self.assertIn("function latestWorkingCopyProgress(job)", control.CONTROL_HTML)
+        self.assertIn('line.match(/^Progress:', control.CONTROL_HTML)
+        self.assertIn('`${progress.done}/${progress.total} sources`', control.CONTROL_HTML)
+        self.assertIn("return percentComplete(progress.done, progress.total)", control.CONTROL_HTML)
 
     def test_broad_visual_status_shows_date_coverage(self) -> None:
         self.assertIn("<span>Date coverage</span>", control.CONTROL_HTML)
@@ -4136,6 +4193,10 @@ class Project365ControlAppTests(unittest.TestCase):
     def test_database_status_reports_working_copy_readiness_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "canonical.db"
+            ready_path = Path(temp_dir) / "ready.png"
+            needs_crop_path = Path(temp_dir) / "needs-crop.png"
+            ready_path.write_bytes(b"ready")
+            needs_crop_path.write_bytes(b"needs-crop")
             ready_crop = {
                 "review_crop": {
                     "x": 0,
@@ -4197,18 +4258,18 @@ class Project365ControlAppTests(unittest.TestCase):
                         (
                             "media-ready",
                             "project365:1998-04-10",
-                            "/tmp/ready.png",
+                            str(ready_path),
                             "sha-ready",
-                            10,
+                            ready_path.stat().st_size,
                             json.dumps(ready_crop, sort_keys=True),
                             "2026-08-20T00:00:00Z",
                         ),
                         (
                             "media-needs-crop",
                             "project365:1998-04-11",
-                            "/tmp/needs-crop.png",
+                            str(needs_crop_path),
                             "sha-needs-crop",
-                            20,
+                            needs_crop_path.stat().st_size,
                             "{}",
                             "2026-08-20T00:00:00Z",
                         ),

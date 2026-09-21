@@ -320,16 +320,19 @@ def build_external_original_search_queue(
     connection = sqlite3.connect(db_path)
     try:
         connection.row_factory = sqlite3.Row
+        pending_crop_rejected_candidates = _load_pending_crop_rejected_candidates(search_queue_path)
         exports = _load_unclear_exports(
             connection,
             review_queue_path,
             include_low_quality_matches=include_low_quality_matches,
+            pending_rejected_candidates=pending_crop_rejected_candidates,
         )
         rejected_candidates = _load_rejected_candidates(connection)
         pending_rejected_candidates = _load_pending_rejected_candidates(search_queue_path)
     finally:
         connection.close()
     rejected_candidates = _merge_rejected_candidates(rejected_candidates, pending_rejected_candidates)
+    rejected_candidates = _merge_rejected_candidates(rejected_candidates, pending_crop_rejected_candidates)
     exports = _filter_target_exports(
         exports,
         target_entry_ids=target_entry_ids,
@@ -1415,7 +1418,7 @@ def _confirmed_external_original_rows_by_entry(
 ) -> dict[str, list[sqlite3.Row]]:
     rows = connection.execute(
         """
-        SELECT entry_id, storage_path, transformation_json
+        SELECT entry_id, sha256, storage_path, transformation_json
         FROM media_assets
         WHERE role = 'external_original_reference'
             AND review_status = 'confirmed'
@@ -1796,9 +1799,11 @@ def _load_unclear_exports(
     connection: sqlite3.Connection,
     review_queue_path: Path,
     include_low_quality_matches: bool = False,
+    pending_rejected_candidates: dict[str, set[tuple[str, str]]] | None = None,
 ) -> list[dict[str, object]]:
     fallback_entry_ids = _fallback_confirmed_entry_ids(connection)
     confirmed_originals_by_entry = _confirmed_external_original_rows_by_entry(connection)
+    pending_rejected_candidates = pending_rejected_candidates or {}
     all_exports = [
         dict(row)
         for row in connection.execute(
@@ -1821,7 +1826,11 @@ def _load_unclear_exports(
         entry_id = str(export["entry_id"])
         if entry_id in fallback_entry_ids:
             continue
-        confirmed_rows = confirmed_originals_by_entry.get(entry_id, [])
+        confirmed_rows = [
+            row
+            for row in confirmed_originals_by_entry.get(entry_id, [])
+            if not _confirmed_original_row_is_pending_rejected(row, pending_rejected_candidates)
+        ]
         if not confirmed_rows:
             exports.append(export)
             continue
@@ -1967,6 +1976,55 @@ def _load_pending_rejected_candidates(search_queue_path: Path) -> dict[str, set[
         if path and path in rejected_paths.get(entry_id, set()):
             pending.setdefault(entry_id, set()).add((str(row.get("candidate_sha256", "")), path))
     return pending
+
+
+def _load_pending_crop_rejected_candidates(search_queue_path: Path) -> dict[str, set[tuple[str, str]]]:
+    staging_path = search_queue_path.with_name(f"{search_queue_path.stem}_crop_staging.json")
+    if not staging_path.exists():
+        return {}
+    try:
+        payload = json.loads(staging_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+    if not isinstance(entries, dict):
+        return {}
+    pending: dict[str, set[tuple[str, str]]] = {}
+    for entry_id, candidates in entries.items():
+        if not isinstance(candidates, dict):
+            continue
+        for candidate_path, record in candidates.items():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("action", "")).strip().lower() != "reject_original":
+                continue
+            if record.get("commit_pending") is False:
+                continue
+            rejected_row = record.get("rejected_row")
+            if not isinstance(rejected_row, dict):
+                rejected_row = {}
+            path = str(rejected_row.get("candidate_path") or candidate_path).strip()
+            sha256 = str(rejected_row.get("candidate_sha256", "")).strip()
+            if path or sha256:
+                pending.setdefault(str(entry_id), set()).add((sha256, path))
+    return pending
+
+
+def _confirmed_original_row_is_pending_rejected(
+    row: sqlite3.Row,
+    pending_rejected_candidates: dict[str, set[tuple[str, str]]],
+) -> bool:
+    entry_id = str(row["entry_id"])
+    rejected = pending_rejected_candidates.get(entry_id, set())
+    if not rejected:
+        return False
+    sha256 = str(row["sha256"] or "").strip()
+    storage_path = str(row["storage_path"] or "").strip()
+    return (
+        (sha256, storage_path) in rejected
+        or bool(sha256 and any(sha256 == rejected_sha for rejected_sha, _ in rejected))
+        or bool(storage_path and any(storage_path == rejected_path for _, rejected_path in rejected))
+    )
 
 
 def _merge_rejected_candidates(

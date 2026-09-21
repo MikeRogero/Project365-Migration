@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from project365_crop_align import suggest_crop
+from project365_crop_align import suggest_crop, suggest_crop_for_rotations
 from project365_original_matcher import IMAGE_EXTENSIONS
 from project365_photo_library_index import (
     ExiftoolPhotoMetadata,
@@ -41,6 +41,7 @@ from project365_original_reference_pipeline import (
     MANUAL_SEARCH_REQUIRED_MESSAGE,
     ORIGINAL_PICKER_TARGET_ROLES,
     REJECT_DECISIONS,
+    _empty_queue_row_from_existing,
     _external_decision_id,
     apply_reviewed_external_references,
     build_external_original_search_queue,
@@ -329,7 +330,9 @@ class PickerState:
         self._source_media = self._load_source_media()
         self._completed_external_entry_ids_cache: set[str] | None = None
         self._completed_external_reference_entry_ids_cache: set[str] | None = None
-        self._completed_queue_prune_signature: tuple[tuple[int, int] | None, tuple[int, int] | None] | None = None
+        self._completed_queue_prune_signature: (
+            tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None] | None
+        ) = None
         self._people_cache_signature: tuple[int, int] | None = None
         self._people_by_entry: dict[str, list[str]] = {}
 
@@ -337,8 +340,8 @@ class PickerState:
         self._prune_completed_queue_entries_if_needed()
         status_counts: dict[str, int] = {}
         entry_count = 0
-        pending = {"accepted": 0, "rejected": 0, "associated": 0}
-        pending_entries = {"accepted": 0, "rejected": 0, "associated": 0}
+        pending = {"accepted": 0, "rejected": 0, "associated": 0, "fallback": 0}
+        pending_entries = {"accepted": 0, "rejected": 0, "associated": 0, "fallback": 0}
         affected_entry_ids = set(self._decision_overrides) | set(self._added_candidate_rows) | set(
             self._replacement_candidate_rows
         )
@@ -361,22 +364,30 @@ class PickerState:
                     row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
                     for row in entry_rows
                 )
+                fallback_count = sum(
+                    row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+                    for row in entry_rows
+                )
             else:
                 status = record["status"]
                 accepted_count = int(record.get("accepted_count", 0))
                 rejected_count = int(record.get("rejected_count", 0))
                 associated_count = int(record.get("associated_count", 0))
+                fallback_count = int(record.get("fallback_count", 0))
             status_counts[status] = status_counts.get(status, 0) + 1
             entry_count += 1
             pending["accepted"] += accepted_count
             pending["rejected"] += rejected_count
             pending["associated"] += associated_count
+            pending["fallback"] += fallback_count
             if accepted_count:
                 pending_entries["accepted"] += 1
             if rejected_count:
                 pending_entries["rejected"] += 1
             if associated_count:
                 pending_entries["associated"] += 1
+            if fallback_count:
+                pending_entries["fallback"] += 1
         if not queue_exists:
             for entry in self._database_entry_summaries(set(), set(), missing_links_only=True):
                 entry_id = entry["entry_id"]
@@ -404,17 +415,24 @@ class PickerState:
                 row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
                 for row in entry_rows
             )
+            fallback_count = sum(
+                row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+                for row in entry_rows
+            )
             status_counts[status] = status_counts.get(status, 0) + 1
             entry_count += 1
             pending["accepted"] += accepted_count
             pending["rejected"] += rejected_count
             pending["associated"] += associated_count
+            pending["fallback"] += fallback_count
             if accepted_count:
                 pending_entries["accepted"] += 1
             if rejected_count:
                 pending_entries["rejected"] += 1
             if associated_count:
                 pending_entries["associated"] += 1
+            if fallback_count:
+                pending_entries["fallback"] += 1
             seen_entry_ids.add(entry_id)
         for entry_id in sorted(affected_entry_ids - seen_entry_ids):
             entry_rows = self._entry_rows_for_manual_candidate(entry_id)
@@ -433,17 +451,24 @@ class PickerState:
                 row.get("review_decision", "").strip().lower() in ASSOCIATED_PHOTO_DECISIONS
                 for row in entry_rows
             )
+            fallback_count = sum(
+                row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+                for row in entry_rows
+            )
             status_counts[status] = status_counts.get(status, 0) + 1
             entry_count += 1
             pending["accepted"] += accepted_count
             pending["rejected"] += rejected_count
             pending["associated"] += associated_count
+            pending["fallback"] += fallback_count
             if accepted_count:
                 pending_entries["accepted"] += 1
             if rejected_count:
                 pending_entries["rejected"] += 1
             if associated_count:
                 pending_entries["associated"] += 1
+            if fallback_count:
+                pending_entries["fallback"] += 1
         return {
             "entry_count": entry_count,
             "status_counts": status_counts,
@@ -793,10 +818,15 @@ class PickerState:
         self._store_added_candidates(entry_id, template, additions)
         return self._entry_rows(entry_id)
 
-    def crop_entry_detail(self, entry_id: str, mark_estimated_viewed: bool = True) -> dict[str, Any] | None:
+    def crop_entry_detail(self, entry_id: str, mark_estimated_viewed: bool = False) -> dict[str, Any] | None:
         entry_rows = self._entry_rows(entry_id)
         if entry_rows:
             entry = self._entry_summary(entry_id, entry_rows)
+            has_accepted_decision = any(
+                row.get("candidate_path", "").strip()
+                and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                for row in entry_rows
+            )
             candidates = [
                 self._candidate_detail(row)
                 for row in entry_rows
@@ -810,9 +840,12 @@ class PickerState:
                 entry["crop_source_state"] = "accepted_not_applied"
                 entry["crop_has_crop"] = _candidate_has_review_crop(candidates[0])
                 return entry
+            if has_accepted_decision:
+                return None
         return self._database_crop_entry_detail(
             entry_id,
             mark_estimated_viewed=mark_estimated_viewed,
+            include_fallback_targets=True,
         )
 
     def crop_entries(
@@ -828,6 +861,13 @@ class PickerState:
         queued_entry_ids: set[str] = set()
         rows = self._read_rows()
         for entry_id, entry_rows in _group_by_entry(rows).items():
+            has_accepted_decision = any(
+                row.get("candidate_path", "").strip()
+                and row.get("review_decision", "").strip().lower() in ACCEPT_DECISIONS
+                for row in entry_rows
+            )
+            if has_accepted_decision:
+                queued_entry_ids.add(entry_id)
             accepted_rows = [
                 row
                 for row in entry_rows
@@ -837,11 +877,10 @@ class PickerState:
             ]
             if not accepted_rows:
                 continue
-            queued_entry_ids.add(entry_id)
             entry = self._entry_summary(entry_id, entry_rows)
             candidate = self._candidate_detail(accepted_rows[0])
             entries.append(self._crop_summary(entry, candidate, "accepted_not_applied"))
-        entries.extend(self._database_crop_entries(exclude_entry_ids=queued_entry_ids))
+        entries.extend(self._database_crop_entries(exclude_entry_ids=queued_entry_ids, include_fallback_targets=True))
         entries = [entry for entry in entries if _crop_filter_matches(entry, crop_filter)]
         entries = [
             entry
@@ -1076,9 +1115,13 @@ class PickerState:
             "crop_status": _crop_status_label(has_crop, crop_source),
         }
 
-    def _database_crop_entries(self, exclude_entry_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    def _database_crop_entries(
+        self,
+        exclude_entry_ids: set[str] | None = None,
+        include_fallback_targets: bool = False,
+    ) -> list[dict[str, Any]]:
         entries = []
-        for row in self._database_crop_rows():
+        for row in self._database_crop_rows(include_fallback_targets=include_fallback_targets):
             if exclude_entry_ids and row["entry_id"] in exclude_entry_ids:
                 continue
             summary = self._database_crop_summary_from_row(row)
@@ -1114,7 +1157,7 @@ class PickerState:
         entry = {
             "entry_id": entry_id,
             "entry_date": str(row["entry_date"]),
-            "status": "selected",
+            "status": "fallback" if str(row["candidate_role"]) == "project365_export_png" else "selected",
             "source_token": self._image_token(source_path) if source_path else "",
             "source_exists": bool(source_path and source_path.exists()),
             "people_names": self._entry_people(entry_id),
@@ -1128,9 +1171,13 @@ class PickerState:
     def _database_crop_entry_detail(
         self,
         entry_id: str,
-        mark_estimated_viewed: bool = True,
+        mark_estimated_viewed: bool = False,
+        include_fallback_targets: bool = False,
     ) -> dict[str, Any] | None:
-        for row in self._database_crop_rows(entry_id=entry_id):
+        for row in self._database_crop_rows(
+            entry_id=entry_id,
+            include_fallback_targets=include_fallback_targets,
+        ):
             detail = self._database_crop_entry_from_row(
                 row,
                 mark_estimated_viewed=mark_estimated_viewed,
@@ -1142,7 +1189,7 @@ class PickerState:
     def _database_crop_entry_from_row(
         self,
         row: sqlite3.Row,
-        mark_estimated_viewed: bool = True,
+        mark_estimated_viewed: bool = False,
     ) -> dict[str, Any] | None:
         candidate_path_text = str(row["candidate_path"] or "").strip()
         if not candidate_path_text or not _candidate_path_is_available(candidate_path_text):
@@ -1193,7 +1240,7 @@ class PickerState:
             "review_notes": "",
             "selected": True,
             "associated": False,
-            "database_confirmed_role": "external_original_reference",
+            "database_confirmed_role": str(row["candidate_role"]),
         }
         self._apply_staged_crop_to_candidate(
             str(row["entry_id"]),
@@ -1210,7 +1257,7 @@ class PickerState:
         entry = {
             "entry_id": str(row["entry_id"]),
             "entry_date": str(row["entry_date"]),
-            "status": "selected",
+            "status": "fallback" if str(row["candidate_role"]) == "project365_export_png" else "selected",
             "candidate_count": len(confirmed_candidates),
             "selected_count": 1,
             "pending_commit_count": 0,
@@ -1513,6 +1560,7 @@ class PickerState:
         finally:
             connection.close()
         project365_media_asset_id = self._database_project365_media_asset_id(entry_id)
+        pending_rejected = self._pending_crop_rejected_candidate_identities(entry_id)
         result = []
         for row in rows:
             candidate_path = str(row[1] or "").strip()
@@ -1521,35 +1569,36 @@ class PickerState:
             path = Path(candidate_path)
             transformation = _parse_json_object(str(row[7] or ""))
             candidate_sha256 = str(row[3] or "").strip() or hashlib.sha256(candidate_path.encode("utf-8")).hexdigest()
-            result.append(
-                {
-                    "entry_id": entry_id,
-                    "entry_date": str(row[0] or ""),
-                    "project365_media_asset_id": project365_media_asset_id,
-                    "current_match_status": "",
-                    "current_decision": "",
-                    "candidate_path": candidate_path,
-                    "candidate_filename": str(row[2] or path.name),
-                    "candidate_sha256": candidate_sha256,
-                    "byte_size": str(row[4] or ""),
-                    "mime_type": str(row[5] or ""),
-                    "filename_dates": "",
-                    "media_creation_dates": "",
-                    "filesystem_dates": "",
-                    "capture_timestamp": "",
-                    "capture_timestamp_source": "",
-                    "gps_latitude": "",
-                    "gps_longitude": "",
-                    "gps_source": "",
-                    "has_gps": "",
-                    "date_distance": "",
-                    "evidence": str(transformation.get("evidence", "database_confirmed")),
-                    "candidate_filter_reason": "",
-                    "review_decision": "",
-                    "review_notes": "",
-                    "database_confirmed_role": str(row[6] or ""),
-                }
-            )
+            candidate_row = {
+                "entry_id": entry_id,
+                "entry_date": str(row[0] or ""),
+                "project365_media_asset_id": project365_media_asset_id,
+                "current_match_status": "",
+                "current_decision": "",
+                "candidate_path": candidate_path,
+                "candidate_filename": str(row[2] or path.name),
+                "candidate_sha256": candidate_sha256,
+                "byte_size": str(row[4] or ""),
+                "mime_type": str(row[5] or ""),
+                "filename_dates": "",
+                "media_creation_dates": "",
+                "filesystem_dates": "",
+                "capture_timestamp": "",
+                "capture_timestamp_source": "",
+                "gps_latitude": "",
+                "gps_longitude": "",
+                "gps_source": "",
+                "has_gps": "",
+                "date_distance": "",
+                "evidence": str(transformation.get("evidence", "database_confirmed")),
+                "candidate_filter_reason": "",
+                "review_decision": "",
+                "review_notes": "",
+                "database_confirmed_role": str(row[6] or ""),
+            }
+            if _row_matches_rejected_candidate_identity(candidate_row, pending_rejected):
+                continue
+            result.append(candidate_row)
         return result
 
     def _with_database_confirmed_roles(
@@ -1651,7 +1700,11 @@ class PickerState:
             return "staged"
         return "applied"
 
-    def _database_crop_rows(self, entry_id: str | None = None) -> list[sqlite3.Row]:
+    def _database_crop_rows(
+        self,
+        entry_id: str | None = None,
+        include_fallback_targets: bool = False,
+    ) -> list[sqlite3.Row]:
         db_path = self.config.canonical_root / "canonical.db"
         if not db_path.exists():
             return []
@@ -1660,6 +1713,19 @@ class PickerState:
         try:
             where_entry = "AND entries.id = ?" if entry_id else ""
             params = (entry_id,) if entry_id else ()
+            fallback_clause = """
+                        OR (
+                            external_refs.role = 'project365_export_png'
+                            AND external_refs.selected_default = 1
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM media_assets AS confirmed_refs
+                                WHERE confirmed_refs.entry_id = external_refs.entry_id
+                                    AND confirmed_refs.role = 'external_original_reference'
+                                    AND confirmed_refs.review_status = 'confirmed'
+                            )
+                        )
+            """ if include_fallback_targets else ""
             return list(
                 connection.execute(
                     f"""
@@ -1670,12 +1736,18 @@ class PickerState:
                         external_refs.internal_filename AS candidate_filename,
                         external_refs.byte_size AS candidate_byte_size,
                         external_refs.mime_type AS candidate_mime_type,
-                        external_refs.transformation_json AS transformation_json
+                        external_refs.transformation_json AS transformation_json,
+                        external_refs.role AS candidate_role
                     FROM media_assets AS external_refs
                     JOIN entries
                         ON entries.id = external_refs.entry_id
-                    WHERE external_refs.role = 'external_original_reference'
-                        AND external_refs.review_status = 'confirmed'
+                    WHERE (
+                        (
+                            external_refs.role = 'external_original_reference'
+                            AND external_refs.review_status = 'confirmed'
+                        )
+                        {fallback_clause}
+                    )
                         AND COALESCE(external_refs.storage_path, '') != ''
                         {where_entry}
                     ORDER BY entries.entry_date, entries.id
@@ -1726,7 +1798,7 @@ class PickerState:
                 SELECT 1
                 FROM media_assets
                 WHERE entry_id = ?
-                    AND role = 'external_original_reference'
+                    AND role IN ('external_original_reference', 'project365_export_png')
                     AND storage_path = ?
                 """,
                 (entry_id, candidate_path),
@@ -1771,7 +1843,7 @@ class PickerState:
             SELECT id, transformation_json
             FROM media_assets
             WHERE entry_id = ?
-                AND role = 'external_original_reference'
+                AND role IN ('external_original_reference', 'project365_export_png')
                 AND storage_path = ?
             """,
             (entry_id, candidate_path),
@@ -2046,7 +2118,10 @@ class PickerState:
                             row["review_decision"] = ""
                             row["review_notes"] = ""
                         continue
-                    if row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS:
+                    if (
+                        normalized_decision == "use_external_original"
+                        and row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+                    ):
                         row["review_decision"] = ""
                         row["review_notes"] = ""
                     if row.get("candidate_path") == candidate_path:
@@ -2441,7 +2516,7 @@ class PickerState:
         crop: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         estimated_crop = self._estimated_crop_for_candidate(entry_id, candidate_path, crop)
-        detail = self.save_crop(entry_id, str(Path(candidate_path)), estimated_crop, source="estimated")
+        detail = self.crop_entry_detail(entry_id, mark_estimated_viewed=False) or {}
         return {"entry": detail, "crop": estimated_crop}
 
     def _estimated_crop_for_candidate(
@@ -2457,13 +2532,25 @@ class PickerState:
         if not candidate.exists() or not candidate.is_file():
             raise ValueError("Missing candidate original image")
         prior_crop = crop if isinstance(crop, dict) else {}
-        rotation_degrees = _normalized_rotation_degrees(prior_crop.get("rotation_degrees"))
         fill_color = _normalized_fill_color(prior_crop.get("fill_color"))
-        suggestion = suggest_crop(
+        rotation_choices = _estimate_rotation_choices(
             reference_path,
             candidate,
-            candidate_rotation_degrees=rotation_degrees,
+            prior_crop.get("rotation_degrees"),
         )
+        if len(rotation_choices) == 1:
+            rotation_degrees = rotation_choices[0]
+            suggestion = suggest_crop(
+                reference_path,
+                candidate,
+                candidate_rotation_degrees=rotation_degrees,
+            )
+        else:
+            rotation_degrees, suggestion = suggest_crop_for_rotations(
+                reference_path,
+                candidate,
+                rotations=rotation_choices,
+            )
         estimated_crop = _square_crop_from_alignment(asdict(suggestion))
         estimated_crop["rotation_degrees"] = rotation_degrees
         if fill_color:
@@ -3432,11 +3519,16 @@ class PickerState:
         }
 
     def _rejected_candidate_hashes(self, entry_id: str) -> set[str]:
+        rejected_hashes = {
+            sha256
+            for sha256, _path in self._pending_crop_rejected_candidate_identities(entry_id)
+            if sha256
+        }
         with sqlite3.connect(self.config.canonical_root / "canonical.db") as connection:
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(media_assets)")}
             if "sha256" not in columns:
-                return set()
-            return {
+                return rejected_hashes
+            rejected_hashes.update(
                 str(row[0])
                 for row in connection.execute(
                     """
@@ -3449,7 +3541,8 @@ class PickerState:
                     """,
                     (entry_id,),
                 ).fetchall()
-            }
+            )
+            return rejected_hashes
 
     def _current_search_range_days(self, entry_id: str, rows: list[dict[str, str]]) -> int:
         range_days = 0
@@ -3811,6 +3904,8 @@ class PickerState:
         return {entry_id: Path(storage_path) for entry_id, storage_path in rows}
 
     def _entry_has_completed_external_decision(self, entry_id: str, include_fallback: bool = True) -> bool:
+        if self._entry_has_pending_crop_original_rejection(entry_id):
+            return False
         if include_fallback:
             if self._completed_external_entry_ids_cache is None:
                 self._completed_external_entry_ids_cache = self._load_completed_external_entry_ids(
@@ -3848,10 +3943,13 @@ class PickerState:
             connection.close()
         return {str(row[0]) for row in rows if str(row[0] or "").strip()}
 
-    def _completed_queue_signature(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    def _completed_queue_signature(
+        self,
+    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[int, int] | None]:
         return (
             _file_signature(self.config.queue_path),
             _file_signature(self.config.canonical_root / "canonical.db"),
+            _file_signature(self._crop_staging_path()),
         )
 
     def _clear_local_review_state(self, entry_ids: set[str]) -> None:
@@ -3881,7 +3979,19 @@ class PickerState:
                 for record in self._queue_shards.summaries()
                 if str(record.get("entry_id", "")).strip()
             }
-            completed_queue_entry_ids = queued_entry_ids & self._load_completed_external_entry_ids()
+            pending_crop_rejected_entry_ids = {
+                entry_id
+                for entry_id in queued_entry_ids
+                if self._entry_has_pending_crop_original_rejection(entry_id)
+            }
+            completed_queue_entry_ids = (
+                queued_entry_ids & self._load_completed_external_entry_ids()
+            ) - pending_crop_rejected_entry_ids
+            completed_queue_entry_ids = {
+                entry_id
+                for entry_id in completed_queue_entry_ids
+                if not self._entry_has_pending_nonreplacement_decision(entry_id)
+            }
             if not completed_queue_entry_ids:
                 self._completed_queue_prune_signature = signature
                 return {}
@@ -4014,6 +4124,25 @@ class PickerState:
     def _staged_crop_is_rejection(self, entry_id: str, candidate_path: str) -> bool:
         record = self._staged_crop_record(entry_id, candidate_path)
         return bool(record and str(record.get("action", "")).strip().lower() == "reject_original")
+
+    def _entry_has_pending_crop_original_rejection(self, entry_id: str) -> bool:
+        return bool(self._pending_crop_rejected_candidate_identities(entry_id))
+
+    def _pending_crop_rejected_candidate_identities(self, entry_id: str) -> set[tuple[str, str]]:
+        rejected: set[tuple[str, str]] = set()
+        for candidate_path, record in self._crop_staging.get(entry_id, {}).items():
+            if str(record.get("action", "")).strip().lower() != "reject_original":
+                continue
+            if record.get("commit_pending") is False:
+                continue
+            rejected_row = record.get("rejected_row")
+            if not isinstance(rejected_row, dict):
+                rejected_row = {}
+            path = str(rejected_row.get("candidate_path") or candidate_path).strip()
+            sha256 = str(rejected_row.get("candidate_sha256", "")).strip()
+            if path or sha256:
+                rejected.add((sha256, path))
+        return rejected
 
     def _staged_crop_commit_pending(self, record: dict[str, Any]) -> bool:
         if "commit_pending" in record:
@@ -4228,6 +4357,34 @@ class PickerState:
             override = overrides.get(_decision_row_key(row))
             if override:
                 row.update(override)
+        if rows and not any(
+            row.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+            for row in rows
+        ):
+            fallback_override = next(
+                (
+                    override
+                    for override in overrides.values()
+                    if override.get("review_decision", "").strip().lower() in FALLBACK_DECISIONS
+                ),
+                None,
+            )
+            if fallback_override:
+                fallback_row = next(
+                    (row for row in rows if not row.get("candidate_path", "").strip()),
+                    None,
+                )
+                if fallback_row is None:
+                    fallback_row = _empty_queue_row_from_existing(rows[0])
+                    rows.append(fallback_row)
+                fallback_row.update(fallback_override)
+
+    def _entry_has_pending_nonreplacement_decision(self, entry_id: str) -> bool:
+        retained_decisions = FALLBACK_DECISIONS | ASSOCIATED_PHOTO_DECISIONS | REJECT_DECISIONS
+        return any(
+            override.get("review_decision", "").strip().lower() in retained_decisions
+            for override in self._decision_overrides.get(entry_id, {}).values()
+        )
 
     def _entry_has_local_pending_rows(self, entry_id: str) -> bool:
         return (
@@ -4315,6 +4472,7 @@ class PickerState:
             rows.extend(dict(row) for row in self._added_candidate_rows.get(entry_id, []))
         self._apply_entry_overrides(entry_id, rows)
         rows = _deduplicate_candidate_rows(rows)
+        rows = self._without_pending_crop_rejected_rows(entry_id, rows)
         if rows:
             self._cache_entry_rows(entry_id, rows)
         return rows
@@ -4325,6 +4483,25 @@ class PickerState:
         while len(self._entry_rows_cache) > 2:
             oldest_entry_id = next(iter(self._entry_rows_cache))
             self._entry_rows_cache.pop(oldest_entry_id, None)
+
+    def _without_pending_crop_rejected_rows(
+        self,
+        entry_id: str,
+        rows: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        rejected = self._pending_crop_rejected_candidate_identities(entry_id)
+        if not rejected:
+            return rows
+        kept = [
+            row
+            for row in rows
+            if not _row_matches_rejected_candidate_identity(row, rejected)
+        ]
+        if kept == rows:
+            return rows
+        if any(row.get("candidate_path", "").strip() for row in kept):
+            return kept
+        return kept or [_empty_queue_row_from_existing(rows[0])]
 
     def _pending_decision_counts(self) -> dict[str, int]:
         accepted = 0
@@ -4379,10 +4556,10 @@ class PickerState:
                 fieldnames.append(field)
                 for row in rows:
                     row[field] = ""
-        for row in rows:
-            override = self._decision_overrides.get(row.get("entry_id", ""), {}).get(_decision_row_key(row))
-            if override:
-                row.update(override)
+        grouped_rows = _group_by_entry(rows)
+        for entry_id, entry_rows in grouped_rows.items():
+            self._apply_entry_overrides(entry_id, entry_rows)
+        rows = [row for entry_rows in grouped_rows.values() for row in entry_rows]
         return fieldnames, rows
 
     def _write_rows(self, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
@@ -4509,7 +4686,7 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                         self._send_json(detail)
                 elif parsed.path.startswith("/api/crop-entry/"):
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/api/crop-entry/"))
-                    detail = state.crop_entry_detail(entry_id)
+                    detail = state.crop_entry_detail(entry_id, mark_estimated_viewed=False)
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
@@ -4930,6 +5107,21 @@ def _entry_status(entry_rows: list[dict[str, str]]) -> str:
     if len(rejected_rows) == len(candidate_rows):
         return "rejected"
     return "needs_review"
+
+
+def _row_matches_rejected_candidate_identity(
+    row: dict[str, str],
+    rejected: set[tuple[str, str]],
+) -> bool:
+    candidate_path = str(row.get("candidate_path", "")).strip()
+    candidate_sha256 = str(row.get("candidate_sha256", "")).strip()
+    if not candidate_path and not candidate_sha256:
+        return False
+    return (
+        (candidate_sha256, candidate_path) in rejected
+        or bool(candidate_sha256 and any(candidate_sha256 == sha256 for sha256, _path in rejected))
+        or bool(candidate_path and any(candidate_path == path for _sha256, path in rejected))
+    )
 
 
 def _deduplicate_candidate_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -5890,6 +6082,35 @@ def _crop_values_differ(current: dict[str, object], proposed: dict[str, object])
     return False
 
 
+def _estimate_rotation_choices(
+    reference_path: Path,
+    candidate_path: Path,
+    current_rotation: object,
+) -> list[float]:
+    rotation = _normalized_rotation_degrees(current_rotation)
+    if rotation:
+        return [rotation]
+    reference_dimensions = _parse_dimensions_text(_image_dimensions(reference_path))
+    candidate_dimensions = _parse_dimensions_text(_image_dimensions(candidate_path))
+    if reference_dimensions and candidate_dimensions and _dimensions_have_opposite_orientation(
+        reference_dimensions,
+        candidate_dimensions,
+    ):
+        return [90.0, -90.0]
+    return [0.0]
+
+
+def _dimensions_have_opposite_orientation(
+    left: tuple[int, int],
+    right: tuple[int, int],
+) -> bool:
+    left_width, left_height = left
+    right_width, right_height = right
+    if left_width == left_height or right_width == right_height:
+        return False
+    return (left_width > left_height) != (right_width > right_height)
+
+
 def _crop_entry_in_date_scope(
     entry: dict[str, Any],
     entry_dates: set[str],
@@ -6204,7 +6425,7 @@ button {
 }
 .entry-date-jump {
   display: inline-grid;
-  grid-template-columns: 112px 112px auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 8px;
   justify-content: start;
 }
@@ -6786,12 +7007,12 @@ textarea:focus-visible {
 .manual-date-search {
   flex-basis: 100%;
   display: grid;
-  grid-template-columns: 104px 104px max-content auto;
+  grid-template-columns: minmax(132px, 1fr) minmax(132px, 1fr) max-content auto;
   gap: 8px;
   align-items: center;
   min-width: 0;
 }
-.manual-date-search input[type="date"] {
+.manual-date-search input {
   width: 100%;
   min-width: 0;
   box-sizing: border-box;
@@ -7230,8 +7451,8 @@ textarea:focus-visible {
       </div>
       <div id="batchSummary" class="summary batch-summary"></div>
       <div class="entry-date-jump" role="search" aria-label="Open entries by date range">
-        <input id="entryDateJump" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}-\\d{2}" maxlength="10" placeholder="yyyy-mm-dd" aria-label="Entry date yyyy-mm-dd">
-        <input id="entryDateJumpEnd" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}-\\d{2}" maxlength="10" placeholder="yyyy-mm-dd" aria-label="End entry date yyyy-mm-dd">
+        <input id="entryDateJump" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="yyyy-mm-dd or yyyy-mm" aria-label="Entry date yyyy-mm-dd or yyyy-mm">
+        <input id="entryDateJumpEnd" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="optional end" aria-label="End entry date yyyy-mm-dd or yyyy-mm">
         <button id="entryDateJumpButton" class="action-button" type="button" title="Open matching Project365 entry dates">Go</button>
       </div>
       <div id="entryDateJumpStatus" class="summary"></div>
@@ -7264,7 +7485,7 @@ textarea:focus-visible {
           <button id="previousEntryButton" class="action-button" title="Shortcut: Left arrow">Previous entry (Left)</button>
           <button id="nextEntryButton" class="action-button" title="Shortcut: Right arrow">Next entry (Right)</button>
         </div>
-        <button id="applyDecisionsButton" class="action-button primary" title="Apply reviewed selections, linked originals, rejections, fallbacks, and associated-photo flags to the database">Apply decisions <span id="acceptedDecisionCount" class="decision-count">0 accepted</span><span id="associatedDecisionCount" class="decision-count">0 flagged</span><span id="rejectedDecisionCount" class="decision-count">0 rejected</span></button>
+        <button id="applyDecisionsButton" class="action-button primary" title="Apply reviewed selections, linked originals, rejections, fallbacks, and associated-photo flags to the database">Apply decisions <span id="acceptedDecisionCount" class="decision-count">0 accepted</span><span id="associatedDecisionCount" class="decision-count">0 flagged</span><span id="rejectedDecisionCount" class="decision-count">0 rejected</span><span id="fallbackDecisionCount" class="decision-count">0 fallback</span></button>
         <button id="fallbackButton" class="icon-button" title="Shortcut: P. Use the photo already stored in the Project365 entry instead of an external original">Use Project365 photo (P)</button>
         <button id="rejectAllButton" class="icon-button" title="Shortcut: R. Reject every candidate currently available for this target photo">Reject all (R)</button>
         <button id="clearButton" class="icon-button" title="Reset pending selections, rejections, notes, and candidate expansions for this entry">Reset decisions</button>
@@ -7309,8 +7530,8 @@ textarea:focus-visible {
               <button class="action-button" type="button" data-time-filter="late-evening" aria-pressed="false" title="Late evening, 12:00 AM to 3:59 AM">12-4a</button>
             </div>
             <div class="manual-date-search">
-              <input id="indexDateStart" type="date" aria-label="Index search start date">
-              <input id="indexDateEnd" type="date" aria-label="Index search end date">
+              <input id="indexDateStart" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="yyyy-mm-dd or yyyy-mm" aria-label="Index search start date yyyy-mm-dd or yyyy-mm">
+              <input id="indexDateEnd" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="optional end" aria-label="Index search end date yyyy-mm-dd or yyyy-mm">
               <div class="index-search-options">
                 <label class="index-search-toggle"><input id="indexSearchWholeIndex" type="checkbox"> Whole index</label>
                 <label class="index-search-toggle"><input id="indexSearchModifiedDate" type="checkbox"> Include modified dates</label>
@@ -7560,6 +7781,8 @@ async function loadSummary() {
   const associatedFiles = pending.associated || 0;
   const associatedEntries = pendingEntries.associated ?? associatedFiles;
   const rejectedFiles = pending.rejected || 0;
+  const fallbackFiles = pending.fallback || 0;
+  const fallbackEntries = pendingEntries.fallback ?? fallbackFiles;
   document.getElementById("acceptedDecisionCount").textContent = acceptedFiles === acceptedEntries
     ? `${acceptedEntries} accepted entries`
     : `${acceptedEntries} accepted entries (${acceptedFiles} files)`;
@@ -7567,8 +7790,11 @@ async function loadSummary() {
     ? `${associatedEntries} flagged`
     : `${associatedEntries} flagged (${associatedFiles} files)`;
   document.getElementById("rejectedDecisionCount").textContent = `${rejectedFiles} rejected`;
+  document.getElementById("fallbackDecisionCount").textContent = fallbackFiles === fallbackEntries
+    ? `${fallbackEntries} fallback`
+    : `${fallbackEntries} fallback (${fallbackFiles} files)`;
   document.getElementById("applyDecisionsButton").title =
-    `Apply ${acceptedEntries} linked, ${associatedEntries} flagged, ${rejectedFiles} rejected, and any fallback decisions to the database`;
+    `Apply ${acceptedEntries} linked, ${associatedEntries} flagged, ${rejectedFiles} rejected, and ${fallbackEntries} fallback decisions to the database`;
 }
 
 async function loadBatches() {
@@ -7710,45 +7936,28 @@ function entryDateScopeLabel(dateTexts) {
   return startDate === endDate ? startDate : `${startDate} to ${endDate}`;
 }
 
-function isValidEntryDateText(dateText) {
-  const match = String(dateText || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
-  if (!match) return false;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  return date.toISOString().slice(0, 10) === dateText;
-}
-
 async function jumpToEntryDate() {
   const startInput = document.getElementById("entryDateJump");
   const endInput = document.getElementById("entryDateJumpEnd");
   const targetStatus = document.getElementById("entryDateJumpStatus");
-  const startDate = String(startInput?.value || "").trim();
-  const endDate = String(endInput?.value || "").trim() || startDate;
-  if (!isValidEntryDateText(startDate) || !isValidEntryDateText(endDate)) {
-    targetStatus.textContent = "Enter dates as yyyy-mm-dd.";
-    return;
-  }
-  if (endDate < startDate) {
-    targetStatus.textContent = "End date must be on or after start date.";
-    return;
-  }
-  const dateTexts = dateRangeValues(startDate, endDate);
-  if (!dateTexts.length || dateTexts[dateTexts.length - 1] !== endDate) {
-    targetStatus.textContent = "Use a date range of 367 days or less.";
+  const scope = dateScopeFromInputValues(startInput?.value || "", endInput?.value || "");
+  if (!scope.ok) {
+    targetStatus.textContent = scope.message;
     return;
   }
   document.getElementById("filter").value = "all";
   document.getElementById("batchFilter").value = "";
   state.urlEntryIds = [];
-  state.urlEntryDates = dateTexts;
+  state.urlEntryDates = scope.dates;
   state.batchEntryIds = [];
   state.batchEntryDates = [];
   state.selectedEntryIds.clear();
   state.lastCheckedIndex = null;
   state.initialBatchId = "";
-  replaceEntryDateScopeUrl(dateTexts);
-  const label = entryDateScopeLabel(dateTexts);
+  replaceEntryDateScopeUrl(scope.dates);
+  const label = entryDateScopeLabel(scope.dates);
   syncEntryDateJumpControl(`Opening ${label}.`);
-  await loadEntries("", false, startDate);
+  await loadEntries("", false, scope.startDate);
   syncEntryDateJumpControl(state.entries.length ? `Showing ${state.entries.length} entries for ${label}.` : `No entries found for ${label}.`);
 }
 
@@ -8453,6 +8662,44 @@ function dateRangeValues(startDate, endDate) {
     cursor = isoDateOffset(cursor, 1);
   }
   return values;
+}
+
+function dateScopeFromInputValues(startValue, endValue = "") {
+  const startScope = parseDateScopeValue(startValue);
+  if (!startScope) return {ok: false, message: "Enter a date as yyyy-mm-dd or yyyy-mm."};
+  const endScope = String(endValue || "").trim() ? parseDateScopeValue(endValue) : startScope;
+  if (!endScope) return {ok: false, message: "Enter the end date as yyyy-mm-dd or yyyy-mm."};
+  if (endScope.endDate < startScope.startDate) {
+    return {ok: false, message: "End date must be on or after start date."};
+  }
+  const dates = dateRangeValues(startScope.startDate, endScope.endDate);
+  if (!dates.length || dates[dates.length - 1] !== endScope.endDate) {
+    return {ok: false, message: "Use a date range of 367 days or less."};
+  }
+  return {
+    ok: true,
+    startDate: startScope.startDate,
+    endDate: endScope.endDate,
+    dates
+  };
+}
+
+function parseDateScopeValue(value) {
+  const text = String(value || "").trim().replace(/^project365:/, "");
+  const dateMatch = text.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+  if (dateMatch) {
+    const date = new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])));
+    const normalized = date.toISOString().slice(0, 10);
+    return normalized === text ? {startDate: normalized, endDate: normalized} : null;
+  }
+  const monthMatch = text.match(/^(\\d{4})-(\\d{2})$/);
+  if (!monthMatch) return null;
+  const year = Number(monthMatch[1]);
+  const month = Number(monthMatch[2]);
+  if (month < 1 || month > 12) return null;
+  const startDate = `${monthMatch[1]}-${monthMatch[2]}-01`;
+  const endDate = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+  return {startDate, endDate};
 }
 
 function isoDateOffset(dateText, offsetDays) {
@@ -9848,25 +10095,27 @@ async function expandDateRange(days) {
 async function searchIndexDateRange() {
   const entry = state.currentEntry;
   if (!entry) return;
-  const startDate = document.getElementById("indexDateStart").value;
-  const endDate = document.getElementById("indexDateEnd").value;
+  const scope = dateScopeFromInputValues(
+    document.getElementById("indexDateStart").value,
+    document.getElementById("indexDateEnd").value
+  );
   const wholeIndex = currentIndexSearchWholeIndex();
   const filenameOnly = !wholeIndex;
   const includeModifiedDates = wholeIndex && currentIndexIncludeModifiedDates();
   const button = document.getElementById("searchIndexDateRange");
   if (!ensureIndexSearchScopeAvailable()) return;
-  if (!startDate || !endDate) {
-    setCrawlStatus("Enter a start and end date.");
+  if (!scope.ok) {
+    setCrawlStatus(scope.message);
     return;
   }
   button.disabled = true;
   const scopeLabel = currentIndexScopeLabel();
-  setCrawlStatus(`Searching ${scopeLabel} from ${startDate} to ${endDate}.`, true);
+  setCrawlStatus(`Searching ${scopeLabel} from ${scope.startDate} to ${scope.endDate}.`, true);
   try {
     const payload = {
       entry_id: entry.entry_id,
-      start_date: startDate,
-      end_date: endDate,
+      start_date: scope.startDate,
+      end_date: scope.endDate,
       search_whole_index: wholeIndex,
       filename_dates_only: filenameOnly,
       include_modified_dates: includeModifiedDates
@@ -9878,8 +10127,8 @@ async function searchIndexDateRange() {
     });
     state.filenameDateScopeEntryId = entry.entry_id;
     state.filenameDateScopeDays = 0;
-    state.filenameDateScopeStart = startDate;
-    state.filenameDateScopeEnd = endDate;
+    state.filenameDateScopeStart = scope.startDate;
+    state.filenameDateScopeEnd = scope.endDate;
     state.currentEntry = result.entry;
     state.entryDetailCache.set(entry.entry_id, result.entry);
     syncEntrySummaryFromDetail(result.entry);
@@ -11704,8 +11953,14 @@ main {
 .heading {
   min-width: 0;
 }
+.heading-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
 .heading strong {
-  display: block;
+  display: inline-block;
   font-size: 16px;
 }
 .heading span {
@@ -11715,6 +11970,36 @@ main {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.heading-title .crop-state-flag {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  max-width: 220px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f8fafc;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.crop-state-flag.missing {
+  border-color: #fecaca;
+  background: #fff7f7;
+  color: var(--danger);
+}
+.crop-state-flag.estimated {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: var(--accent);
+}
+.crop-state-flag.manual {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #15803d;
 }
 .controls {
   display: flex;
@@ -12117,17 +12402,17 @@ button.subtle-danger:hover {
 	          <option value="missing">No saved crop data</option>
 	          <option value="estimated">Saved estimates</option>
 	          <option value="confirmed">User saved crops</option>
-	          <option value="all">All linked originals</option>
+	          <option value="all">All crop targets</option>
 	        </select>
 	      </label>
         <div class="date-scope-controls">
           <label>
             From
-            <input id="cropStartDate" type="date">
+            <input id="cropStartDate" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="yyyy-mm-dd or yyyy-mm">
           </label>
           <label>
             To
-            <input id="cropEndDate" type="date">
+            <input id="cropEndDate" type="text" inputmode="numeric" pattern="\\d{4}-\\d{2}(-\\d{2})?" maxlength="10" placeholder="optional end">
           </label>
         </div>
         <div class="date-scope-actions">
@@ -12135,14 +12420,17 @@ button.subtle-danger:hover {
           <button id="clearCropDateScopeButton" type="button">Clear</button>
         </div>
 	    </div>
-    <div id="summary" class="summary">Loading linked originals...</div>
-    <div id="cropListHint" class="summary crop-list-hint" hidden>Expand a year and month to choose a linked original for crop confirmation.</div>
+    <div id="summary" class="summary">Loading crop targets...</div>
+    <div id="cropListHint" class="summary crop-list-hint" hidden>Expand a year and month to choose a crop target.</div>
     <div id="entryList" class="entry-list"></div>
   </aside>
   <section class="workspace">
     <div class="toolbar">
       <div class="heading">
-        <strong id="entryHeading">No original selected</strong>
+        <div class="heading-title">
+          <strong id="entryHeading">No original selected</strong>
+          <span id="cropStateFlag" class="crop-state-flag missing">No saved crop</span>
+        </div>
         <span id="candidatePath"></span>
       </div>
       <div class="controls">
@@ -12171,7 +12459,7 @@ button.subtle-danger:hover {
         <div class="control-group item-actions">
           <button id="previousCropEntryButton" title="Shortcut: Left arrow">Previous entry (Left)</button>
           <button id="nextCropEntryButton" title="Shortcut: Right arrow">Next entry (Right)</button>
-          <button id="suggestCropButton">Estimate crop</button>
+          <button id="suggestCropButton" title="Shortcut: e. Estimate crop and rotation">Estimate crop (e)</button>
           <button id="resetCropButton">Reset crop</button>
           <button id="saveCropButton" class="primary" title="Shortcut: Return. Save crop offsets to staging">Save crop (Return)</button>
           <button id="commitCropButton" title="Commit staged crop-window changes to the canonical database">Commit crop changes <span id="pendingCropCommitCount" class="pending-count">0 pending</span></button>
@@ -12227,6 +12515,9 @@ const state = {
     cropStartDate: "",
     cropEndDate: "",
     cropScopeFallbackMessage: "",
+    cropNavigationNotice: "",
+    cropNavigationHistory: [],
+    cropNavigationResume: null,
 	  openYears: new Set(),
 	  openMonths: new Set()
 	};
@@ -12238,7 +12529,7 @@ async function fetchJson(url, options) {
   return body;
 }
 
-async function loadEntries(preferredEntryId = "") {
+async function loadEntries(preferredEntryId = "", options = {}) {
   const filterControl = document.getElementById("cropFilter");
   let cropFilter = filterControl.value;
   let body = await fetchJson(cropEntriesUrl(cropFilter));
@@ -12273,7 +12564,7 @@ async function loadEntries(preferredEntryId = "") {
   updatePendingCropCommitControl();
   const missingCount = state.entries.filter(entry => !entry.crop_has_crop).length;
   document.getElementById("summary").textContent =
-    cropSummaryText(cropFilter, state.entries, missingCount) + cropDateScopeSummary() + cropScopeFallbackSummary() + cropEstimateBatchSummary(state.cropEstimateBatch);
+    cropSummaryText(cropFilter, state.entries, missingCount) + cropDateScopeSummary() + cropScopeFallbackSummary() + cropNavigationNoticeSummary() + cropEstimateBatchSummary(state.cropEstimateBatch);
   if (!state.entries.length) {
     state.selectedEntryId = "";
     state.currentEntry = null;
@@ -12290,6 +12581,10 @@ async function loadEntries(preferredEntryId = "") {
   state.selectedEntryId = selected.entry_id;
   rememberOpenGroups(selected);
   renderEntries();
+  if (options.preserveCurrentEntry && state.currentEntry?.entry_id === state.selectedEntryId) {
+    updateCropNavigationState();
+    return;
+  }
   await loadEntry(state.selectedEntryId);
 }
 
@@ -12343,7 +12638,7 @@ function cropEntryStateText(entry) {
 }
 
 function cropSummaryText(cropFilter, entries, missingCount) {
-  const countText = `${entries.length} linked original${entries.length === 1 ? "" : "s"}`;
+  const countText = `${entries.length} crop target${entries.length === 1 ? "" : "s"}`;
   if (cropFilter === "missing") return `${countText} without saved crop data.`;
   if (cropFilter === "estimated") return `${countText} with saved estimate crop data.`;
   if (cropFilter === "confirmed") return `${countText} with user saved crop data.`;
@@ -12352,6 +12647,10 @@ function cropSummaryText(cropFilter, entries, missingCount) {
 
 function cropScopeFallbackSummary() {
   return state.cropScopeFallbackMessage || "";
+}
+
+function cropNavigationNoticeSummary() {
+  return state.cropNavigationNotice ? ` ${state.cropNavigationNotice}` : "";
 }
 
 function cropEstimateBatchSummary(job) {
@@ -12421,7 +12720,7 @@ function renderEntries() {
           ${image}
           <span>
             <span class="entry-date">${escapeHtml(entry.entry_date || entry.entry_id)}</span>
-            <span class="entry-meta">${escapeHtml(entry.candidate_filename || entry.candidate_path || "linked original")}</span>
+            <span class="entry-meta">${escapeHtml(entry.candidate_filename || entry.candidate_path || "crop target")}</span>
             ${people}
             <span class="entry-crop-status ${statusClass}">${escapeHtml(entry.crop_status || "")} · ${escapeHtml(entry.crop_source_state || "")}</span>
           </span>
@@ -12508,6 +12807,7 @@ function updateOpenGroup(collection, key, open, element) {
 
 function renderEmpty() {
   document.getElementById("entryHeading").textContent = "No selected originals";
+  updateCropStateFlag("No saved crop", "missing");
   const candidatePath = document.getElementById("candidatePath");
   candidatePath.textContent = "";
   candidatePath.removeAttribute("title");
@@ -12541,6 +12841,7 @@ function renderCropEditor() {
     return;
   }
   document.getElementById("entryHeading").textContent = entry.entry_date || entry.entry_id;
+  updateCropStateFlag(...cropStateFlagForEntry(entry, candidate));
   document.getElementById("cropListHint").hidden = true;
   const candidatePath = document.getElementById("candidatePath");
   candidatePath.textContent = candidateFileLabel(candidate);
@@ -12594,19 +12895,7 @@ function savedCropForCandidate(candidate) {
 }
 
 function sourceForCropSave() {
-  const source = String(state.selectedCandidate?.review_crop_source || "").trim().toLowerCase();
-  if (source !== "estimated") return "manual";
-  const saved = savedCropForCandidate(state.selectedCandidate);
-  if (!saved || !state.cropDraft) return "manual";
-  return cropsMatchForSourcePreservation(saved, state.cropDraft) ? "estimated" : "manual";
-}
-
-function cropsMatchForSourcePreservation(saved, draft) {
-  const numericFields = ["x", "y", "size", "candidate_width", "candidate_height", "rotation_degrees"];
-  const sameNumbers = numericFields.every(field => Number(saved[field]) === Number(draft[field]));
-  const savedFill = normalizeFillColor(saved.fill_color) || defaultFillColor();
-  const draftFill = normalizeFillColor(draft.fill_color) || defaultFillColor();
-  return sameNumbers && savedFill === draftFill;
+  return "manual";
 }
 
 function hasSavedCropForCandidate(candidate) {
@@ -13189,7 +13478,7 @@ async function estimateCropForCurrentCandidate() {
   const button = document.getElementById("suggestCropButton");
   const existingCrop = state.cropDraft ? {...state.cropDraft} : {};
   button.disabled = true;
-  document.getElementById("cropStatus").textContent = "Estimating crop with current rotation.";
+  document.getElementById("cropStatus").textContent = "Estimating crop and rotation.";
   try {
     const result = await fetchJson("/api/crop-suggestion", {
       method: "POST",
@@ -13204,7 +13493,7 @@ async function estimateCropForCurrentCandidate() {
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.selected) || state.selectedCandidate;
     state.cropDraft = result.crop;
     renderCropEditor();
-    document.getElementById("cropStatus").textContent = "Estimated crop staged with current rotation. Adjust it if needed.";
+    document.getElementById("cropStatus").textContent = "Estimated crop loaded as a draft. Press Save crop to stage it.";
   } catch (error) {
     document.getElementById("cropStatus").textContent = error.message;
   } finally {
@@ -13216,6 +13505,7 @@ async function saveCropForCurrentCandidate() {
   if (!state.currentEntry || !state.selectedCandidate || !state.cropDraft) return;
   const button = document.getElementById("saveCropButton");
   const nextEntryId = nextEntryIdAfterCurrent();
+  const savedEntry = cropNavigationHistoryEntry(state.currentEntry);
   button.disabled = true;
   try {
     state.currentEntry = await fetchJson("/api/crop", {
@@ -13228,10 +13518,21 @@ async function saveCropForCurrentCandidate() {
         source: sourceForCropSave()
       })
     });
+    rememberCropNavigationHistory(savedEntry);
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.selected) || state.selectedCandidate;
     state.cropDraft = savedCropForCandidate(state.selectedCandidate) || state.cropDraft;
     renderCropEditor();
     document.getElementById("cropStatus").textContent = "Crop offsets staged.";
+    const resume = consumeCropNavigationResume(state.currentEntry.entry_id);
+    if (resume) {
+      const filterControl = document.getElementById("cropFilter");
+      filterControl.value = resume.cropFilter;
+      state.cropFilterTouched = true;
+      state.cropNavigationNotice = "";
+      document.getElementById("cropStatus").textContent = `Crop offsets staged. Returned to ${cropFilterLabel(resume.cropFilter)}.`;
+      await loadEntries(resume.resumeEntryId);
+      return;
+    }
     const cropFilter = document.getElementById("cropFilter").value;
     await loadEntries(["missing", "estimated"].includes(cropFilter) ? nextEntryId : state.currentEntry.entry_id);
   } catch (error) {
@@ -13341,21 +13642,116 @@ function updateCropNavigationState() {
   const index = currentCropEntryIndex();
   const previousButton = document.getElementById("previousCropEntryButton");
   const nextButton = document.getElementById("nextCropEntryButton");
-  if (previousButton) previousButton.disabled = index <= 0;
+  if (previousButton) previousButton.disabled = index <= 0 && !state.cropNavigationHistory.length;
   if (nextButton) nextButton.disabled = index < 0 || index >= state.entries.length - 1;
 }
 
 async function selectAdjacentCropEntry(direction) {
   const index = currentCropEntryIndex();
+  if (direction < 0 && state.cropNavigationHistory.length) {
+    const previous = popCropNavigationHistory();
+    if (previous) await loadCropNavigationHistoryEntry(previous);
+    return;
+  }
   const target = state.entries[index + direction];
   if (!target) return;
   await loadEntry(target.entry_id);
+}
+
+function cropNavigationHistoryEntry(entry) {
+  if (!entry?.entry_id) return null;
+  return {
+    entry_id: entry.entry_id,
+    entry_date: entry.entry_date || entry.entry_id
+  };
+}
+
+function rememberCropNavigationHistory(entry) {
+  if (!entry?.entry_id) return;
+  state.cropNavigationHistory = state.cropNavigationHistory.filter(item => item.entry_id !== entry.entry_id);
+  state.cropNavigationHistory.push(entry);
+  if (state.cropNavigationHistory.length > 20) state.cropNavigationHistory.shift();
+}
+
+function popCropNavigationHistory() {
+  while (state.cropNavigationHistory.length) {
+    const previous = state.cropNavigationHistory.pop();
+    if (previous?.entry_id && previous.entry_id !== state.selectedEntryId) return previous;
+  }
+  return null;
+}
+
+async function loadCropNavigationHistoryEntry(previous) {
+  const existing = cropEntryById(previous.entry_id);
+  if (existing) {
+    await loadEntry(previous.entry_id);
+    return;
+  }
+  const filterControl = document.getElementById("cropFilter");
+  if (filterControl.value !== "all") {
+    const resumeFilter = filterControl.value;
+    const resumeEntryId = state.selectedEntryId;
+    filterControl.value = "all";
+    state.cropFilterTouched = true;
+    rememberCropNavigationResume(previous.entry_id, resumeFilter, resumeEntryId);
+    state.cropNavigationNotice = `${previous.entry_date || "Previous entry"} is outside the current crop list, so Crop list changed to All crop targets.`;
+    document.getElementById("summary").textContent = `Loading All crop targets. ${state.cropNavigationNotice}`;
+    await loadEntry(previous.entry_id);
+    document.getElementById("cropStatus").textContent = state.cropNavigationNotice;
+    loadEntries(previous.entry_id, {preserveCurrentEntry: true}).catch(error => {
+      document.getElementById("summary").textContent = error.message;
+    });
+    return;
+  }
+  state.cropNavigationNotice = `${previous.entry_date || "Previous entry"} is no longer visible in the current date scope.`;
+  await loadEntries(state.selectedEntryId);
+  document.getElementById("cropStatus").textContent = state.cropNavigationNotice;
+}
+
+function rememberCropNavigationResume(previousEntryId, cropFilter, resumeEntryId) {
+  if (!previousEntryId || !cropFilter || cropFilter === "all") return;
+  state.cropNavigationResume = {
+    previousEntryId,
+    cropFilter,
+    resumeEntryId: resumeEntryId || ""
+  };
+}
+
+function consumeCropNavigationResume(entryId) {
+  const resume = state.cropNavigationResume;
+  if (!resume || resume.previousEntryId !== entryId) return null;
+  state.cropNavigationResume = null;
+  return resume;
+}
+
+function cropFilterLabel(cropFilter) {
+  if (cropFilter === "estimated") return "Saved estimates";
+  if (cropFilter === "missing") return "No saved crop data";
+  if (cropFilter === "confirmed") return "User saved crops";
+  return "the previous crop list";
 }
 
 function cropLabel(candidate) {
   const saved = savedCropForCandidate(candidate);
   if (!saved) return "No saved crop";
   return `${savedCropSourceLabel(candidate)}: x ${saved.x}, y ${saved.y}, size ${saved.size}`;
+}
+
+function cropStateFlagForEntry(entry, candidate) {
+  if (!hasSavedCropForCandidate(candidate)) return ["No saved crop", "missing"];
+  const source = String(candidate?.review_crop_source || entry?.crop_source || "").trim().toLowerCase();
+  const pending = Boolean(entry?.crop_commit_pending);
+  if (source === "estimated") return [pending ? "Saved estimate pending" : "Saved estimate", "estimated"];
+  if (source === "manual") return [pending ? "User saved crop pending" : "User saved crop", "manual"];
+  return [pending ? "Saved crop pending" : "Saved crop", ""];
+}
+
+function updateCropStateFlag(label, className = "") {
+  const flag = document.getElementById("cropStateFlag");
+  if (!flag) return;
+  flag.textContent = label;
+  flag.className = `crop-state-flag ${className}`.trim();
+  flag.title = label;
 }
 
 function savedCropSourceLabel(candidate) {
@@ -13444,6 +13840,8 @@ function handleCropKeyboardShortcut(event) {
     handled = runCropShortcutButton("minimalFitButton", minimalFitCurrentCrop);
   } else if (key === "m") {
     handled = runCropShortcutButton("minimalMoveButton", minimalMoveCurrentCrop);
+  } else if (key === "e") {
+    handled = runCropShortcutButton("suggestCropButton", estimateCropForCurrentCandidate);
   } else if (event.key === "ArrowLeft") {
     handled = runCropShortcutButton("previousCropEntryButton", () => selectAdjacentCropEntry(-1));
   } else if (event.key === "ArrowRight") {
@@ -13462,10 +13860,14 @@ document.getElementById("minimalFitButton").onclick = minimalFitCurrentCrop;
 document.getElementById("minimalMoveButton").onclick = minimalMoveCurrentCrop;
 document.getElementById("cropFilter").onchange = () => {
   state.cropFilterTouched = true;
+  state.cropNavigationNotice = "";
+  state.cropNavigationResume = null;
   loadEntries();
 };
 document.getElementById("applyCropDateScopeButton").onclick = () => {
-  applyCropDateScopeControls();
+  if (!applyCropDateScopeControls()) return;
+  state.cropNavigationNotice = "";
+  state.cropNavigationResume = null;
   loadEntries();
 };
 document.getElementById("clearCropDateScopeButton").onclick = () => {
@@ -13473,6 +13875,8 @@ document.getElementById("clearCropDateScopeButton").onclick = () => {
   state.cropStartDate = "";
   state.cropEndDate = "";
   state.cropScopeFallbackMessage = "";
+  state.cropNavigationNotice = "";
+  state.cropNavigationResume = null;
   document.getElementById("cropStartDate").value = "";
   document.getElementById("cropEndDate").value = "";
   loadEntries();
@@ -13551,28 +13955,71 @@ function applyInitialCropFilterFromUrl() {
 function applyInitialCropDateScopeFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const entryDates = params.getAll("entry_date").flatMap(splitCropDateValues).filter(Boolean);
-  const directDate = normalizeCropDate(params.get("date") || (entryDates.length === 1 ? entryDates[0] : ""));
-  const startDate = normalizeCropDate(params.get("start_date") || directDate);
-  const endDate = normalizeCropDate(params.get("end_date") || directDate);
-  state.cropEntryDates = entryDates.map(normalizeCropDate).filter(Boolean);
-  state.cropStartDate = startDate;
-  state.cropEndDate = endDate;
-  document.getElementById("cropStartDate").value = startDate;
-  document.getElementById("cropEndDate").value = endDate;
+  const normalizedEntryDates = entryDates.map(normalizeCropDate).filter(Boolean);
+  const directDate = params.get("date") || (normalizedEntryDates.length === 1 ? normalizedEntryDates[0] : "");
+  const scopeStart = params.get("start_date") || directDate;
+  const scopeEnd = params.get("end_date") || "";
+  const scope = scopeStart ? dateScopeFromInputValues(scopeStart, scopeEnd) : {ok: true, startDate: "", endDate: ""};
+  state.cropEntryDates = normalizedEntryDates;
+  state.cropStartDate = scope.ok ? scope.startDate : "";
+  state.cropEndDate = scope.ok ? scope.endDate : "";
+  document.getElementById("cropStartDate").value = state.cropStartDate;
+  document.getElementById("cropEndDate").value = state.cropEndDate;
 }
 
 function applyCropDateScopeControls() {
-  const startDate = normalizeCropDate(document.getElementById("cropStartDate").value);
-  const endDate = normalizeCropDate(document.getElementById("cropEndDate").value || startDate);
+  const scope = dateScopeFromInputValues(
+    document.getElementById("cropStartDate").value,
+    document.getElementById("cropEndDate").value
+  );
+  if (!scope.ok) {
+    document.getElementById("summary").textContent = scope.message;
+    document.getElementById("cropStatus").textContent = scope.message;
+    return false;
+  }
   state.cropEntryDates = [];
-  state.cropStartDate = startDate;
-  state.cropEndDate = endDate;
-  document.getElementById("cropStartDate").value = startDate;
-  document.getElementById("cropEndDate").value = endDate;
+  state.cropStartDate = scope.startDate;
+  state.cropEndDate = scope.endDate;
+  document.getElementById("cropStartDate").value = scope.startDate;
+  document.getElementById("cropEndDate").value = scope.endDate;
+  return true;
 }
 
 function splitCropDateValues(value) {
   return String(value || "").split(";").map(item => item.trim()).filter(Boolean);
+}
+
+function dateScopeFromInputValues(startValue, endValue = "") {
+  const startScope = parseDateScopeValue(startValue);
+  if (!startScope) return {ok: false, message: "Enter a date as yyyy-mm-dd or yyyy-mm."};
+  const endScope = String(endValue || "").trim() ? parseDateScopeValue(endValue) : startScope;
+  if (!endScope) return {ok: false, message: "Enter the end date as yyyy-mm-dd or yyyy-mm."};
+  if (endScope.endDate < startScope.startDate) {
+    return {ok: false, message: "End date must be on or after start date."};
+  }
+  return {
+    ok: true,
+    startDate: startScope.startDate,
+    endDate: endScope.endDate
+  };
+}
+
+function parseDateScopeValue(value) {
+  const text = String(value || "").trim().replace(/^project365:/, "");
+  const dateMatch = text.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+  if (dateMatch) {
+    const date = new Date(Date.UTC(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3])));
+    const normalized = date.toISOString().slice(0, 10);
+    return normalized === text ? {startDate: normalized, endDate: normalized} : null;
+  }
+  const monthMatch = text.match(/^(\\d{4})-(\\d{2})$/);
+  if (!monthMatch) return null;
+  const year = Number(monthMatch[1]);
+  const month = Number(monthMatch[2]);
+  if (month < 1 || month > 12) return null;
+  const startDate = `${monthMatch[1]}-${monthMatch[2]}-01`;
+  const endDate = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+  return {startDate, endDate};
 }
 
 function normalizeCropDate(value) {
