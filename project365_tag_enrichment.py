@@ -162,7 +162,7 @@ def load_exportable_diarium_tags(db_path: Path, entry_ids: list[str]) -> dict[st
             tags_by_entry[row["id"]].append(normalize_diarium_tag("source", row["source_app"]))
         for row in connection.execute(
             f"""
-            SELECT entry_id, diarium_name
+            SELECT entry_id, tag_type, diarium_name
             FROM tags
             WHERE entry_id IN ({placeholders})
                 AND review_status IN ('confirmed', 'reviewed')
@@ -170,19 +170,50 @@ def load_exportable_diarium_tags(db_path: Path, entry_ids: list[str]) -> dict[st
             """,
             entry_ids,
         ):
-            tags_by_entry[row["entry_id"]].append(row["diarium_name"])
+            tags_by_entry[row["entry_id"]].append(_export_tag_label(row["diarium_name"], row["tag_type"]))
         for row in connection.execute(
             f"""
             SELECT entry_id, diarium_tag
             FROM people
             WHERE entry_id IN ({placeholders})
                 AND review_status IN ('confirmed', 'reviewed')
+                AND source != 'digikam_xmp'
             ORDER BY canonical_name
             """,
             entry_ids,
         ):
-            tags_by_entry[row["entry_id"]].append(row["diarium_tag"])
+            tags_by_entry[row["entry_id"]].append(_export_tag_label(row["diarium_tag"], "person"))
         return {entry_id: _dedupe(tags) for entry_id, tags in tags_by_entry.items()}
+    finally:
+        connection.close()
+
+
+def load_exportable_media_people_tags(db_path: Path, media_asset_ids: list[str]) -> dict[str, list[str]]:
+    if not media_asset_ids:
+        return {}
+    tags_by_media = {media_asset_id: [] for media_asset_id in media_asset_ids}
+    connection = sqlite3.connect(db_path)
+    try:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'media_people'"
+        ).fetchone() is None:
+            return tags_by_media
+        placeholders = ",".join("?" for _ in media_asset_ids)
+        for media_asset_id, tag in connection.execute(
+            f"""
+            SELECT media_people.media_asset_id, media_people.diarium_tag
+            FROM media_people
+            JOIN media_assets ON media_assets.id = media_people.media_asset_id
+            LEFT JOIN people ON people.entry_id = media_assets.entry_id
+                AND people.canonical_name = media_people.canonical_name
+            WHERE media_people.media_asset_id IN ({placeholders})
+                AND (people.review_status IS NULL OR people.review_status != 'rejected')
+            ORDER BY media_people.media_asset_id, media_people.canonical_name
+            """,
+            media_asset_ids,
+        ):
+            tags_by_media[media_asset_id].append(_export_tag_label(tag, "person"))
+        return tags_by_media
     finally:
         connection.close()
 
@@ -229,6 +260,15 @@ def normalize_diarium_tag(tag_type: str, name: str) -> str:
     if tag_type == "place":
         return f"place:{cleaned}"
     return f"{_slug(tag_type)}:{cleaned}"
+
+
+def _export_tag_label(tag: str, tag_type: str) -> str:
+    if tag_type == "source":
+        return tag
+    prefix = f"{_slug(tag_type)}:"
+    if tag.lower().startswith(prefix):
+        return tag[len(prefix):].strip() or tag
+    return tag
 
 
 def _write_queue(path: Path, rows: list[dict[str, object]]) -> None:

@@ -112,6 +112,18 @@ reviewing how a confirmed original photo should be squared for diary use. Crop
 geometry is staged first and then committed explicitly, which keeps review
 decisions auditable and avoids accidental database writes.
 
+For linked photos without a Project365 target, Crop uses Apple Vision to make
+square and straightening candidates, then the locally loaded Qwen3-VL model
+chooses one. Start LM Studio's localhost server and load the downloaded
+`qwen/qwen3-vl-8b` model before using **Batch estimate crop**. With **Save
+estimates as calculated** checked, the worker saves draft estimates in groups
+of 25. Open **Saved estimates** in Crop and choose a **Ready batch** while later
+groups continue. Adjust any crop, or press Return to save its coordinates;
+**Commit crop changes** remains a separate explicit action. Each estimate is
+persisted as it completes. If the local model closes, the batch stops; reload
+the model and start the batch again to skip already saved crops. The original
+photos are never edited.
+
 ### Working Photo Copies
 
 `project365_media_derivatives.py` generates date-organized working copies from
@@ -150,6 +162,84 @@ local output paths and should not be committed.
 
 ### Diarium Export and Reconciliation
 
+For Day One itself, the Control Panel also has **Day One journals: Project365 +
+Private**. It generates a separate ZIP under
+`Project365Canonical/exports/dayone_import_batches` with `Project365.json` and
+`Project365 Private.json`. Each entry goes to exactly one journal; any Private
+tag on any included working-copy photo sends the entire entry to the private
+journal. The export stops if a required working-copy XMP sidecar is missing or
+unreadable. Picker and Crop show an entry-level Private checkbox for all included
+working copies; `P` toggles it, while `K` keeps the Project365 photo in Picker. digiKam's
+pending metadata writes must be synchronized before using either control.
+
+Day One does not document import fields for journal settings. After a small
+pilot import, verify both journal names and counts, then manually set **Conceal
+Content**, encryption, and the desired visibility controls on Project365
+Private. Conceal Content hides previews, not access to entries; the exported
+ZIP contains readable diary text and photos. A repeated JSON import creates
+new journals rather than updating the previous import.
+
+### Facebook JSON Export to Day One
+
+In the Control Panel, open **Step 12: Import your data** and enable Facebook.
+Drop the extracted Facebook **JSON** export root (the folder containing
+`your_activity_across_facebook/posts`) into the indicated source folder. Put
+other HTML/media-only exports under its `Other Facebook Data Exports` folder.
+The converter detects one unambiguous JSON export and the supplemental folder
+automatically; **Advanced** accepts another folder path. Select **Build Day One
+ZIP**. The
+same converter is available from the terminal:
+
+```sh
+python3 facebook_dayone_importer.py --source 'Source Data/Facebook Data Export/facebook-mikerogero' --output-dir Project365Canonical/exports/facebook_dayone_batches
+```
+
+For the audited archive, add
+`--additional-exports 'Source Data/Facebook Data Export/Other Facebook Data Exports'`.
+The main JSON export is the most complete single folder, but the added HTML
+snapshot supplies one distinct title-only post and a media-only folder supplies
+one previously external-only video. HTML post dates have no timezone: the
+converter accepts them only when it can infer a consistent offset from posts
+also present in timestamped JSON. Same-path media with differing file sizes
+remain the JSON source's version and are listed in the manifest for review.
+
+It packages posts, archived stories, Marketplace listings, attached photos/videos,
+album photo groups, and uncategorized-photo and video records not already attached
+to posts. Album photos on the same local date share an entry; groups over Day One's
+30-media limit are labeled in consecutive parts. Individual photo descriptions
+remain beside their media, and each media item retains its original Facebook
+timestamp. Identical Marketplace listing records within three days share one
+entry. An uncategorized photo joins a listing only when its upload time is
+within 15 minutes of exactly one listing group; repeated bytes and
+near-identical re-encodings are included once. ImageMagick enables the visual
+duplicate check; without it, exact-byte duplicates are still removed.
+Exported comments with no parent post URL or ID
+are counted in the manifest but not emitted as contextless Day One entries. The
+source comments remain untouched for later reconciliation. The converter cannot
+recover other people's comments or friends-only tagged posts absent from the export. Source
+timestamps remain UTC; when the HTML overlap establishes a consistent display
+offset, the Day One timezone is set to that offset so local calendar dates match
+Facebook's export. Post place coordinates and tagged names are retained.
+The HTML export's post-date links are attached to matching entries; ambiguous
+same-second matches are left unlinked. Facebook's `dyi/l` tokens cannot be
+converted into final post IDs offline. Verified destinations can be placed in
+`Source Data/Facebook Data Export/facebook_post_link_overrides.json` as a JSON
+object mapping each intermediate URL to its final Facebook post URL. The manifest
+counts links that still point to an intermediate page. Facebook mention tokens become readable
+profile links. If a shared item has no original URL or media in the export,
+the entry says so rather than inventing a link or attaching someone else's
+photos. The manifest reports the latest post date and these link gaps.
+The ZIP and JSON integrity manifest stay under ignored local outputs. The
+manifest lists every attachment and any external-only links, unindexed media
+dated from filesystem modification time, or entries whose date had to use
+album modification time. It repairs reversible UTF-8 mojibake in diary text,
+reports the number of repaired entries and flags any remaining suspect text;
+the Facebook source files are unchanged. Review the warnings before import. The converter does
+not change the Facebook source or Day One; use Day One **File > Import > JSON
+Zip File** to import the ZIP into a
+new journal. Like other Day One JSON ZIPs, the archive contains readable text
+and media, so keep it private.
+
 `project365_diarium_exporter.py` builds a Day One ZIP package that Diarium can
 import through:
 
@@ -157,6 +247,25 @@ import through:
 
 Do not use Diarium's generic "Import diary" option for these packages; that
 expects a Diarium database backup.
+
+Day One person tags appear under Diarium Tags, not its People category. For a
+fresh Diarium migration with dedicated People fields, convert a generated
+Day One ZIP and its manifest using `project365_diarium_csv_exporter.py`:
+
+```sh
+python3 project365_diarium_csv_exporter.py \
+  --canonical-root Project365Canonical \
+  --dayone-zip /path/to/project365_dayone.zip \
+  --manifest /path/to/project365_dayone_manifest.csv \
+  --output /path/to/project365_diarium_people.csv.zip \
+  --include-suggested
+```
+
+Import that ZIP through `Settings > Diary > Migrate from other app > CSV`.
+Omit `--include-suggested` to export only reviewed/confirmed people. Diarium's
+CSV import skips an entry when its exact timestamp already exists; it does not
+add People to an existing Day One import. Use a fresh diary for a replacement
+migration, after backing up the current diary. CSV entry text is plain text.
 
 `project365_diarium_reconciler.py` compares a Diarium JSON or ZIP export back
 against the canonical archive and the generated package manifest. This provides
@@ -193,14 +302,22 @@ git clone https://github.com/MikeRogero/Project365-Migration.git
 cd Project365-Migration
 ```
 
-Create the expected local workspace folders:
+Create the core local workspace folders:
 
 ```sh
-mkdir -p "Source Data/Project365 Pro Export Zips"
 mkdir -p "Source Data/Original Photos matching Project365 Entries"
 mkdir -p Project365Canonical
 mkdir -p Reports
 ```
+
+On first launch, Step 12 in the Control Panel asks which import sources to enable.
+It creates drop folders under `Source Data` for the selected sources (Project365
+Pro, Facebook, Swarm, Twitter/X, and Instagram). Drop each export into the
+folder shown on its card. Disabled sources can be enabled later in Step 12.
+Project365 Pro imports into the canonical database; Facebook builds a Day One
+ZIP; Twitter/X stages posts for review. Swarm and Instagram currently have
+drop-folder setup only, not working importers. An advanced folder override is
+available when the export is stored elsewhere.
 
 Copy Project365 monthly ZIP exports into:
 

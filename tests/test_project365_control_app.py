@@ -676,6 +676,76 @@ class Project365ControlAppTests(unittest.TestCase):
 
         self.assertIn("--progress-interval", command)
         self.assertIn("25", command)
+        self.assertNotIn("--no-include-associated", command)
+        self.assertNotIn("--start-date", command)
+        self.assertNotIn("--end-date", command)
+        self.assertNotIn("--force", command)
+
+    def test_dayone_control_step_uses_private_split_export(self) -> None:
+        command = control._commands_for_step("generate_dayone_package", {
+            "start_date": "1998-04-12", "end_date": "1998-04-13", "limit": 2,
+        })[0]
+        self.assertIn("--target", command)
+        self.assertEqual(command[command.index("--target") + 1], "dayone")
+        self.assertIn(str(control.DAYONE_IMPORT_BATCH_DIR), command)
+        self.assertIn('data-step="generate_dayone_package"', control.CONTROL_HTML)
+        self.assertIn('id="dayOnePrivacyReadiness"', control.CONTROL_HTML)
+
+    def test_facebook_dayone_control_step_builds_importer_command_and_panel(self) -> None:
+        command = control._commands_for_step("import_facebook_dayone", {
+            "source": "/tmp/facebook-export",
+        })[0]
+        self.assertEqual(
+            command,
+            [
+                control.sys.executable,
+                "facebook_dayone_importer.py",
+                "--source",
+                "/tmp/facebook-export",
+                "--output-dir",
+                str(control.FACEBOOK_DAYONE_IMPORT_BATCH_DIR),
+            ],
+        )
+        self.assertIn('data-step="import_hub"', control.CONTROL_HTML)
+        self.assertIn('id="facebookDayOneSource"', control.CONTROL_HTML)
+        self.assertIn('id="facebookDayOneAdditionalExports"', control.CONTROL_HTML)
+        self.assertIn("runFacebookDayOneImport", control.CONTROL_HTML)
+        with_extra = control._commands_for_step("import_facebook_dayone", {
+            "source": "/tmp/facebook-export", "additional_exports": "/tmp/other-exports",
+        })[0]
+        self.assertEqual(with_extra[-2:], ["--additional-exports", "/tmp/other-exports"])
+
+    def test_facebook_dayone_control_step_uses_unambiguous_default_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            posts = root / "Facebook Data Export" / "export" / "posts"
+            posts.mkdir(parents=True)
+            (posts / "your_posts_1.json").write_text("[]", encoding="utf-8")
+            with mock.patch.object(control, "SOURCE_DATA_ROOT", root):
+                command = control._commands_for_step("import_facebook_dayone", {})[0]
+            self.assertEqual(command[command.index("--source") + 1], str(root / "Facebook Data Export" / "export"))
+
+    def test_x_step_stages_for_review_without_canonical_ingest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "Twitter Data Export" / "archive" / "data"
+            archive.mkdir(parents=True)
+            (archive / "tweets.js").write_text("[]", encoding="utf-8")
+            with mock.patch.object(control, "SOURCE_DATA_ROOT", root):
+                commands = control._commands_for_step("stage_x_archive", {})
+            self.assertEqual(len(commands), 1)
+            self.assertIn("project365_social_adapter_config.py", commands[0])
+            self.assertNotIn("project365_social_ingester.py", commands[0])
+
+    def test_facebook_dayone_result_shows_package_and_coverage_warnings(self) -> None:
+        outputs = [{"output": "package_path: /tmp/facebook_dayone.zip\nmanifest_path: /tmp/manifest.json\nentry_count: 4\nattachment_count: 3\nalbum_entries: 2\nunlinked_comments: 1\nentries_with_location: 1\nexternal_media_links: 1\nunindexed_media_files: 2\nestimated_date_entries: 1\n"}]
+        metrics = control._summary_metrics("import_facebook_dayone", {}, {}, outputs)
+        self.assertEqual(metrics[0], {"label": "Day One ZIP", "value": "/tmp/facebook_dayone.zip"})
+        self.assertEqual(metrics[2], {"label": "Entries", "value": "4"})
+        self.assertIn({"label": "Album entries", "value": "2"}, metrics)
+        self.assertIn({"label": "Unlinked comments", "value": "1"}, metrics)
+        self.assertIn("comments need post links", control.CONTROL_HTML)
+        self.assertEqual(len(control._summary_warnings("import_facebook_dayone", outputs)), 3)
 
     def test_generate_derivatives_uses_long_running_timeout(self) -> None:
         self.assertEqual(control._step_timeout_seconds("generate_derivatives"), 12 * 60 * 60)
@@ -1367,6 +1437,14 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("reject_duplicate", control.MEDIA_DEDUPE_HTML)
         self.assertIn('event.key === "ArrowRight"', control.MEDIA_DEDUPE_HTML)
 
+    def test_video_memory_review_is_available_from_control_panel(self) -> None:
+        self.assertIn("video_memory_review", control.WORKFLOW_STEPS)
+        self.assertIn('data-step="video_memory_review"', control.CONTROL_HTML)
+        self.assertIn('href="http://127.0.0.1:8767/"', control.CONTROL_HTML)
+        source = Path(control.__file__).read_text()
+        self.assertNotIn("import project365_video_memory_review", source)
+        self.assertNotIn('parsed.path == "/video-memory/api/videos"', source)
+
     def test_media_dedupe_api_adds_media_urls_and_records_decisions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -1751,9 +1829,9 @@ class Project365ControlAppTests(unittest.TestCase):
     def test_control_html_expands_only_requested_crop_confirmation_step(self) -> None:
         html = control._control_html("/picker", initial_step="crop_confirmation")
 
-        self.assertIn('<section class="panel workflow-step" data-step="import_zips">', html)
+        self.assertIn('<section class="panel workflow-step" data-step="import_hub">', html)
         self.assertIn(
-            'data-step-toggle="import_zips" onclick="toggleWorkflowStep(\'import_zips\')" aria-expanded="false">Open</button>',
+            'data-step-toggle="import_hub" onclick="toggleWorkflowStep(\'import_hub\')" aria-expanded="false">Open</button>',
             html,
         )
         self.assertIn('<section class="panel workflow-step is-expanded" data-step="crop_confirmation">', html)
@@ -1767,9 +1845,26 @@ class Project365ControlAppTests(unittest.TestCase):
 
         self.assertNotIn("workflow-step is-expanded", html)
         self.assertIn(
-            'data-step-toggle="import_zips" onclick="toggleWorkflowStep(\'import_zips\')" aria-expanded="false">Open</button>',
+            'data-step-toggle="import_hub" onclick="toggleWorkflowStep(\'import_hub\')" aria-expanded="false">Open</button>',
             html,
         )
+
+    def test_latest_facebook_package_is_visible_after_cli_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            package = output / "facebook_dayone_20260101T000000Z.zip"
+            package.write_bytes(b"fixture")
+            manifest = output / "facebook_dayone_20260101T000000Z_manifest.json"
+            manifest.write_text(json.dumps({
+                "package_path": str(package), "entry_count": 3, "attachment_count": 2,
+                "entries_with_location": 1, "facebook_post_links": 2,
+                "latest_post_date": "2023-09-21", "shared_content_without_original_url": 1,
+            }), encoding="utf-8")
+            with mock.patch.object(control, "FACEBOOK_DAYONE_IMPORT_BATCH_DIR", output):
+                record = control._latest_facebook_package_workflow_record()
+            self.assertEqual(record["step"], "import_facebook_dayone")
+            self.assertEqual(record["summary"]["metrics"][0]["value"], str(package))
+            self.assertIn({"label": "Latest post", "value": "2023-09-21"}, record["summary"]["metrics"])
 
     def test_diary_enrichment_follows_working_copies_and_face_tagging(self) -> None:
         original_review = control.CONTROL_HTML.index("Original-photo review")
@@ -1787,13 +1882,20 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("workingCopyEndDate", control.CONTROL_HTML)
         self.assertIn("forceWorkingCopies", control.CONTROL_HTML)
         self.assertIn("function runWorkingCopies()", control.CONTROL_HTML)
+        self.assertIn("async function runWorkingCopies() {\n  const scope = workingCopyDateScope();", control.CONTROL_HTML)
+        self.assertIn("Leave both dates blank to check the entire database", control.CONTROL_HTML)
         self.assertIn("function refreshWorkingCopyReadiness()", control.CONTROL_HTML)
         self.assertIn("/api/working-copy-readiness", control.CONTROL_HTML)
         self.assertIn("Unchanged copies are skipped unless forced", control.CONTROL_HTML)
+        self.assertIn("Linked targets", control.CONTROL_HTML)
+        self.assertIn("Write digiKam metadata to <code>.xmp</code> sidecars", control.CONTROL_HTML)
         self.assertIn("Import digiKam suggestions", control.CONTROL_HTML)
-        self.assertIn("digikamXmpRoots", control.CONTROL_HTML)
+        self.assertNotIn("digikamXmpRoots", control.CONTROL_HTML)
         self.assertIn("digikamSuggestionsCsv", control.CONTROL_HTML)
         self.assertIn("function importDigiKamPeople()", control.CONTROL_HTML)
+        self.assertIn("Rerun after digiKam adds, changes, or removes names", control.CONTROL_HTML)
+        self.assertIn('class="button primary" onclick="importDigiKamPeople()"', control.CONTROL_HTML)
+        self.assertNotIn('onclick="runStep(\'face_tagging\')"', control.CONTROL_HTML)
 
     def test_control_scopes_working_photo_copy_command(self) -> None:
         commands = control._commands_for_step(
@@ -1851,6 +1953,14 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("/tmp/xmp-two", command)
         self.assertIn("--suggestions-csv", command)
         self.assertIn("/tmp/people.csv", command)
+
+    def test_control_uses_working_copy_sidecars_without_folder_input(self) -> None:
+        command = control._commands_for_step("import_digikam_people", {})[0]
+        xmp_index = command.index("--xmp-root")
+        self.assertEqual(
+            command[xmp_index + 1],
+            str(control.CANONICAL_ROOT / "media" / "diarium_derivatives" / control.DERIVATIVE_POLICY),
+        )
 
     def test_control_embeds_picker_under_same_port(self) -> None:
         html = control._embedded_picker_html()
@@ -2057,7 +2167,7 @@ class Project365ControlAppTests(unittest.TestCase):
         html = control._embedded_crop_html()
 
         self.assertIn('href="/?step=crop_confirmation"', html)
-        self.assertIn("fetchJson(cropEntriesUrl(cropFilter))", html)
+        self.assertIn("fetchJson(cropEntriesUrl(cropFilter, anchorMonth))", html)
         self.assertIn("`/crop/api/crop-entries?${params.toString()}`", html)
         self.assertIn('params.set("start_date", state.cropStartDate);', html)
         self.assertIn('fetchJson(`/crop/api/crop-entry/', html)
@@ -2067,11 +2177,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('fetchJson("/crop/api/crop-reject-original"', html)
         self.assertIn('fetchJson("/crop/api/crop-suggestion"', html)
         self.assertNotIn('fetchJson("/crop/api/crop-estimate-batch"', html)
-        self.assertNotIn('fetchJson(`/crop/api/crop-estimate-batch/', html)
+        self.assertIn('fetchJson(`/crop/api/crop-estimate-batch/', html)
         self.assertNotIn('id="estimateCropBatchButton"', html)
-        self.assertIn('src="/picker/image/${encodeURIComponent(entry.source_token)}"', html)
+        self.assertIn('const base = `/picker/image/${encodeURIComponent(token)}`;', html)
         self.assertIn("`/picker/image/${entry.source_token}`", html)
-        self.assertIn("`/picker/image/${candidate.token}`", html)
         self.assertNotIn('fetchJson("/api/', html)
         self.assertNotIn('fetchJson(`/api/', html)
         self.assertNotIn('src="/image/${', html)
@@ -2205,8 +2314,28 @@ class Project365ControlAppTests(unittest.TestCase):
         state = mock.Mock()
         picker_state = state.picker_state.return_value
         picker_state.crop_entries.return_value = [
-            {"entry_id": "project365:1998-04-11"},
-            {"entry_id": "project365:1998-04-12"},
+            {
+                "entry_id": "project365:1998-03-31",
+                "entry_date": "1998-03-31",
+                "estimate_batch_id": "batch-1",
+                "estimate_batch_number": 1,
+                "estimate_batch_complete": True,
+            },
+            {
+                "entry_id": "project365:1998-04-11",
+                "entry_date": "1998-04-11",
+                "estimate_batch_id": "batch-1",
+                "estimate_batch_number": 1,
+                "estimate_batch_complete": True,
+            },
+            {
+                "entry_id": "project365:1998-06-12",
+                "entry_date": "1998-06-12",
+                "estimate_batch_id": "batch-2",
+                "estimate_batch_number": 2,
+                "estimate_batch_complete": True,
+            },
+            {"entry_id": "project365:1998-07-01", "entry_date": "1998-07-01"},
         ]
         picker_state.pending_crop_commits.return_value = {"pending_count": 2}
         picker_state.latest_crop_estimate_job.return_value = {
@@ -2228,7 +2357,7 @@ class Project365ControlAppTests(unittest.TestCase):
         thread.start()
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing&limit=1&entry_date=1998-04-12&start_date=1998-04-01&end_date=1998-04-30",
+                f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?crop_filter=missing&limit=1&anchor_month=1998-04&month_count=2",
                 timeout=5,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
@@ -2237,8 +2366,19 @@ class Project365ControlAppTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(result["entries"], [{"entry_id": "project365:1998-04-11"}])
-        self.assertEqual(result["total_count"], 2)
+        self.assertEqual(result["entries"], [picker_state.crop_entries.return_value[1]])
+        self.assertEqual(result["total_count"], 4)
+        self.assertEqual(result["window_count"], 2)
+        self.assertEqual(result["window_months"], ["1998-04", "1998-06"])
+        self.assertEqual(result["previous_month"], "1998-03")
+        self.assertEqual(result["next_month"], "1998-07")
+        self.assertEqual(
+            result["estimate_batches"],
+            [
+                {"id": "batch-1", "number": 1, "count": 2},
+                {"id": "batch-2", "number": 2, "count": 1},
+            ],
+        )
         self.assertEqual(result["pending_crop_commits"], {"pending_count": 2})
         self.assertEqual(result["crop_estimate_batch"]["id"], "job-1")
         self.assertEqual(result["crop_estimate_batch"]["error_count"], 1)
@@ -2253,9 +2393,9 @@ class Project365ControlAppTests(unittest.TestCase):
         )
         picker_state.crop_entries.assert_called_once_with(
             crop_filter="missing",
-            entry_dates={"1998-04-12"},
-            start_date="1998-04-01",
-            end_date="1998-04-30",
+            entry_dates=set(),
+            start_date="",
+            end_date="",
         )
         picker_state.pending_crop_commits.assert_called_once_with()
         picker_state.latest_crop_estimate_job.assert_called_once_with()
@@ -3156,6 +3296,26 @@ class Project365ControlAppTests(unittest.TestCase):
             {"label": "Saved candidate rows", "value": "32"},
             record["summary"]["metrics"],
         )
+
+    def test_recorded_people_import_takes_precedence_over_its_queue_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            queue = Path(temp_dir) / "queue.csv"
+            report = Path(temp_dir) / "report.csv"
+            queue.write_text("")
+            report.write_text("")
+            finished_at = max(control._path_mtime_iso(queue), control._path_mtime_iso(report))
+            record = {
+                "step": "import_digikam_people",
+                "status": "pass",
+                "started_at": finished_at,
+                "finished_at": finished_at,
+                "summary": {"metrics": [{"label": "Photo person links", "value": "2"}]},
+            }
+            with mock.patch.object(control, "TAG_QUEUE", queue), mock.patch.object(control, "DIGIKAM_PEOPLE_REPORT", report):
+                history = control._current_workflow_history([record], {}, {"face_tagging"})
+
+            self.assertNotIn("face_tagging", history)
+            self.assertEqual(history["import_digikam_people"][0]["summary"]["metrics"][0]["value"], "2")
 
     def test_current_workflow_history_includes_persisted_status_with_recorded_history(self) -> None:
         recorded = {

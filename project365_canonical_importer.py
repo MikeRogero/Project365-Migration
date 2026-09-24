@@ -18,7 +18,7 @@ import project365_export_validator as validator
 from project365_paths import PROJECT365_PRO_EXPORT_ZIPS_DIR
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -163,7 +163,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
 
         INSERT OR REPLACE INTO schema_meta (key, value)
-        VALUES ('schema_version', '1');
+        VALUES ('schema_version', '2');
 
         CREATE TABLE IF NOT EXISTS import_batches (
             id TEXT PRIMARY KEY,
@@ -265,6 +265,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source TEXT NOT NULL,
             UNIQUE (entry_id, canonical_name),
             FOREIGN KEY (entry_id) REFERENCES entries(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS media_people (
+            media_asset_id TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            diarium_tag TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (media_asset_id, canonical_name),
+            FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
         );
 
         CREATE TABLE IF NOT EXISTS locations (

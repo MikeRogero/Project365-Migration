@@ -66,8 +66,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--include-associated",
-        action="store_true",
-        help="Also generate derivatives for associated photos linked to diary entries.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include linked photos in working copies (default: included).",
     )
     parser.add_argument(
         "--progress-interval",
@@ -127,7 +128,7 @@ def generate_derivatives(
     start_date: str = "",
     end_date: str = "",
     force: bool = False,
-    include_associated: bool = False,
+    include_associated: bool = True,
     progress_interval: int = 0,
     progress_sink: Callable[[str], None] | None = None,
     reuse_existing_newer_than: str = "",
@@ -590,7 +591,7 @@ def derivative_readiness_summary(
     quality: int = 88,
     start_date: str = "",
     end_date: str = "",
-    include_associated: bool = False,
+    include_associated: bool = True,
 ) -> DerivativeReadinessSummary:
     db_path = canonical_root / "canonical.db"
     if not db_path.exists():
@@ -724,8 +725,6 @@ def _staged_review_crop_for_row(
     staged_crops: dict[tuple[str, str], dict[str, object]],
     row: sqlite3.Row,
 ) -> dict[str, object] | None:
-    if str(row["source_role"]) == "associated":
-        return None
     return staged_crops.get((str(row["entry_id"]), str(row["storage_path"])))
 
 
@@ -735,7 +734,7 @@ def _load_source_media(
     limit: int | None,
     start_date: str = "",
     end_date: str = "",
-    include_associated: bool = False,
+    include_associated: bool = True,
 ) -> list[sqlite3.Row]:
     query = """
         WITH source_rows AS (
@@ -860,8 +859,6 @@ def _derivative_is_current(
     if str(row["derivative_storage_path"] or "") != str(output_path):
         return False
     if not output_path.exists():
-        return False
-    if int(row["derivative_byte_size"] or -1) != output_path.stat().st_size:
         return False
     if not str(row["derivative_sha256"] or "").strip():
         return False

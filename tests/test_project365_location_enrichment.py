@@ -63,6 +63,7 @@ class Project365LocationEnrichmentTests(unittest.TestCase):
                 end_date="1998-04-30",
                 limit=20,
             )
+            self.assertEqual(package_summary.location_count, 1)
             with zipfile.ZipFile(package_summary.package_path) as archive:
                 payload = json.loads(archive.read("Journal.json").decode("utf-8"))
             self.assertEqual(

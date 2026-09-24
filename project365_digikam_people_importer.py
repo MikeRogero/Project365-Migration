@@ -11,10 +11,16 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY
 from project365_tag_enrichment import normalize_diarium_tag, run_tag_enrichment
 
 
-WORKING_COPY_RE = re.compile(r"(?:^|/)project365_(\d{4}-\d{2}-\d{2})\.[^.]+$", re.IGNORECASE)
+WORKING_COPY_RE = re.compile(
+    r"(?:^|/)(?:project365_(\d{4}-\d{2}-\d{2})\.[^.]+|"
+    r"Project365 Working Copy - (\d{4}-\d{2}-\d{2}) - "
+    r"(?:sq\d+|associated sq\d+ - [0-9a-f]{12})\.(?:jpe?g|heic))$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,9 @@ class DigiKamImportSummary:
     applied_count: int
     skipped_count: int
     error_count: int
+    media_people_count: int = 0
+    unmatched_sidecar_count: int = 0
+    removed_suggestion_count: int = 0
 
 
 def main() -> int:
@@ -58,6 +67,9 @@ def main() -> int:
     print(f"Applied suggestions: {summary.applied_count}")
     print(f"Skipped suggestions: {summary.skipped_count}")
     print(f"Errors: {summary.error_count}")
+    print(f"Photo person links: {summary.media_people_count}")
+    print(f"Unmatched sidecars: {summary.unmatched_sidecar_count}")
+    print(f"Removed stale suggestions: {summary.removed_suggestion_count}")
     return 0
 
 
@@ -79,14 +91,59 @@ def import_digikam_people(
     if suggestions_csv is not None and not suggestions_csv.exists():
         raise FileNotFoundError(f"Missing suggestions CSV: {suggestions_csv}")
 
+    connection = sqlite3.connect(db_path)
+    try:
+        media_by_path = {
+            str(Path(path).resolve()): asset_id
+            for asset_id, path in connection.execute(
+                """
+                SELECT id, storage_path FROM media_assets
+                WHERE role IN ('diarium_derivative', 'diarium_associated_derivative')
+                    AND status = 'available' AND storage_path IS NOT NULL
+                """
+            )
+        }
+    finally:
+        connection.close()
+    resolved_roots = [root.resolve() for root in xmp_roots]
+    working_copy_root = canonical_root / "media" / "diarium_derivatives" / DEFAULT_DERIVATIVE_POLICY
+    full_working_copy_scan = working_copy_root.resolve() in resolved_roots
+    scoped_media_ids = {
+        asset_id
+        for path, asset_id in media_by_path.items()
+        if any(Path(path).is_relative_to(root) for root in resolved_roots)
+    }
     suggestions: list[dict[str, str]] = []
+    media_people: dict[str, set[str]] = {}
+    parse_errors: list[dict[str, str]] = []
+    malformed_media_ids: set[str] = set()
+    unmatched_sidecar_count = 0
     scanned_count = 0
     for root in xmp_roots:
         for path in sorted(root.rglob("*.xmp")):
             scanned_count += 1
             media_path = _media_path_from_sidecar(path)
-            for name in _extract_people_from_xmp(path):
-                suggestions.append({"media_path": str(media_path), "person_name": name, "source": "digikam_xmp"})
+            try:
+                names = _extract_people_from_xmp(path)
+            except ET.ParseError:
+                media_asset_id = media_by_path.get(str(media_path.resolve()))
+                if media_asset_id is not None:
+                    malformed_media_ids.add(media_asset_id)
+                parse_errors.append({
+                    "media_path": str(media_path), "entry_id": "", "person_name": "",
+                    "status": "error", "reason": "malformed_xmp", "source": "digikam_xmp",
+                })
+                continue
+            media_asset_id = media_by_path.get(str(media_path.resolve())) if media_path.is_file() else None
+            if media_asset_id is not None:
+                media_people.setdefault(media_asset_id, set()).update(names)
+            elif names:
+                unmatched_sidecar_count += 1
+            for name in names:
+                suggestions.append({
+                    "media_path": str(media_path), "person_name": name,
+                    "source": "digikam_xmp", "media_asset_id": media_asset_id or "",
+                })
     if suggestions_csv is not None:
         with suggestions_csv.open(encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
@@ -95,12 +152,44 @@ def import_digikam_people(
                 person_name = _first_value(row, ["person_name", "person", "name", "tag"])
                 suggestions.append({"media_path": media_path, "person_name": person_name, "source": "digikam_csv"})
 
-    report_rows = []
+    report_rows = list(parse_errors)
     applied_count = 0
     skipped_count = 0
-    error_count = 0
+    error_count = len(parse_errors)
+    removed_suggestion_count = 0
     with sqlite3.connect(db_path) as connection:
         connection.row_factory = sqlite3.Row
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_people (
+                media_asset_id TEXT NOT NULL,
+                canonical_name TEXT NOT NULL,
+                diarium_tag TEXT NOT NULL,
+                source TEXT NOT NULL,
+                PRIMARY KEY (media_asset_id, canonical_name),
+                FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
+            )
+            """
+        )
+        connection.execute(
+            "UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'"
+        )
+        for media_asset_id in sorted(scoped_media_ids - malformed_media_ids):
+            connection.execute(
+                "DELETE FROM media_people WHERE media_asset_id = ? AND source = 'digikam_xmp'",
+                (media_asset_id,),
+            )
+        for media_asset_id, names in media_people.items():
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO media_people (media_asset_id, canonical_name, diarium_tag, source)
+                VALUES (?, ?, ?, 'digikam_xmp')
+                """,
+                (
+                    (media_asset_id, name, normalize_diarium_tag("person", name))
+                    for name in sorted(names)
+                ),
+            )
         known_entries = _known_entry_ids(connection)
         seen_suggestions: set[tuple[str, str]] = set()
         for suggestion in suggestions:
@@ -115,6 +204,9 @@ def import_digikam_people(
             elif entry_id is None or entry_id not in known_entries:
                 reason = "unknown_working_copy"
                 error_count += 1
+            elif full_working_copy_scan and suggestion["source"] == "digikam_xmp" and not suggestion.get("media_asset_id"):
+                reason = "sidecar_not_current_working_copy"
+                skipped_count += 1
             elif (entry_id, person_name) in seen_suggestions:
                 reason = "duplicate_suggestion"
                 skipped_count += 1
@@ -141,6 +233,22 @@ def import_digikam_people(
                     "source": suggestion["source"],
                 }
             )
+        if full_working_copy_scan:
+            before_cleanup = connection.total_changes
+            connection.execute(
+                """
+                DELETE FROM people
+                WHERE source = 'digikam_xmp' AND review_status = 'suggested'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM media_people
+                        JOIN media_assets ON media_assets.id = media_people.media_asset_id
+                        WHERE media_assets.entry_id = people.entry_id
+                            AND media_people.canonical_name = people.canonical_name
+                            AND media_people.source = 'digikam_xmp'
+                    )
+                """
+            )
+            removed_suggestion_count = connection.total_changes - before_cleanup
         connection.commit()
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +262,9 @@ def import_digikam_people(
         applied_count=applied_count,
         skipped_count=skipped_count,
         error_count=error_count,
+        media_people_count=sum(len(names) for names in media_people.values()),
+        unmatched_sidecar_count=unmatched_sidecar_count,
+        removed_suggestion_count=removed_suggestion_count,
     )
 
 
@@ -198,10 +309,7 @@ def _upsert_suggested_person(
 
 
 def _extract_people_from_xmp(path: Path) -> list[str]:
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError:
-        return []
+    root = ET.parse(path).getroot()
     people: list[str] = []
     for element in root.iter():
         for key, value in element.attrib.items():
@@ -247,7 +355,7 @@ def _entry_id_from_media_path(media_path: str) -> str | None:
     match = WORKING_COPY_RE.search(media_path.replace("\\", "/"))
     if not match:
         return None
-    return f"project365:{match.group(1)}"
+    return f"project365:{match.group(1) or match.group(2)}"
 
 
 def _known_entry_ids(connection: sqlite3.Connection) -> set[str]:

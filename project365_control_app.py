@@ -38,11 +38,13 @@ import project365_broad_visual_match as broad_visual_match
 import project365_diary_enrichment as diary_enrichment
 import project365_diary_intake as diary_intake
 import project365_media_dedupe_review as media_dedupe
+import project365_import_sources as import_sources
 from project365_paths import ORIGINAL_PHOTOS_ROOT, PROJECT365_PRO_EXPORT_ZIPS_DIR
 
 
 CANONICAL_ROOT = Path("Project365Canonical")
 SOURCE_DATA_ROOT = Path("Source Data")
+IMPORT_SOURCE_SETTINGS = CANONICAL_ROOT / "runtime" / "import_sources.json"
 REPORT_DIR = Path("Reports")
 VERIFY_REPORT_DIR = CANONICAL_ROOT / "exports" / "verification_reports"
 ORIGINAL_QUEUE = VERIFY_REPORT_DIR / "original_photo_external_search_queue.csv"
@@ -54,6 +56,8 @@ BROAD_VISUAL_DB = CANONICAL_ROOT / "broad_visual_match.sqlite"
 TAG_QUEUE = VERIFY_REPORT_DIR / "tag_review_queue.csv"
 DIGIKAM_PEOPLE_REPORT = VERIFY_REPORT_DIR / "digikam_people_import_report.csv"
 DIARIUM_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "diarium_import_batches"
+DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "dayone_import_batches"
+FACEBOOK_DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "facebook_dayone_batches"
 DIARIUM_DB_PATH = (
     Path.home() / "Library" / "Containers" / "mac.partl.Diarium" / "Data" / "data.db"
 )
@@ -63,6 +67,7 @@ RUN_HISTORY_LIMIT = 50
 ARCHIVE_RESULT_LIMIT = 25
 BROAD_REVIEW_ENTRY_LIMIT = 1
 _BROAD_MONTHLY_COVERAGE_CACHE: dict[str, Any] = {"key": None, "rows": []}
+_FACEBOOK_PACKAGE_CACHE: dict[str, Any] = {"key": None, "record": None}
 
 
 @dataclass(frozen=True)
@@ -99,6 +104,7 @@ class ControlState:
         active_jobs = self._active_jobs(include_crop_estimates=True)
         active_owners = {_owner_step(str(job.get("step", ""))) for job in active_jobs}
         diarium_package = _diarium_package_status(DIARIUM_IMPORT_BATCH_DIR)
+        dayone_package = _diarium_package_status(DAYONE_IMPORT_BATCH_DIR)
         diarium_local = _diarium_local_status(DIARIUM_DB_PATH)
         photo_library_index = (
             _busy_photo_library_index_status(PHOTO_LIBRARY_INDEX)
@@ -127,6 +133,8 @@ class ControlState:
             "original_search_attempts": _search_attempt_status(ORIGINAL_SEARCH_ATTEMPTS),
             "broad_visual_match": _broad_visual_status(),
             "diarium_package": diarium_package,
+            "dayone_package": dayone_package,
+            "dayone_privacy": _dayone_privacy_readiness(CANONICAL_ROOT / "canonical.db"),
             "diarium_local": diarium_local,
             "diarium_import_verification": _diarium_import_verification(
                 diarium_package,
@@ -134,6 +142,7 @@ class ControlState:
             ),
             "history": self.history[-20:],
             "active_jobs": active_jobs,
+            "import_sources": import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS),
         }
         _attach_visual_job_progress(status)
         status["top_metrics"] = _top_metrics(
@@ -164,6 +173,7 @@ class ControlState:
                 include_photo_index=include_photo_index_metric
             ),
             "active_jobs": active_jobs,
+            "import_sources": import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS),
         }
         if "workflow_overview" in requested:
             status["photo_library_index"] = _photo_library_index_latest_run_status(PHOTO_LIBRARY_INDEX)
@@ -174,6 +184,7 @@ class ControlState:
             status["broad_visual_match"] = _broad_visual_overview_status()
             status["crop_confirmation"] = self.crop_confirmation_status()
             status["diarium_package"] = _diarium_package_status(DIARIUM_IMPORT_BATCH_DIR)
+            status["dayone_package"] = _diarium_package_status(DAYONE_IMPORT_BATCH_DIR)
         paths: dict[str, Any] = {}
         if "import_zips" in requested:
             paths["project365_zips"] = _path_status(PROJECT365_PRO_EXPORT_ZIPS_DIR)
@@ -219,6 +230,10 @@ class ControlState:
                 diarium_package,
                 diarium_local,
             )
+        if "generate_dayone_package" in requested:
+            status["dayone_package"] = _diarium_package_status(DAYONE_IMPORT_BATCH_DIR)
+            status["dayone_privacy"] = _dayone_privacy_readiness(CANONICAL_ROOT / "canonical.db")
+            status["database"] = _database_status(CANONICAL_ROOT / "canonical.db")
         if paths:
             status["paths"] = paths
         status["workflow_history"] = _current_workflow_history(self.history, status, requested)
@@ -640,6 +655,7 @@ def _step_timeout_seconds(step: str) -> int:
         "rough_prefilter_build",
         "rough_visual_match",
         "generate_derivatives",
+        "import_facebook_dayone",
     }:
         return 12 * 60 * 60
     return 60 * 60
@@ -1088,10 +1104,10 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
             ]
         ]
     if step == "import_digikam_people":
-        xmp_roots = _payload_list(payload, "xmp_roots")
+        xmp_roots = _payload_list(payload, "xmp_roots") or [
+            str(CANONICAL_ROOT / "media" / "diarium_derivatives" / DERIVATIVE_POLICY)
+        ]
         suggestions_csv = str(payload.get("suggestions_csv", "")).strip()
-        if not xmp_roots and not suggestions_csv:
-            raise ValueError("Choose a digiKam XMP folder or suggestions CSV.")
         command = [
             python,
             "project365_digikam_people_importer.py",
@@ -1157,6 +1173,56 @@ def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
                 DERIVATIVE_POLICY,
             ]
         ]
+    if step == "generate_dayone_package":
+        date_range = _entry_date_range(CANONICAL_ROOT / "canonical.db")
+        start_date = str(payload.get("start_date") or date_range[0] or "1900-01-01")
+        end_date = str(payload.get("end_date") or date_range[1] or "2999-12-31")
+        return [[
+            python, "project365_diarium_exporter.py",
+            "--canonical-root", str(CANONICAL_ROOT),
+            "--output-dir", str(DAYONE_IMPORT_BATCH_DIR),
+            "--package-name", f"project365_{start_date}_{end_date}_two_journals.zip",
+            "--start-date", start_date,
+            "--end-date", end_date,
+            "--limit", str(payload.get("limit") or 100000),
+            "--derivative-policy", DERIVATIVE_POLICY,
+            "--target", "dayone",
+        ]]
+    if step == "import_facebook_dayone":
+        source = str(payload.get("source", "")).strip()
+        if not source:
+            source_path, auto_additional = import_sources.resolve_facebook(
+                SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["facebook"]
+            )
+            source = str(source_path)
+        else:
+            auto_additional = None
+        output_dir = str(payload.get("output_dir") or FACEBOOK_DAYONE_IMPORT_BATCH_DIR)
+        command = [
+            python,
+            "facebook_dayone_importer.py",
+            "--source",
+            source,
+            "--output-dir",
+            output_dir,
+        ]
+        additional = str(payload.get("additional_exports", "")).strip() or str(auto_additional or "")
+        if additional:
+            command.extend(["--additional-exports", additional])
+        return [command]
+    if step == "stage_x_archive":
+        source = str(payload.get("source", "")).strip()
+        if not source:
+            source = str(import_sources.resolve_x(
+                SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["x_twitter"]
+            ))
+        return [[
+            python, "project365_social_adapter_config.py",
+            "--config", "config/social_adapters/x_archive_posts_v1.json",
+            "--source-root", source,
+            "--staging-out", str(CANONICAL_ROOT / "staging" / "social" / "x_archive_posts.jsonl"),
+            "--report-dir", str(REPORT_DIR / "social_adapters"),
+        ]]
     raise ValueError(f"Unsupported step: {step}")
 
 
@@ -1519,6 +1585,8 @@ def _workflow_snapshot(step: str = "", include_details: bool = True) -> dict[str
         snapshot["digikam_people"] = _csv_status_snapshot(DIGIKAM_PEOPLE_REPORT, "status")
     if include_details and step in {"generate_diarium_package", ""}:
         snapshot["diarium_package"] = _diarium_package_status(DIARIUM_IMPORT_BATCH_DIR)
+    if include_details and step in {"generate_dayone_package", ""}:
+        snapshot["dayone_package"] = _diarium_package_status(DAYONE_IMPORT_BATCH_DIR)
     return snapshot
 
 
@@ -1664,6 +1732,31 @@ def _workflow_run_summary(
 
 
 def _summary_warnings(step: str, outputs: list[dict[str, Any]]) -> list[str]:
+    if step == "import_facebook_dayone":
+        parsed = _parse_key_value_output(outputs)
+        warnings = []
+        external = _to_int(parsed.get("external_media_links"))
+        unindexed = _to_int(parsed.get("unindexed_media_files"))
+        estimated = _to_int(parsed.get("estimated_date_entries"))
+        encoding = _to_int(parsed.get("text_encoding_review_entries"))
+        if external:
+            warnings.append(f"{external} external-only media links could not be attached; see the manifest.")
+        variants = _to_int(parsed.get("supplemental_media_variants"))
+        if variants:
+            warnings.append(f"{variants} same-path media files differ in size across exports; the JSON-source versions were retained. See the manifest.")
+        if unindexed:
+            warnings.append(f"{unindexed} media files had no matching JSON record and used file modification dates; see the manifest.")
+        if estimated:
+            warnings.append(f"{estimated} entries used inferred or fallback dates; see each manifest date_source.")
+        if encoding:
+            warnings.append(f"{encoding} entries may contain Facebook text-encoding artifacts; original text was preserved for review.")
+        missing_shared = _to_int(parsed.get("shared_content_without_original_url"))
+        if missing_shared:
+            warnings.append(f"{missing_shared} shared items had no original link or media in the export; source-post links were included when available.")
+        ambiguous_links = _to_int(parsed.get("ambiguous_html_post_links"))
+        if ambiguous_links:
+            warnings.append(f"{ambiguous_links} ambiguous post timestamps prevented confident matching of some Facebook links.")
+        return warnings
     if step != "broad_visual_match":
         return []
     parsed = _parse_key_value_output(outputs)
@@ -1685,7 +1778,7 @@ def _summary_metrics(
     batch_after = after.get("batch_plan", {})
     tag_after = after.get("tag_queue", {})
     digikam_after = after.get("digikam_people", {})
-    package_after = after.get("diarium_package", {})
+    package_after = after.get("dayone_package" if step == "generate_dayone_package" else "diarium_package", {})
     broad_after = after.get("broad_visual_match", {})
     common = {
         "entries": _delta_metric("Diary entries", db_before.get("entries"), db_after.get("entries")),
@@ -1701,6 +1794,23 @@ def _summary_metrics(
             common["source_links"],
             common["media_records"],
         ]
+    if step == "import_facebook_dayone":
+        return [
+            {"label": "Day One ZIP", "value": parsed.get("package_path", "not created")},
+            {"label": "Integrity manifest", "value": parsed.get("manifest_path", "not created")},
+            {"label": "Entries", "value": parsed.get("entry_count", "0")},
+            {"label": "Attachments", "value": parsed.get("attachment_count", "0")},
+            {"label": "Album entries", "value": parsed.get("album_entries", "0")},
+            {"label": "Unlinked comments", "value": parsed.get("unlinked_comments", "0")},
+            {"label": "Recovered video links", "value": parsed.get("recovered_external_media_links", "0")},
+            {"label": "Entries with location", "value": parsed.get("entries_with_location", "0")},
+            {"label": "Facebook post links", "value": parsed.get("facebook_post_links", "0")},
+            {"label": "Latest post", "value": parsed.get("latest_post_date", "unknown")},
+            {"label": "Shared originals unavailable", "value": parsed.get("shared_content_without_original_url", "0")},
+            {"label": "Ambiguous post links", "value": parsed.get("ambiguous_html_post_links", "0")},
+        ]
+    if step == "stage_x_archive":
+        return [{"label": "Staged events", "value": parsed.get("Staged events", "0")}]
     if step in {"build_photo_index", "refresh_photo_index_metadata"}:
         return [
             _delta_metric("Indexed photos", before.get("photo_index", {}).get("file_count"), index_after.get("file_count")),
@@ -1806,11 +1916,14 @@ def _summary_metrics(
                 [
                     {"label": "Suggested people", "value": parsed.get("Suggested people", "0")},
                     {"label": "Applied suggestions", "value": parsed.get("Applied suggestions", "0")},
+                    {"label": "Photo person links", "value": parsed.get("Photo person links", "0")},
+                    {"label": "Unmatched sidecars", "value": parsed.get("Unmatched sidecars", "0")},
+                    {"label": "Removed stale suggestions", "value": parsed.get("Removed stale suggestions", "0")},
                     {"label": "Import report rows", "value": str(digikam_after.get("rows", 0))},
                 ]
             )
         return metrics
-    if step == "generate_diarium_package":
+    if step in {"generate_diarium_package", "generate_dayone_package"}:
         return [
             {"label": "Package entries", "value": str(package_after.get("journal_entries", parsed.get("Entries", "0")))},
             {"label": "Package photos", "value": str(package_after.get("photo_files", parsed.get("Media assets", "0")))},
@@ -1923,12 +2036,15 @@ def _summary_scope(step: str, payload: dict[str, Any]) -> list[str]:
         roots = payload.get("xmp_roots") or []
         csv_path = str(payload.get("suggestions_csv") or "").strip()
         parts = []
-        if roots:
-            parts.append(f"XMP folders: {'; '.join(str(root) for root in roots)}")
+        if not roots:
+            roots = [str(CANONICAL_ROOT / "media" / "diarium_derivatives" / DERIVATIVE_POLICY)]
+        parts.append(f"XMP folders: {'; '.join(str(root) for root in roots)}")
         if csv_path:
             parts.append(f"CSV: {csv_path}")
-        return parts or ["No input scope"]
-    if step == "generate_diarium_package":
+        return parts
+    if step == "import_facebook_dayone":
+        return [f"Facebook source: {payload.get('source') or 'not selected'}"]
+    if step in {"generate_diarium_package", "generate_dayone_package"}:
         return [
             f"Date range: {payload.get('start_date') or 'auto'} to {payload.get('end_date') or 'auto'}",
             f"Limit: {payload.get('limit') or 100000}",
@@ -2125,6 +2241,8 @@ def _step_title(step: str) -> str:
         "face_tagging": "Build tag queue",
         "import_digikam_people": "Import digiKam suggestions",
         "generate_diarium_package": "Diarium import package",
+        "generate_dayone_package": "Day One private/public package",
+        "import_facebook_dayone": "Facebook Day One package",
     }
     return titles.get(step, step.replace("_", " "))
 
@@ -2359,15 +2477,47 @@ def _current_workflow_history(
             )
         )
 
-    if wants("import_zips"):
+    dayone_package = status.get("dayone_package", {})
+    if isinstance(dayone_package, dict) and dayone_package.get("path"):
+        prepend(_workflow_record(
+            "generate_dayone_package",
+            started_at=_path_mtime_iso(Path(str(dayone_package["path"]))),
+            metrics=[
+                {"label": "Journal entries", "value": dayone_package.get("journal_entries", 0)},
+                {"label": "Photo files", "value": dayone_package.get("photo_files", 0)},
+            ],
+            scope=[str(dayone_package.get("filename") or dayone_package["path"])],
+        ))
+
+    if wants("import_zips") or wants("import_hub"):
         prepend(_latest_import_zip_workflow_record())
+    if wants("import_facebook_dayone"):
+        latest_facebook = _latest_facebook_package_workflow_record()
+        if latest_facebook:
+            latest_path = latest_facebook["summary"]["metrics"][0]["value"]
+            recorded_paths = {
+                metric.get("value")
+                for record in grouped.get("import_facebook_dayone", [])
+                for metric in (record.get("summary") or {}).get("metrics", [])
+                if metric.get("label") == "Day One ZIP"
+            }
+            if latest_path not in recorded_paths:
+                prepend(latest_facebook)
     if wants("face_tagging") and (TAG_QUEUE.exists() or DIGIKAM_PEOPLE_REPORT.exists()):
-        prepend(
-            _workflow_record(
-                "face_tagging",
-                started_at=max((_path_mtime_iso(path) for path in (TAG_QUEUE, DIGIKAM_PEOPLE_REPORT) if path.exists()), default=""),
-            )
+        persisted_at = max(
+            (_path_mtime_iso(path) for path in (TAG_QUEUE, DIGIKAM_PEOPLE_REPORT) if path.exists()),
+            default="",
         )
+        recorded_at = max(
+            (
+                str(record.get("finished_at") or record.get("started_at") or "")
+                for step in ("face_tagging", "import_digikam_people")
+                for record in grouped.get(step, [])
+            ),
+            default="",
+        )
+        if persisted_at > recorded_at:
+            prepend(_workflow_record("face_tagging", started_at=persisted_at))
     return grouped
 
 
@@ -2421,6 +2571,39 @@ def _latest_import_zip_workflow_record() -> dict[str, Any] | None:
         ],
         scope=[str(row[6] or "")] if row[6] else [],
     )
+
+
+def _latest_facebook_package_workflow_record() -> dict[str, Any] | None:
+    manifests = sorted(FACEBOOK_DAYONE_IMPORT_BATCH_DIR.glob("facebook_dayone_*_manifest.json"))
+    if not manifests:
+        return None
+    path = manifests[-1]
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+        package = path.with_name(path.name.removesuffix("_manifest.json") + ".zip")
+        if not package.is_file():
+            return None
+        if _FACEBOOK_PACKAGE_CACHE["key"] == key:
+            return _FACEBOOK_PACKAGE_CACHE["record"]
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        metrics = [
+            {"label": "Day One ZIP", "value": str(package)},
+            {"label": "Integrity manifest", "value": str(path)},
+            {"label": "Entries", "value": str(summary.get("entry_count", 0))},
+            {"label": "Attachments", "value": str(summary.get("attachment_count", 0))},
+            {"label": "Album entries", "value": str(summary.get("album_entries", 0))},
+            {"label": "Unlinked comments", "value": str(summary.get("unlinked_comments", 0))},
+            {"label": "Entries with location", "value": str(summary.get("entries_with_location", 0))},
+            {"label": "Facebook post links", "value": str(summary.get("facebook_post_links", 0))},
+            {"label": "Latest post", "value": str(summary.get("latest_post_date", "unknown"))},
+            {"label": "Shared originals unavailable", "value": str(summary.get("shared_content_without_original_url", 0))},
+            {"label": "Ambiguous post links", "value": str(summary.get("ambiguous_html_post_links", 0))},
+        ]
+        record = _workflow_record("import_facebook_dayone", started_at=_path_mtime_iso(path), metrics=metrics)
+        _FACEBOOK_PACKAGE_CACHE.update(key=key, record=record)
+        return record
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _database_status(db_path: Path) -> dict[str, Any]:
@@ -3088,6 +3271,26 @@ def _search_attempt_summary(row: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _dayone_privacy_readiness(db_path: Path) -> dict[str, int]:
+    if not db_path.exists():
+        return {"working_copies": 0, "missing_sidecars": 0}
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            """SELECT storage_path FROM media_assets
+               WHERE role IN ('diarium_derivative', 'diarium_associated_derivative')
+                 AND status = 'available' AND id LIKE ?""",
+            (f"%:{DERIVATIVE_POLICY}",),
+        ).fetchall()
+    paths = [Path(str(row[0])) for row in rows]
+    return {
+        "working_copies": len(paths),
+        "missing_sidecars": sum(
+            not path.is_file() or not path.with_name(path.name + ".xmp").is_file()
+            for path in paths
+        ),
+    }
+
+
 def _diarium_package_status(package_dir: Path) -> dict[str, Any]:
     if not package_dir.exists():
         return {"exists": False}
@@ -3102,15 +3305,18 @@ def _diarium_package_status(package_dir: Path) -> dict[str, Any]:
         name_set = set(names)
         photo_files = [name for name in names if name.startswith("photos/") and not name.endswith("/")]
         journal_entries = 0
+        journal_entry_counts: dict[str, int] = {}
         journal_photo_refs = 0
         missing_photo_refs = 0
         missing_photo_markers = 0
         zero_dimension_photo_refs = 0
         photo_hashes = []
-        if "Journal.json" in names:
-            journal = json.loads(archive.read("Journal.json").decode("utf-8"))
+        journal_names = [name for name in names if name.endswith(".json") and "/" not in name]
+        for journal_name in journal_names:
+            journal = json.loads(archive.read(journal_name).decode("utf-8"))
             entries = journal.get("entries", []) if isinstance(journal, dict) else []
-            journal_entries = len(entries)
+            journal_entries += len(entries)
+            journal_entry_counts[journal_name] = len(entries)
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -3157,7 +3363,7 @@ def _diarium_package_status(package_dir: Path) -> dict[str, Any]:
             )
     photo_ready = (
         journal_photo_refs > 0
-        and len(photo_files) >= journal_photo_refs
+        and len(photo_files) >= len(set(photo_hashes))
         and manifest_photo_rows == journal_photo_refs
         and missing_photo_refs == 0
         and missing_photo_markers == 0
@@ -3170,6 +3376,8 @@ def _diarium_package_status(package_dir: Path) -> dict[str, Any]:
         "path": str(package_path),
         "filename": package_path.name,
         "journal_entries": journal_entries,
+        "journal_names": journal_names,
+        "journal_entry_counts": journal_entry_counts,
         "photo_files": len(photo_files),
         "journal_photo_refs": journal_photo_refs,
         "missing_photo_refs": missing_photo_refs,
@@ -3848,6 +4056,8 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                             ),
                         )
                     )
+                elif parsed.path == "/api/import-sources":
+                    self._send_json(import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS))
                 elif parsed.path == "/api/working-copy-readiness":
                     query = urllib.parse.parse_qs(parsed.query)
                     self._send_json(
@@ -3998,6 +4208,9 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                             )
                         }
                     )
+                elif parsed.path.startswith(("/picker/api/private/", "/crop/api/private/")):
+                    entry_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+                    self._send_json(state.picker_state().private_status(entry_id))
                 elif parsed.path.startswith("/picker/api/entry/"):
                     query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/picker/api/entry/"))
@@ -4026,18 +4239,37 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 elif parsed.path == "/crop/api/crop-entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     crop_filter = query.get("crop_filter", ["missing"])[0]
-                    entries = state.picker_state().crop_entries(
+                    all_entries = state.picker_state().crop_entries(
                         crop_filter=crop_filter,
                         entry_dates=set(original_picker._query_values(query, "entry_date")),
                         start_date=query.get("start_date", [""])[0],
                         end_date=query.get("end_date", [""])[0],
                     )
+                    estimate_batches = original_picker._crop_estimate_batch_options(all_entries)
+                    estimate_batch_id = query.get("estimate_batch_id", [""])[0].strip()
+                    entries = [
+                        entry for entry in all_entries
+                        if not estimate_batch_id or entry.get("estimate_batch_id") == estimate_batch_id
+                    ]
+                    month_count = original_picker._query_int(query, "month_count", 0) or 0
+                    window = original_picker._crop_month_window(
+                        entries,
+                        anchor_month=query.get("anchor_month", [""])[0],
+                        month_count=month_count,
+                    ) if month_count > 0 else {
+                        "entries": entries, "months": [], "previous_month": "", "next_month": "",
+                    }
                     limit = original_picker._query_int(query, "limit", None)
-                    limited_entries = entries[:limit] if limit and limit > 0 else entries
+                    limited_entries = window["entries"][:limit] if limit and limit > 0 else window["entries"]
                     self._send_json(
                         {
                             "entries": limited_entries,
                             "total_count": len(entries),
+                            "window_count": len(window["entries"]),
+                            "window_months": window["months"],
+                            "previous_month": window["previous_month"],
+                            "next_month": window["next_month"],
+                            "estimate_batches": estimate_batches,
                             "pending_crop_commits": state.picker_state().pending_crop_commits(),
                             "crop_estimate_batch": _compact_crop_estimate_job(
                                 state.picker_state().latest_crop_estimate_job() or {}
@@ -4052,8 +4284,12 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     else:
                         self._send_json(detail)
                 elif parsed.path.startswith("/crop/api/crop-entry/"):
+                    query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/crop-entry/"))
-                    detail = state.picker_state().crop_entry_detail(entry_id, mark_estimated_viewed=False)
+                    detail = state.picker_state().crop_entry_detail(
+                        entry_id, mark_estimated_viewed=False,
+                        candidate_path=query.get("candidate_path", [""])[0],
+                    )
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
@@ -4095,7 +4331,23 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/run":
                     payload = self._read_json()
-                    self._send_json(state.start_step(str(payload.get("step", "")), payload))
+                    step = str(payload.get("step", ""))
+                    source_key = {
+                        "import_zips": "project365",
+                        "import_facebook_dayone": "facebook",
+                        "stage_x_archive": "x_twitter",
+                    }.get(step)
+                    if source_key and source_key not in import_sources.status(
+                        SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS
+                    )["enabled"]:
+                        raise ValueError(f"Enable {import_sources.SOURCE_LABELS[source_key]} in Step 12 first.")
+                    self._send_json(state.start_step(step, payload))
+                    return
+                if parsed.path == "/api/import-sources":
+                    payload = self._read_json()
+                    self._send_json(import_sources.configure(
+                        SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS, payload.get("enabled")
+                    ))
                     return
                 if parsed.path == "/api/photo-index-folder-from-file":
                     payload = self._read_json()
@@ -4209,6 +4461,13 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         associated_date_source=str(payload.get("associated_date_source", "manual")),
                     )
                     self._send_json(detail)
+                    return
+                if parsed.path in {"/picker/api/private", "/crop/api/private"}:
+                    payload = self._read_json()
+                    self._send_json(state.picker_state().set_private(
+                        entry_id=str(payload.get("entry_id", "")),
+                        private=payload.get("private"),
+                    ))
                     return
                 if parsed.path == "/picker/api/associated-date-choices":
                     payload = self._read_json()
@@ -4733,10 +4992,10 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
 
 
 WORKFLOW_STEPS = (
-    "import_zips",
     "build_photo_index",
     "match_easy_originals",
     "media_dedupe_review",
+    "video_memory_review",
     "broad_visual_match",
     "rough_visual_match",
     "crop_confirmation",
@@ -4745,9 +5004,14 @@ WORKFLOW_STEPS = (
     "diary_intake",
     "diary_enrichment",
     "generate_diarium_package",
+    "generate_dayone_package",
+    "import_hub",
 )
 
 STEP_OWNER = {
+    "import_zips": "import_hub",
+    "import_facebook_dayone": "import_hub",
+    "stage_x_archive": "import_hub",
     "refresh_photo_index_metadata": "build_photo_index",
     "search_originals": "match_easy_originals",
     "apply_original_decisions": "match_easy_originals",
@@ -6008,6 +6272,21 @@ a.button {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
 }
+.import-hub-heading, .import-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.import-hub-heading p { margin: 0; }
+.import-source-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.import-source-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; display: grid; align-content: start; gap: 8px; }
+.import-source-card.is-disabled { background: #f7f8f6; color: var(--muted); }
+.import-source-card h3 { margin: 0; font-size: 15px; }
+.import-source-card p { margin: 0; font-size: 13px; color: var(--muted); }
+.import-source-card code, .import-source-card .import-result, .import-advanced { overflow-wrap: anywhere; }
+.import-source-card .button { justify-self: start; }
+.import-result { font-size: 13px; line-height: 1.4; }
+.import-setup { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #f7faf8; }
+.import-setup p { margin: 0 0 10px; font-size: 13px; }
+.import-setup-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 10px; }
+.import-advanced { font-size: 13px; }
+.import-advanced .field { margin-top: 10px; }
 input {
   width: 100%;
   height: 34px;
@@ -6354,7 +6633,7 @@ a { color: var(--accent); }
   <div class="header">
     <div>
       <h1>Project365 Control</h1>
-      <div class="subtle">Local workflow runner for canonical import, original-photo review, tagging, derivatives, and Diarium packages.</div>
+        <div class="subtle">Local workflow runner for canonical import, original-photo review, tagging, derivatives, and Day One/Diarium packages.</div>
     </div>
     <button class="button" onclick="loadStatus()">Refresh</button>
   </div>
@@ -6369,23 +6648,6 @@ a { color: var(--accent); }
   <div id="statusLoadError" class="inline-status error" role="status" aria-live="polite" hidden></div>
 
   <section class="workflow" id="workflow">
-    <section class="panel workflow-step" data-step="import_zips">
-      <div class="workflow-step-header">
-        <div>
-          <div class="step-kicker">Step 1</div>
-          <h2>Import Project365 Pro zips</h2>
-        </div>
-        <div class="step-status-bar" data-step-status="import_zips">No runs yet</div>
-        <button class="button small step-toggle" data-step-toggle="import_zips" onclick="toggleWorkflowStep('import_zips')" aria-expanded="false">Open</button>
-      </div>
-      <div class="workflow-step-body">
-      <div class="subtle">Imports new, changed, and existing zips idempotently into the canonical database.</div>
-      <button class="button primary" onclick="runStep('import_zips')">Import zips</button>
-      <div class="step-result" data-step-result="import_zips"></div>
-      <div class="step-history" data-step-history="import_zips"></div>
-      </div>
-    </section>
-
     <section class="panel workflow-step" data-step="build_photo_index">
       <div class="workflow-step-header">
         <div>
@@ -6677,7 +6939,7 @@ a { color: var(--accent); }
         <button class="button small step-toggle" data-step-toggle="crop_confirmation" onclick="toggleWorkflowStep('crop_confirmation')" aria-expanded="false">Open</button>
       </div>
       <div class="workflow-step-body">
-      <div class="subtle">After an original has been selected, confirm the square crop on the identified original next to the Project365 target.</div>
+      <div class="subtle">Confirm square crops against the Project365 target where one exists. Linked photos use the local vision model; completed groups appear in Saved estimates while later groups run.</div>
       <div id="cropConfirmationOverview" class="result-grid"></div>
       <div class="button-row">
 	        <button id="estimateCropBatchButton" class="button" type="button" onclick="startCropEstimateBatch()">Batch estimate crop</button>
@@ -6702,7 +6964,8 @@ a { color: var(--accent); }
         <button class="button small step-toggle" data-step-toggle="generate_derivatives" onclick="toggleWorkflowStep('generate_derivatives')" aria-expanded="false">Open</button>
       </div>
       <div class="workflow-step-body">
-      <div class="subtle">Creates date-organized JPEG working copies from confirmed originals where available. Unchanged copies are skipped unless forced.</div>
+      <div class="subtle">Creates date-organized JPEG working copies from confirmed originals and linked photos where available. Unchanged copies are skipped unless forced.</div>
+      <div class="subtle"><strong>Metadata warning:</strong> Write digiKam metadata to <code>.xmp</code> sidecars. A source/crop update or forced export can replace metadata embedded in a JPEG; external edits alone do not trigger regeneration. Keep working-copy filenames and square dimensions unchanged when editing externally.</div>
       <div class="grid">
         <div class="field">
           <label>Start date</label>
@@ -6717,6 +6980,7 @@ a { color: var(--accent); }
           Force rewrite all matching working copies
         </label>
       </div>
+      <div class="subtle">Leave both dates blank to check the entire database; current copies are skipped unless forced.</div>
       <div id="workingCopyReadiness" class="result-grid"></div>
       <button class="button primary" onclick="runWorkingCopies()">Generate working copies</button>
       <div id="workingCopyMessage" class="inline-status" role="status" aria-live="polite"></div>
@@ -6735,20 +6999,12 @@ a { color: var(--accent); }
         <button class="button small step-toggle" data-step-toggle="face_tagging" onclick="toggleWorkflowStep('face_tagging')" aria-expanded="false">Open</button>
       </div>
       <div class="workflow-step-body">
-      <div class="subtle">Builds the metadata-safe people/tag review queue after the working copies exist. Scan the working-copy folder locally in digiKam, then import XMP sidecars or a suggestions CSV as reviewed suggestions.</div>
-      <button class="button primary" onclick="runStep('face_tagging')">Build tag queue</button>
+      <div class="subtle">Imports people from digiKam XMP sidecars beside the working copies, then rebuilds the people/tag review queue. Rerun after digiKam adds, changes, or removes names, before compiling a Diarium package. Imported names remain suggestions for review.</div>
       <div class="field">
-        <label>digiKam XMP folders, separated by semicolons</label>
-        <div class="folder-row">
-          <input id="digikamXmpRoots" placeholder="/path/to/working/copies/or/sidecars">
-          <button class="button" onclick="chooseFolderInFinder('digikamXmpRoots')">Choose folder</button>
-        </div>
-      </div>
-      <div class="field">
-        <label>digiKam suggestions CSV</label>
+        <label>Additional suggestions CSV (optional)</label>
         <input id="digikamSuggestionsCsv" placeholder="/path/to/digikam_people.csv">
       </div>
-      <button class="button" onclick="importDigiKamPeople()">Import digiKam suggestions</button>
+      <button class="button primary" onclick="importDigiKamPeople()">Import digiKam suggestions</button>
       <div id="digikamPeopleMessage" class="inline-status" role="status" aria-live="polite"></div>
       <div class="step-result" data-step-result="face_tagging"></div>
       <div class="step-history" data-step-history="face_tagging"></div>
@@ -6830,6 +7086,45 @@ a { color: var(--accent); }
       <div class="step-history" data-step-history="generate_diarium_package"></div>
       </div>
     </section>
+    <section class="panel workflow-step" data-step="generate_dayone_package">
+      <div class="workflow-step-header">
+        <div><div class="step-kicker">Step 11</div><h2>Day One journals: Project365 + Private</h2></div>
+        <div class="step-status-bar" data-step-status="generate_dayone_package">No runs yet</div>
+        <button class="button small step-toggle" data-step-toggle="generate_dayone_package" onclick="toggleWorkflowStep('generate_dayone_package')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+        <div class="subtle">Exports two journals in one ZIP. Any entry with a Private-tagged working copy goes wholly to Project365 Private. Missing sidecars stop export. After importing in Day One, enable Conceal Content and review the private journal's visibility and encryption settings manually. The ZIP itself is readable.</div>
+        <div id="dayOnePrivacyReadiness" class="inline-status" role="status"></div>
+        <div class="field"><label>Start date</label><input id="dayOneStartDate" placeholder="auto, YYYY-MM-DD, or YYYY-MM"></div>
+        <div class="field"><label>End date</label><input id="dayOneEndDate" placeholder="optional end"></div>
+        <div class="field"><label>Limit</label><input id="dayOneLimit" value="100000"></div>
+        <button class="button primary" onclick="runDayOnePackage()">Generate two-journal ZIP</button>
+        <div class="step-result" data-step-result="generate_dayone_package"></div>
+        <div class="step-history" data-step-history="generate_dayone_package"></div>
+      </div>
+    </section>
+    <section class="panel workflow-step" data-step="import_hub">
+      <div class="workflow-step-header">
+        <div><div class="step-kicker">Step 12</div><h2>Import your data</h2></div>
+        <div class="step-status-bar" data-step-status="import_hub">Choose sources</div>
+        <button class="button small step-toggle" data-step-toggle="import_hub" onclick="toggleWorkflowStep('import_hub')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+        <div class="import-hub-heading"><p class="subtle">Enable a source, drop its export into the folder shown, then run the available import.</p><button class="button small" type="button" onclick="showImportSetup()">Choose sources</button></div>
+        <div id="importSetup" class="import-setup" hidden>
+          <p>Select the import sources you want to use. This creates their drop folders under Source Data; it does not import anything.</p>
+          <div id="importSetupChoices" class="import-setup-choices"></div>
+          <div class="import-actions"><button class="button primary small" type="button" onclick="saveImportSetup()">Save sources</button><button class="button small" type="button" onclick="hideImportSetup()">Cancel</button></div>
+        </div>
+        <div id="importSourceCards" class="import-source-grid"></div>
+        <details class="import-advanced"><summary>Advanced: use another export folder</summary>
+          <div class="field"><label for="facebookDayOneSource">Facebook JSON export</label><div class="folder-row"><input id="facebookDayOneSource" placeholder="Default folder above" oninput="renderImportHub(lastStatus)"><button class="button small" type="button" onclick="chooseFolderInFinder('facebookDayOneSource', 'replace')">Paste path</button></div></div>
+          <div class="field"><label for="facebookDayOneAdditionalExports">Other Facebook exports (optional)</label><div class="folder-row"><input id="facebookDayOneAdditionalExports" placeholder="Auto-detected when using default"><button class="button small" type="button" onclick="chooseFolderInFinder('facebookDayOneAdditionalExports', 'replace')">Paste path</button></div></div>
+          <div class="field"><label for="xArchiveSource">Twitter / X archive</label><div class="folder-row"><input id="xArchiveSource" placeholder="Default folder above" oninput="renderImportHub(lastStatus)"><button class="button small" type="button" onclick="chooseFolderInFinder('xArchiveSource', 'replace')">Paste path</button></div></div>
+        </details>
+        <div id="importHubMessage" class="inline-status" role="status" aria-live="polite"></div>
+      </div>
+    </section>
   </section>
   <pre id="output" hidden>No runs yet.</pre>
 </main>
@@ -6843,8 +7138,12 @@ let progressStep = "";
 let activeJobId = "";
 let statusRefreshTimer = null;
 let startRequestController = null;
+let importSetupPrompted = false;
 const ACTIVE_STATUS_REFRESH_MS = 1500;
 const STEP_OWNER = {
+  import_zips: "import_hub",
+  import_facebook_dayone: "import_hub",
+  stage_x_archive: "import_hub",
   refresh_photo_index_metadata: "build_photo_index",
   search_originals: "match_easy_originals",
   apply_original_decisions: "match_easy_originals",
@@ -6884,6 +7183,7 @@ async function loadStatus(steps, options = {}) {
     lastStatus = payload;
     setStatusLoadError("");
     renderStatus(payload);
+    renderDayOnePrivacyReadiness(payload);
     renderWorkingCopyReadiness(payload);
     renderPhotoIndexBox(payload);
     renderEasyMatchBox(payload);
@@ -6898,6 +7198,16 @@ async function loadStatus(steps, options = {}) {
     setStatusLoadError(`Could not load current database status: ${error.message}`);
     throw error;
   }
+}
+
+function renderDayOnePrivacyReadiness(payload) {
+  const target = document.getElementById("dayOnePrivacyReadiness");
+  const privacy = payload.dayone_privacy;
+  if (!target || !privacy) return;
+  const missing = Number(privacy.missing_sidecars || 0);
+  target.textContent = missing
+    ? `${missing} of ${privacy.working_copies || 0} current working copies lack sidecars; a full privacy-split export will stop until resolved.`
+    : `All ${privacy.working_copies || 0} current working copies have sidecars.`;
 }
 
 function setStatusLoadError(message) {
@@ -6922,6 +7232,7 @@ function renderStatus(payload) {
   const latestAttempt = attempts.latest || {};
   const photoIndex = payload.photo_library_index || {};
   const packageStatus = payload.diarium_package || {};
+  const dayOnePackage = payload.dayone_package || {};
   const diariumLocal = payload.diarium_local || {};
   const diariumVerification = payload.diarium_import_verification || {};
   status.innerHTML = `
@@ -6948,6 +7259,7 @@ function renderStatus(payload) {
     <div class="status-item"><span>Package photo readiness</span><strong>${formatDiariumPackageReadiness(packageStatus)}</strong></div>
     <div class="status-item"><span>Package manifest</span><strong>${packageStatus.manifest_rows || 0} rows · ${packageStatus.manifest_photo_rows || 0} photo rows</strong></div>
     <div class="status-item"><span>Diarium local diary</span><strong>${formatDiariumLocal(diariumLocal)}</strong></div>
+    <div class="status-item"><span>Day One two-journal ZIP</span><strong>${dayOnePackage.path ? `${dayOnePackage.journal_entries || 0} entries · ${dayOnePackage.photo_files || 0} photos` : "not generated"}</strong></div>
     <div class="status-item"><span>Diarium import check</span><strong>${formatDiariumImportCheck(packageStatus, diariumLocal)}</strong></div>
     <div class="status-item"><span>Diarium photo import</span><strong class="${diariumVerification.photo_imported ? "ok" : "bad"}">${formatDiariumImportVerification(diariumVerification)}</strong></div>
     ${formatDiariumAttachmentNote(diariumVerification)}
@@ -6960,12 +7272,16 @@ function renderWorkingCopyReadiness(payload) {
   const db = payload.database || {};
   const ready = Number(db.working_copy_ready_count || 0);
   const sources = Number(db.working_copy_source_count || 0);
+  const primarySources = Number(db.working_copy_primary_source_count || 0);
+  const linkedSources = Number(db.working_copy_associated_source_count || 0);
   const notReady = Number(db.working_copy_not_ready_count || 0);
   const current = Number(db.working_copy_current_count || 0);
   const needsUpdate = Number(db.working_copy_needs_update_count || 0);
   target.innerHTML = `
     <div class="result-metric"><span>Ready for export</span><strong>${ready}</strong></div>
-    <div class="result-metric"><span>Primary targets</span><strong>${sources}</strong></div>
+    <div class="result-metric"><span>All targets</span><strong>${sources}</strong></div>
+    <div class="result-metric"><span>Main targets</span><strong>${primarySources}</strong></div>
+    <div class="result-metric"><span>Linked targets</span><strong>${linkedSources}</strong></div>
     <div class="result-metric"><span>Already current</span><strong>${current}</strong></div>
     <div class="result-metric"><span>Need update</span><strong>${needsUpdate}</strong></div>
     <div class="result-metric"><span>Not ready</span><strong>${notReady}</strong></div>
@@ -7056,6 +7372,122 @@ function renderWorkflowSummaries(payload) {
     const records = workflowRecordsFor(owner, history);
     renderWorkflowCard(card, owner, active, records);
   }
+  renderImportHub(payload);
+}
+
+const IMPORT_SOURCE_ORDER = ["project365", "facebook", "swarm", "x_twitter", "instagram"];
+const IMPORT_RUN_STEPS = {project365: "import_zips", facebook: "import_facebook_dayone", x_twitter: "stage_x_archive"};
+const IMPORT_ACTIONS = {project365: "Import ZIPs", facebook: "Build Day One ZIP", x_twitter: "Stage for review"};
+function importSourceResult(key, history, activeJobs) {
+  const step = IMPORT_RUN_STEPS[key];
+  if (!step) return "Importer not available yet.";
+  const active = activeJobs.find(job => job.step === step);
+  if (active) return formatActiveWorkflowResult(active);
+  const latest = (history[step] || [])[0];
+  if (!latest) return "No runs yet.";
+  const summary = latest.summary || {};
+  const metrics = summary.metrics || [];
+  const value = label => String((metrics.find(item => item.label === label) || {}).value || "");
+  const date = formatShortDateTime(latest.finished_at || latest.started_at);
+  const state = latest.status === "pass" ? "Completed" : formatJobStatus(latest.status || "fail");
+  if (key === "facebook" && latest.status === "pass") {
+    const zip = value("Day One ZIP");
+    const name = zip.split("/").pop();
+    const manifest = value("Integrity manifest");
+    const details = `${value("Entries")} entries · ${value("Attachments")} attachments · ${value("Entries with location")} with location`;
+    const albums = Number(value("Album entries")) ? `${value("Album entries")} album entries` : "";
+    const coverage = value("Latest post") && value("Latest post") !== "unknown" ? `Posts through ${value("Latest post")}` : "";
+    const linkCount = value("Facebook post links") ? `${value("Facebook post links")} Facebook links` : "";
+    const issues = [Number(value("Unlinked comments")) ? `${value("Unlinked comments")} comments need post links` : "", Number(value("Shared originals unavailable")) ? `${value("Shared originals unavailable")} shared originals unavailable` : "", Number(value("Ambiguous post links")) ? `${value("Ambiguous post links")} ambiguous post timestamps` : ""].filter(Boolean).join(" · ");
+    return `<div class="import-result"><strong>${escapeHtml(state)}</strong> ${escapeHtml(date)}<br>${escapeHtml([details, albums].filter(Boolean).join(" · "))}${coverage || linkCount ? `<br>${escapeHtml([coverage, linkCount].filter(Boolean).join(" · "))}` : ""}${issues ? `<br>${escapeHtml(issues)}` : ""}<br>ZIP: <code>${escapeHtml(name)}</code><details><summary>Show output location</summary><code>${escapeHtml(zip)}</code><br>Manifest: <code>${escapeHtml(manifest)}</code></details></div>`;
+  }
+  if (key === "project365" && latest.status === "pass") {
+    const count = value("Archives scanned") || value("Source files");
+    return `<div class="import-result"><strong>${escapeHtml(state)}</strong> ${escapeHtml(date)}${count ? ` · ${escapeHtml(count)} ZIPs scanned` : ""}</div>`;
+  }
+  if (key === "x_twitter" && latest.status === "pass") {
+    return `<div class="import-result"><strong>${escapeHtml(state)}</strong> ${escapeHtml(date)} · ${escapeHtml(value("Staged events") || "0")} posts staged for review</div>`;
+  }
+  return `<div class="import-result"><strong>${escapeHtml(state)}</strong> ${escapeHtml(date)}${summary.error ? `<br>${escapeHtml(summary.error)}` : ""}</div>`;
+}
+function renderImportHub(payload) {
+  const config = payload.import_sources;
+  if (!config) return;
+  const target = document.getElementById("importSourceCards");
+  if (!target) return;
+  const history = payload.workflow_history || {};
+  const activeJobs = payload.active_jobs || [];
+  target.innerHTML = IMPORT_SOURCE_ORDER.map(key => {
+    const source = (config.sources || {})[key];
+    if (!source) return "";
+    const enabled = Boolean(source.enabled);
+    const folder = `Source Data/${String(source.folder || "").split("/").pop()}`;
+    const supported = Boolean(IMPORT_RUN_STEPS[key]);
+    const override = key === "facebook" ? document.getElementById("facebookDayOneSource")?.value.trim()
+      : key === "x_twitter" ? document.getElementById("xArchiveSource")?.value.trim() : "";
+    const canRun = enabled && supported && (source.ready || override);
+    const action = !enabled
+      ? `<button class="button small" type="button" onclick="enableImportSource('${key}')">Enable</button>`
+      : supported
+        ? `<button class="button primary small" type="button" onclick="runImportSource('${key}')" ${canRun && !running ? "" : "disabled"}>${IMPORT_ACTIONS[key]}</button>`
+        : `<button class="button small" type="button" disabled>Importer coming later</button>`;
+    const instruction = !enabled ? "Not enabled" : source.ready ? "Export found" : source.detail;
+    return `<article class="import-source-card ${enabled ? "" : "is-disabled"}">
+      <h3>${escapeHtml(source.label)}</h3>
+      <p>${escapeHtml(instruction)}</p>
+      <p>Drop export in <code>${escapeHtml(folder)}</code></p>
+      ${action}
+      ${enabled ? importSourceResult(key, history, activeJobs) : ""}
+    </article>`;
+  }).join("");
+  if (!config.configured && !importSetupPrompted) {
+    importSetupPrompted = true;
+    manuallyExpandedSteps.add("import_hub");
+    showImportSetup();
+    workflowCard("import_hub")?.scrollIntoView({block: "start"});
+  }
+}
+function showImportSetup() {
+  const setup = document.getElementById("importSetup");
+  const choices = document.getElementById("importSetupChoices");
+  const config = (lastStatus || {}).import_sources || {};
+  if (!setup || !choices) return;
+  choices.innerHTML = IMPORT_SOURCE_ORDER.map(key => {
+    const source = (config.sources || {})[key];
+    const suffix = source?.capability === "unavailable" ? " (folder only)" : source?.capability === "stage_for_review" ? " (stage only)" : "";
+    return source ? `<label class="checkbox-line"><input type="checkbox" value="${key}" ${source.enabled ? "checked" : ""}>${escapeHtml(source.label + suffix)}</label>` : "";
+  }).join("");
+  setup.hidden = false;
+  manuallyExpandedSteps.add("import_hub");
+  const card = workflowCard("import_hub");
+  if (card) card.classList.add("is-expanded");
+  const toggle = card?.querySelector('[data-step-toggle="import_hub"]');
+  if (toggle) { toggle.textContent = "Collapse"; toggle.setAttribute("aria-expanded", "true"); }
+}
+function hideImportSetup() { document.getElementById("importSetup").hidden = true; }
+async function saveImportSetup() {
+  const enabled = Array.from(document.querySelectorAll("#importSetupChoices input:checked")).map(input => input.value);
+  try {
+    await fetchJson("/api/import-sources", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify({enabled})});
+    hideImportSetup();
+    setStepMessage("import_hub", "Source folders are ready. Drop exports into the folders shown.");
+    await loadStatus(["import_hub"]);
+  } catch (error) { setStepMessage("import_hub", error.message, "error"); }
+}
+async function enableImportSource(key) {
+  const current = ((lastStatus || {}).import_sources || {}).enabled || [];
+  const enabled = Array.from(new Set([...current, key]));
+  try {
+    await fetchJson("/api/import-sources", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify({enabled})});
+    await loadStatus(["import_hub"]);
+    const source = (((lastStatus || {}).import_sources || {}).sources || {})[key];
+    setStepMessage("import_hub", `Enabled ${source?.label || key}. Drop its export into Source Data/${String(source?.folder || "").split("/").pop()}.`);
+  } catch (error) { setStepMessage("import_hub", error.message, "error"); }
+}
+async function runImportSource(key) {
+  if (key === "project365") await runStep("import_zips");
+  if (key === "facebook") await runFacebookDayOneImport();
+  if (key === "x_twitter") await runStep("stage_x_archive", {source: document.getElementById("xArchiveSource").value.trim()});
 }
 
 function applyInitialWorkflowExpansion() {
@@ -7084,6 +7516,8 @@ function renderWorkflowCard(card, owner, active, records) {
       statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Ready`;
     } else if (owner === "diary_enrichment" && !active) {
       statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Set date range`;
+    } else if (owner === "video_memory_review" && !active) {
+      statusTarget.innerHTML = `<span class="status-pill">Interactive</span>Review prepared videos`;
     } else {
       statusTarget.innerHTML = latest ? formatWorkflowStatus(latest, Boolean(active)) : "No runs yet";
     }
@@ -7107,7 +7541,7 @@ function formatCropConfirmationStatus(crop) {
 function openCropConfirmation() {
   const job = ((lastStatus || {}).crop_confirmation || {}).crop_estimate_batch || {};
   const url = new URL("/crop", window.location.href);
-  if (job.apply_estimates && Number(job.estimated_count || 0) > 0 && ["queued", "running"].includes(job.status || "")) {
+  if (job.apply_estimates && Number(job.completed_batch_count || 0) > 0) {
     url.searchParams.set("crop_filter", "estimated");
   }
   window.location.assign(url.toString());
@@ -7192,23 +7626,22 @@ function openDiaryEnrichment() {
 }
 
 async function runWorkingCopies() {
-  const scope = dateScopeFromInputValues(
-    document.getElementById("workingCopyStartDate").value,
-    document.getElementById("workingCopyEndDate").value
-  );
+  const scope = workingCopyDateScope();
   if (!scope.ok) {
     setWorkingCopyMessage(scope.message, true);
     return;
   }
+  const force = Boolean(document.getElementById("forceWorkingCopies").checked);
+  const dateLabel = scope.startDate ? "selected dates" : "all database dates";
   setWorkingCopyMessage(
-    document.getElementById("forceWorkingCopies").checked
-      ? "Starting forced rewrite for selected dates..."
-      : "Starting selected dates; unchanged copies will be skipped."
+    force
+      ? `Starting forced rewrite for ${dateLabel}...`
+      : `Checking ${dateLabel}; unchanged copies will be skipped.`
   );
   await runStep("generate_derivatives", {
     start_date: scope.startDate,
     end_date: scope.endDate,
-    force: Boolean(document.getElementById("forceWorkingCopies").checked)
+    force
   });
   await refreshWorkingCopyReadiness();
 }
@@ -7294,12 +7727,14 @@ function renderCropEstimateBatchJob(job) {
   const estimated = Number(job.estimated_count || 0);
   const skipped = Number(job.skipped_count || 0);
   const failed = Number(job.failed_count || 0);
+  const readyBatches = Number(job.completed_batch_count || 0);
+  const fallback = Number(job.vision_fallback_count || 0);
   const current = job.current_entry_id ? ` · ${job.current_entry_id}` : "";
   const mode = job.apply_estimates ? "saved" : "previewed";
   const errorDetail = cropEstimateFailureSummary(job);
   const label = runningNow ? "Working" : job.status === "pass" ? "Complete" : "Failed";
   setCropEstimateBatchStatus(
-    `${label} · ${processed}/${total} checked · ${estimated} ${mode} estimates · ${skipped} skipped · ${failed} failed${current}${errorDetail}`
+    `${label} · ${processed}/${total} checked · ${readyBatches} batches ${job.apply_estimates ? "ready" : "analyzed"} · ${estimated} ${mode} estimates · ${fallback} Vision fallbacks · ${skipped} skipped · ${failed} failed${current}${errorDetail}`
   );
 }
 
@@ -8213,8 +8648,6 @@ function setFolderChooserMessage(targetInputId, message, state = "") {
     ? "photoIndexMessage"
     : targetInputId === "broadCandidateRoots"
       ? "broadVisualActionMessage"
-    : targetInputId === "digikamXmpRoots"
-      ? "digikamPeopleMessage"
       : "";
   const target = targetId ? document.getElementById(targetId) : null;
   if (!target) return;
@@ -8741,9 +9174,31 @@ async function runDiariumPackage() {
   });
 }
 
+async function runDayOnePackage() {
+  const scope = dateScopeFromInputValues(
+    document.getElementById("dayOneStartDate").value,
+    document.getElementById("dayOneEndDate").value,
+    {allowBlank: true}
+  );
+  if (!scope.ok) {
+    setStepMessage("generate_dayone_package", scope.message, "error");
+    return;
+  }
+  await runStep("generate_dayone_package", {
+    start_date: scope.startDate,
+    end_date: scope.endDate,
+    limit: Number(document.getElementById("dayOneLimit").value || "100000")
+  });
+}
+
+async function runFacebookDayOneImport() {
+  const source = document.getElementById("facebookDayOneSource").value.trim();
+  const additional_exports = document.getElementById("facebookDayOneAdditionalExports").value.trim();
+  await runStep("import_facebook_dayone", {source, additional_exports});
+}
+
 async function importDigiKamPeople() {
   await runStep("import_digikam_people", {
-    xmp_roots: parseDelimited("digikamXmpRoots"),
     suggestions_csv: document.getElementById("digikamSuggestionsCsv").value.trim()
   });
 }
@@ -8790,6 +9245,7 @@ async function runStep(step, extra = {}, triggerOverride = null) {
     running = false;
     markButtonRunning(trigger, false);
     setButtons(false);
+    renderImportHub(lastStatus);
   }
 }
 
@@ -8812,6 +9268,9 @@ async function waitForJob(jobId) {
 
 function setStepMessage(step, message, state = "") {
   const targetIds = {
+    import_hub: "importHubMessage",
+    import_zips: "importHubMessage",
+    stage_x_archive: "importHubMessage",
     build_photo_index: "photoIndexMessage",
     refresh_photo_index_metadata: "photoIndexMessage",
     match_easy_originals: "easyMatchMessage",
@@ -8822,7 +9281,8 @@ function setStepMessage(step, message, state = "") {
     rough_visual_match: "roughVisualMessage",
     rough_visual_benchmark: "roughVisualMessage",
     generate_derivatives: "workingCopyMessage",
-    import_digikam_people: "digikamPeopleMessage"
+    import_digikam_people: "digikamPeopleMessage",
+    import_facebook_dayone: "importHubMessage"
   };
   const target = document.getElementById(targetIds[step] || "");
   if (!target) return;
@@ -8842,6 +9302,9 @@ function stepCompletionMessage(step) {
   if (step === "rough_visual_benchmark") return "No-date visual benchmark exported.";
   if (step === "generate_derivatives") return "Working photo copies completed.";
   if (step === "import_digikam_people") return "digiKam suggestions imported. Tag queue refreshed.";
+  if (step === "import_facebook_dayone") return "Facebook Day One ZIP completed.";
+  if (step === "stage_x_archive") return "X archive staged for review; no entries were imported into the journal.";
+  if (step === "import_zips") return "Project365 ZIP import completed.";
   return "Task completed.";
 }
 
@@ -8907,6 +9370,7 @@ async function cancelActiveJob() {
     document.getElementById("output").textContent = message;
     running = false;
     setButtons(false);
+    renderImportHub(lastStatus);
     if (stopButton) stopButton.disabled = false;
     return;
   }
@@ -9266,10 +9730,10 @@ loadStatus(["workflow_overview"])
 
 
 def _patch_control_html(html: str) -> str:
-    if 'data-step="media_dedupe_review"' in html:
-        return html
-    html = html.replace('      <a class="button" href="/dedupe">Open media dedupe review</a>\n', "")
-    section = """
+    marker = '    <section class="panel workflow-step" data-step="broad_visual_match">'
+    if 'data-step="media_dedupe_review"' not in html:
+        html = html.replace('      <a class="button" href="/dedupe">Open media dedupe review</a>\n', "")
+        section = """
     <section class="panel workflow-step" data-step="media_dedupe_review">
       <div class="workflow-step-header">
         <div>
@@ -9290,19 +9754,39 @@ def _patch_control_html(html: str) -> str:
     </section>
 
 """
-    marker = '    <section class="panel workflow-step" data-step="broad_visual_match">'
-    html = html.replace(marker, section + marker, 1)
-    replacements = {
-        '<div class="step-kicker">Step 4</div>\n          <h2>Broad Visual Match</h2>': '<div class="step-kicker">Step 5</div>\n          <h2>Broad Visual Match</h2>',
-        '<div class="step-kicker">Step 4B</div>\n          <h2>No-Date Visual Match</h2>': '<div class="step-kicker">Step 5B</div>\n          <h2>No-Date Visual Match</h2>',
-        '<div class="step-kicker">Step 5</div>\n          <h2>Crop confirmation</h2>': '<div class="step-kicker">Step 6</div>\n          <h2>Crop confirmation</h2>',
-        '<div class="step-kicker">Step 6</div>\n          <h2>Working photo copies</h2>': '<div class="step-kicker">Step 7</div>\n          <h2>Working photo copies</h2>',
-        '<div class="step-kicker">Step 7</div>\n          <h2>People / face tagging</h2>': '<div class="step-kicker">Step 8</div>\n          <h2>People / face tagging</h2>',
-        '<div class="step-kicker">Step 8</div>\n          <h2>Diary enrichment</h2>': '<div class="step-kicker">Step 9</div>\n          <h2>Diary enrichment</h2>',
-        '<div class="step-kicker">Step 9</div>\n          <h2>Diarium import package</h2>': '<div class="step-kicker">Step 10</div>\n          <h2>Diarium import package</h2>',
-    }
-    for old, new in replacements.items():
-        html = html.replace(old, new, 1)
+        html = html.replace(marker, section + marker, 1)
+        replacements = {
+            '<div class="step-kicker">Step 4</div>\n          <h2>Broad Visual Match</h2>': '<div class="step-kicker">Step 5</div>\n          <h2>Broad Visual Match</h2>',
+            '<div class="step-kicker">Step 4B</div>\n          <h2>No-Date Visual Match</h2>': '<div class="step-kicker">Step 5B</div>\n          <h2>No-Date Visual Match</h2>',
+            '<div class="step-kicker">Step 5</div>\n          <h2>Crop confirmation</h2>': '<div class="step-kicker">Step 6</div>\n          <h2>Crop confirmation</h2>',
+            '<div class="step-kicker">Step 6</div>\n          <h2>Working photo copies</h2>': '<div class="step-kicker">Step 7</div>\n          <h2>Working photo copies</h2>',
+            '<div class="step-kicker">Step 7</div>\n          <h2>People / face tagging</h2>': '<div class="step-kicker">Step 8</div>\n          <h2>People / face tagging</h2>',
+            '<div class="step-kicker">Step 8</div>\n          <h2>Diary enrichment</h2>': '<div class="step-kicker">Step 9</div>\n          <h2>Diary enrichment</h2>',
+            '<div class="step-kicker">Step 9</div>\n          <h2>Diarium import package</h2>': '<div class="step-kicker">Step 10</div>\n          <h2>Diarium import package</h2>',
+        }
+        for old, new in replacements.items():
+            html = html.replace(old, new, 1)
+    if 'data-step="video_memory_review"' not in html:
+        video_section = """
+    <section class="panel workflow-step" data-step="video_memory_review">
+      <div class="workflow-step-header">
+        <div>
+          <div class="step-kicker">Independent tool</div>
+          <h2>Video memory review</h2>
+        </div>
+        <div class="step-status-bar" data-step-status="video_memory_review">Review prepared videos</div>
+        <button class="button small step-toggle" data-step-toggle="video_memory_review" onclick="toggleWorkflowStep('video_memory_review')" aria-expanded="false">Open</button>
+      </div>
+      <div class="workflow-step-body">
+      <div class="subtle">Runs on its own local server so heavy thumbnail, video, and render work stays isolated from the Control Panel. Review pre-generated frames, adjust the on-device AI suggestions, set video-wide or individual screenshot privacy, choose each key frame, and explicitly queue final JPEGs.</div>
+      <div class="button-row">
+        <a class="button primary" href="http://127.0.0.1:8767/">Open video memory review</a>
+      </div>
+      </div>
+    </section>
+
+"""
+        html = html.replace(marker, video_section + marker, 1)
     return html
 
 CONTROL_HTML = _patch_control_html(CONTROL_HTML)

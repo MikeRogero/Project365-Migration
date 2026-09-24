@@ -14,6 +14,44 @@ import project365_diarium_exporter as diarium_exporter
 
 
 class Project365DiariumExporterTests(unittest.TestCase):
+    def test_dayone_split_routes_private_working_copy_to_second_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            import_dir.mkdir()
+            _write_zip(import_dir / "1998-04.zip", {
+                "1998-04-12.png": _tiny_png(), "1998-04-13.png": _tiny_png(),
+            })
+            canonical_root = base / "Project365Canonical"
+            canonical_importer.import_project365_exports(import_dir=import_dir, canonical_root=canonical_root)
+            for date, private in (("1998-04-12", False), ("1998-04-13", True)):
+                entry_id = f"project365:{date}"
+                _insert_derivative(canonical_root, entry_id, diarium_exporter.DEFAULT_DERIVATIVE_POLICY,
+                                   _jpeg_with_dimensions(width=12, height=12))
+                photo = canonical_root / "media" / "diarium_derivatives" / diarium_exporter.DEFAULT_DERIVATIVE_POLICY / f"project365_{date}.jpg"
+                sidecar = photo.with_name(photo.name + ".xmp")
+                tag = "<rdf:li>Private</rdf:li>" if private else ""
+                sidecar.write_text('<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:Description><dc:subject><rdf:Bag>' + tag + '</rdf:Bag></dc:subject></rdf:Description></rdf:RDF>')
+            summary = diarium_exporter.generate_diarium_dayone_package(
+                canonical_root, base / "out", "split.zip", "1998-04-12", "1998-04-13", 2,
+                target="dayone",
+            )
+            self.assertEqual(summary.entry_count, 2)
+            with zipfile.ZipFile(summary.package_path) as archive:
+                public = json.loads(archive.read("Project365.json"))["entries"]
+                private = json.loads(archive.read("Project365 Private.json"))["entries"]
+            self.assertEqual(len(public), 1)
+            self.assertEqual(len(private), 1)
+            self.assertNotEqual(public[0]["uuid"], private[0]["uuid"])
+            missing_sidecar = canonical_root / "media" / "diarium_derivatives" / diarium_exporter.DEFAULT_DERIVATIVE_POLICY / "project365_1998-04-12.jpg.xmp"
+            missing_sidecar.unlink()
+            with self.assertRaises(FileNotFoundError):
+                diarium_exporter.generate_diarium_dayone_package(
+                    canonical_root, base / "out", "unsafe.zip", "1998-04-12", "1998-04-13", 2,
+                    target="dayone",
+                )
+            self.assertFalse((base / "out" / "unsafe.zip").exists())
+
     def test_generate_dayone_package_from_canonical_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -46,6 +84,13 @@ class Project365DiariumExporterTests(unittest.TestCase):
                 policy=diarium_exporter.DEFAULT_DERIVATIVE_POLICY,
                 payload=_jpeg_with_dimensions(width=9, height=9),
             )
+            adjusted_payload = _jpeg_with_dimensions(width=12, height=12)[:-2] + b"\xff\xfe\x00\x06edit" + b"\xff\xd9"
+            adjusted_path = (
+                canonical_root / "media" / "diarium_derivatives"
+                / diarium_exporter.DEFAULT_DERIVATIVE_POLICY
+                / "project365_1998-04-12.jpg"
+            )
+            adjusted_path.write_bytes(adjusted_payload)
 
             summary = diarium_exporter.generate_diarium_dayone_package(
                 canonical_root=canonical_root,
@@ -57,6 +102,7 @@ class Project365DiariumExporterTests(unittest.TestCase):
             )
 
             self.assertEqual(summary.entry_count, 2)
+            self.assertEqual(summary.location_count, 0)
             self.assertEqual(summary.media_count, 2)
             package_path = Path(summary.package_path)
             manifest_path = Path(summary.manifest_path)
@@ -92,6 +138,7 @@ class Project365DiariumExporterTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["entry_id"], "project365:1998-04-12")
             self.assertEqual(rows[0]["media_role"], "diarium_derivative")
+            self.assertEqual(rows[0]["media_sha256"], hashlib.sha256(adjusted_payload).hexdigest())
             self.assertEqual(rows[1]["media_role"], "diarium_derivative")
             self.assertEqual(rows[0]["text_present"], "true")
             self.assertEqual(rows[1]["text_present"], "false")
@@ -124,6 +171,18 @@ class Project365DiariumExporterTests(unittest.TestCase):
                 payload=_jpeg_with_dimensions(width=7, height=7),
                 associated_entry_date="1998-04-13",
             )
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                assets = connection.execute(
+                    "SELECT id, role FROM media_assets WHERE role IN ('diarium_derivative', 'diarium_associated_derivative')"
+                ).fetchall()
+                connection.executemany(
+                    "INSERT INTO media_people (media_asset_id, canonical_name, diarium_tag, source) VALUES (?, ?, ?, 'digikam_xmp')",
+                    [
+                        (asset_id, "Main Example", "person:Main Example") if role == "diarium_derivative"
+                        else (asset_id, "Linked Example", "person:Linked Example")
+                        for asset_id, role in assets
+                    ],
+                )
 
             summary = diarium_exporter.generate_diarium_dayone_package(
                 canonical_root=canonical_root,
@@ -141,6 +200,10 @@ class Project365DiariumExporterTests(unittest.TestCase):
                 photo_names = [name for name in archive.namelist() if name.startswith("photos/")]
             self.assertEqual(len(photo_names), 2)
             photos = payload["entries"][0]["photos"]
+            self.assertEqual(
+                payload["entries"][0]["tags"],
+                ["source:project365", "Main Example", "Linked Example"],
+            )
             self.assertEqual([photo["orderInEntry"] for photo in photos], [0, 1])
             self.assertEqual((photos[0]["width"], photos[0]["height"]), (12, 12))
             self.assertEqual((photos[1]["width"], photos[1]["height"]), (7, 7))

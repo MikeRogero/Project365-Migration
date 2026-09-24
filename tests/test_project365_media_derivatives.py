@@ -94,15 +94,15 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                 long_edge=64,
                 quality=80,
             )
-            self.assertEqual(default_readiness.source_count, 1)
-            self.assertEqual(default_readiness.associated_source_count, 0)
+            self.assertEqual(default_readiness.source_count, 2)
+            self.assertEqual(default_readiness.associated_source_count, 1)
+            self.assertEqual(default_readiness.associated_ready_count, 1)
 
             summary = derivatives.generate_derivatives(
                 canonical_root=canonical_root,
                 output_format="jpeg",
                 long_edge=64,
                 quality=80,
-                include_associated=True,
             )
 
             self.assertEqual(summary.generated_count, 2)
@@ -138,6 +138,48 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                     "Project365 Working Copy - 1998-04-12 - associated sq64 - "
                 )
             )
+
+    def test_staged_linked_crop_is_ready_for_normal_working_copy_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(import_dir / "1998-04.zip", {"1998-04-12.png": _tiny_png()})
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir, canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+            associated_path = base / "associated.jpg"
+            associated_path.write_bytes(_tiny_png())
+            _insert_associated_original(canonical_root, associated_path)
+            with sqlite3.connect(canonical_root / "canonical.db") as connection:
+                transformation = json.loads(connection.execute(
+                    "SELECT transformation_json FROM media_assets WHERE id = 'associated-source'"
+                ).fetchone()[0])
+                transformation.pop("review_crop")
+                connection.execute(
+                    "UPDATE media_assets SET transformation_json = ? WHERE id = 'associated-source'",
+                    (json.dumps(transformation, sort_keys=True),),
+                )
+
+            missing = derivatives.derivative_readiness_summary(
+                canonical_root, output_format="jpeg", long_edge=64, quality=80,
+            )
+            self.assertEqual(missing.associated_source_count, 1)
+            self.assertEqual(missing.associated_not_ready_count, 1)
+            _write_staged_crop(canonical_root, "project365:1998-04-12", associated_path, {
+                "x": 0, "y": 0, "size": 1,
+                "candidate_width": 1, "candidate_height": 1, "source": "manual",
+            })
+            ready = derivatives.derivative_readiness_summary(
+                canonical_root, output_format="jpeg", long_edge=64, quality=80,
+            )
+            self.assertEqual(ready.associated_ready_count, 1)
+            summary = derivatives.generate_derivatives(
+                canonical_root, output_format="jpeg", long_edge=64, quality=80,
+            )
+            self.assertEqual(summary.generated_count, 2)
 
     def test_missing_review_crop_is_not_ready_for_derivative_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -313,6 +355,54 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             )
             self.assertEqual(readiness.current_count, 1)
             self.assertEqual(readiness.needs_update_count, 0)
+
+    def test_external_working_copy_edit_does_not_trigger_regeneration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(import_dir / "1998-04.zip", {"1998-04-12.png": _tiny_png()})
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            _set_project365_export_crop(canonical_root)
+            first = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            with Path(first.report_path).open(newline="") as handle:
+                output = Path(next(csv.DictReader(handle))["derivative_path"])
+            externally_edited = output.read_bytes() + b"external edit"
+            output.write_bytes(externally_edited)
+
+            readiness = derivatives.derivative_readiness_summary(
+                canonical_root, output_format="jpeg", long_edge=64, quality=80
+            )
+            with mock.patch.object(
+                derivatives, "_convert_image_atomically", side_effect=AssertionError("should skip")
+            ):
+                second = derivatives.generate_derivatives(
+                    canonical_root=canonical_root,
+                    output_format="jpeg",
+                    long_edge=64,
+                    quality=80,
+                )
+
+            self.assertEqual(first.generated_count, 1)
+            self.assertEqual(readiness.current_count, 1)
+            self.assertEqual(readiness.needs_update_count, 0)
+            self.assertEqual(second.generated_count, 0)
+            self.assertEqual(second.skipped_count, 1)
+            self.assertEqual(output.read_bytes(), externally_edited)
+            output.unlink()
+            missing = derivatives.derivative_readiness_summary(
+                canonical_root, output_format="jpeg", long_edge=64, quality=80
+            )
+            self.assertEqual(missing.needs_update_count, 1)
 
     def test_date_range_limits_working_copy_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

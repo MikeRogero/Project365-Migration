@@ -176,13 +176,13 @@ class Project365DigiKamPeopleImporterTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(people, [("Alex Example", "suggested", "digikam_xmp")])
 
-    def test_imports_people_from_working_copy_sidecar_folder(self) -> None:
+    def test_sidecar_without_current_working_copy_is_not_imported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             canonical_root = _import_sample(base, ["1998-04-12"])
             xmp_root = canonical_root / "media" / "diarium_derivatives" / "Project365_square_2560_q88" / "1998-04"
             xmp_root.mkdir(parents=True)
-            sidecar = xmp_root / "project365_1998-04-12.jpg.xmp"
+            sidecar = xmp_root / "Project365 Working Copy - 1998-04-12 - sq2560.jpg.xmp"
             sidecar.write_text(
                 """<?xml version="1.0"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -204,13 +204,25 @@ class Project365DigiKamPeopleImporterTests(unittest.TestCase):
                 queue_path=canonical_root / "exports" / "verification_reports" / "tag_queue.csv",
             )
 
-            self.assertEqual(summary.applied_count, 1)
+            self.assertEqual(summary.applied_count, 0)
             self.assertEqual(summary.error_count, 0)
+            self.assertEqual(summary.unmatched_sidecar_count, 1)
             with sqlite3.connect(canonical_root / "canonical.db") as connection:
                 people = connection.execute(
                     "SELECT canonical_name, diarium_tag, review_status, source FROM people"
                 ).fetchall()
-            self.assertEqual(people, [("Alex Example", "person:Alex Example", "suggested", "digikam_xmp")])
+            self.assertEqual(people, [])
+
+    def test_current_working_copy_names_map_to_entry(self) -> None:
+        self.assertEqual(
+            digikam._entry_id_from_media_path("/working/1998-04/Project365 Working Copy - 1998-04-12 - sq2560.jpg"),
+            "project365:1998-04-12",
+        )
+        self.assertEqual(
+            digikam._entry_id_from_media_path("/working/1998-04/Project365 Working Copy - 1998-04-12 - associated sq2560 - 123456789abc.jpg"),
+            "project365:1998-04-12",
+        )
+        self.assertIsNone(digikam._entry_id_from_media_path("/working/1998-04/Project365 Working Copy - invalid - sq2560.jpg"))
 
 
 def _import_sample(base: Path, dates: list[str]) -> Path:

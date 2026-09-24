@@ -17,8 +17,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY
+from project365_private_tags import read_private_tag
 from project365_location_enrichment import load_exportable_locations
-from project365_tag_enrichment import load_exportable_diarium_tags
+from project365_tag_enrichment import load_exportable_diarium_tags, load_exportable_media_people_tags
 
 
 NAMESPACE = uuid.UUID("c4d9f898-190f-4c0c-b87e-000000a36500")
@@ -32,6 +33,7 @@ class DiariumExportSummary:
     manifest_path: str
     entry_count: int
     media_count: int
+    location_count: int = 0
     skipped_entry_count: int = 0
     skipped_entry_dates: tuple[str, ...] = ()
 
@@ -81,6 +83,10 @@ def main() -> int:
         default=DEFAULT_DERIVATIVE_POLICY,
         help="Preferred diarium_derivative policy suffix.",
     )
+    parser.add_argument(
+        "--target", choices=("diarium", "dayone"), default="diarium",
+        help="Day One creates two journals split by working-copy Private tags.",
+    )
     args = parser.parse_args()
 
     summary = generate_diarium_dayone_package(
@@ -92,12 +98,14 @@ def main() -> int:
         limit=args.limit,
         time_zone=args.time_zone,
         derivative_policy=args.derivative_policy,
+        target=args.target,
     )
-    print("Project365 Diarium package generation: PASS")
+    print(f"Project365 {'Day One' if args.target == 'dayone' else 'Diarium'} package generation: PASS")
     print(f"Package: {summary.package_path}")
     print(f"Manifest: {summary.manifest_path}")
     print(f"Entries: {summary.entry_count}")
     print(f"Media assets: {summary.media_count}")
+    print(f"Entries with location: {summary.location_count}")
     print(f"Skipped entries: {summary.skipped_entry_count}")
     if summary.skipped_entry_dates:
         print(f"Skipped dates: {', '.join(summary.skipped_entry_dates)}")
@@ -113,9 +121,12 @@ def generate_diarium_dayone_package(
     limit: int,
     time_zone: str = DEFAULT_TIME_ZONE,
     derivative_policy: str = DEFAULT_DERIVATIVE_POLICY,
+    target: str = "diarium",
 ) -> DiariumExportSummary:
     if limit <= 0:
         raise ValueError("limit must be positive")
+    if target not in {"diarium", "dayone"}:
+        raise ValueError("Unsupported export target")
     _validate_date(start_date, "start-date")
     _validate_date(end_date, "end-date")
     if start_date > end_date:
@@ -150,12 +161,17 @@ def generate_diarium_dayone_package(
         db_path,
         [entry["entry_id"] for entry in exportable_entries],
     )
+    media_people_tags = load_exportable_media_people_tags(
+        db_path,
+        [media["media_asset_id"] for entry in exportable_entries for media in entry["media"]],
+    )
     locations_by_entry = load_exportable_locations(
         db_path,
         [entry["entry_id"] for entry in exportable_entries],
     )
 
     entries_json: list[dict[str, object]] = []
+    private_entries_json: list[dict[str, object]] = []
     manifest_rows: list[dict[str, object]] = []
     media_count = 0
     zip_payloads: dict[str, bytes] = {}
@@ -166,8 +182,14 @@ def generate_diarium_dayone_package(
         creation_date = _creation_date_utc(entry_date, time_zone)
         entry_uuid = str(uuid.uuid5(NAMESPACE, entry_id)).upper()
         text = entry["original_text"] or ""
-        tags = tags_by_entry.get(entry_id, ["source:project365"])
+        tags = list(tags_by_entry.get(entry_id, ["source:project365"]))
+        for media in entry["media"]:
+            tags.extend(media_people_tags.get(media["media_asset_id"], []))
+        tags = list(dict.fromkeys(tags))
         photos: list[dict[str, object]] = []
+        is_private = target == "dayone" and any(
+            read_private_tag(Path(media["storage_path"])) for media in entry["media"]
+        )
 
         for order, media in enumerate(entry["media"]):
             media_payload = Path(media["storage_path"]).read_bytes()
@@ -205,7 +227,7 @@ def generate_diarium_dayone_package(
                     "photo_order": order,
                     "media_asset_id": media["media_asset_id"] or "",
                     "media_role": media["media_role"] or "",
-                    "media_sha256": media["media_sha256"] or "",
+                    "media_sha256": hashlib.sha256(media_payload).hexdigest(),
                     "source_media_asset_id": media["source_media_asset_id"] or "",
                     "source_media_role": media["source_media_role"] or "",
                     "associated_entry_date": media["associated_entry_date"] or "",
@@ -225,17 +247,19 @@ def generate_diarium_dayone_package(
             entry_json["location"] = locations_by_entry[entry_id]
         if photos:
             entry_json["photos"] = photos
-        entries_json.append(entry_json)
+        (private_entries_json if is_private else entries_json).append(entry_json)
 
-    dayone_payload = {
-        "metadata": {"version": "1.0"},
-        "entries": entries_json,
-    }
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            "Journal.json",
-            json.dumps(dayone_payload, ensure_ascii=False, indent=2) + "\n",
+        journals = (
+            {"Journal.json": entries_json} if target == "diarium" else
+            {"Project365.json": entries_json, "Project365 Private.json": private_entries_json}
         )
+        for name, journal_entries in journals.items():
+            archive.writestr(
+                name,
+                json.dumps({"metadata": {"version": "1.0"}, "entries": journal_entries},
+                           ensure_ascii=False, indent=2) + "\n",
+            )
         for name, payload in sorted(zip_payloads.items()):
             archive.writestr(name, payload)
 
@@ -262,8 +286,9 @@ def generate_diarium_dayone_package(
     return DiariumExportSummary(
         package_path=str(package_path),
         manifest_path=str(manifest_path),
-        entry_count=len(entries_json),
+        entry_count=len(entries_json) + len(private_entries_json),
         media_count=media_count,
+        location_count=sum("location" in entry for entry in entries_json + private_entries_json),
         skipped_entry_count=len(skipped_dates),
         skipped_entry_dates=tuple(skipped_dates),
     )
