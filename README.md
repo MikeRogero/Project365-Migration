@@ -399,6 +399,9 @@ Swarm missing-photo review stages photo choices and skips until you press
 shows its staged count. **Previous** revisits choices; **Clear** removes a draft
 or stages clearing a submitted choice. Drafts survive refreshes and restarts;
 only submitted choices are used by exports.
+Navigation and Submit controls stay in the fixed footer. The current check-in's
+address is looked up automatically and cached locally; photo reference services
+still open only when requested.
 
 Start reuses an existing Control Panel and leaves already-running review tools
 alone. Stop reports failure with a nonzero exit code and retains the PID record

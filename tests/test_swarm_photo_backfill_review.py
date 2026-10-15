@@ -256,7 +256,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
             self.assertIn(f"selectReference('{provider}')", html)
         self.assertNotIn("autoSubmit", html)
 
-    def test_reference_ui_loads_only_after_explicit_user_actions(self) -> None:
+    def test_reference_pages_stay_explicit_while_current_address_loads_automatically(self) -> None:
         """Execute the emitted browser script with deterministic DOM/network stubs."""
         html = _review_html("csrf")
         node_harness = textwrap.dedent(r"""
@@ -310,7 +310,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
               if(url.startsWith('/api/location')) {
                 locationCall++;
                 if(locationCall===1) return new Promise(resolve=>{resolveLocation=()=>resolve({ok:true,json:async()=>({available:true,google_images_query:'old query',google_images_url:'https://images.example/old'})})});
-                return {ok:true,json:async()=>({available:true,google_images_query:'resolved query',google_images_url:'https://images.example/resolved'})};
+                return {ok:true,json:async()=>({available:true,address:'12 New Street',city:'New City',state:'Excluded Region',country:'Country',display:'12 New Street, New City, Excluded Region, Country',google_images_query:'resolved query',google_images_url:'https://images.example/resolved'})};
               }
               throw new Error(`Unexpected fetch: ${url}`);
             };
@@ -331,55 +331,58 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
             vm.runInNewContext(script, context, {timeout:2000});
             (async()=>{
               await context.__initialLoad;
-              assert.equal(loads.length,0,'startup ignores the legacy auto-submit preference');
+              assert.equal(locationCall,1,'only the current entry address is looked up on load');
+              assert.equal(elements.locationAddress.textContent,'Looking up address…');
+              assert.equal(elements.previousEntry.disabled,true,'Previous is disabled at the queue start');
+              assert.equal(elements.nextEntry.disabled,false);
+              assert.equal(loads.length,0,'startup does not load external reference pages');
               assert.equal(popups.length,0,'startup does not open a reference window');
               await context.__test.selectReference('google');
-              assert.deepEqual(loads.map(([id])=>id),['googleFrame'],'explicit submit loads only the selected iframe');
+              assert.deepEqual(loads.map(([id])=>id),['googleFrame']);
               assert.equal(loads.at(-1)[1],entries[0].google_maps_embed_url);
               await context.__test.selectReference('google');
               assert.equal(loads.length,1,'repeating the same provider and URL is deduplicated');
               await context.__test.submitSelectedReference(true);
               assert.equal(loads.length,2,'Update forces one reload');
               loads.length=0;
-              await context.__test.load(1);
-              assert.equal(loads.length,0,'Next does not load external content');
               await context.__test.selectReference('google-images');
-              assert.equal(loads.length,0,'Google Images tab only selects its panel');
               assert.equal(popups.length,0,'Google Images tab does not open a window');
-              assert.equal(locationCall,0,'Google Images tab does not geocode');
               const staleWindowClick = context.__test.openReferenceWindow();
               assert.equal(popups.length,1,'explicit Google Images button opens one named window');
               assert.equal(popups[0].url,'about:blank');
               assert.equal(popups[0].name,'swarm-reference-window');
               assert.equal(navigations.length,0,'Google Images window waits for its address lookup');
-              assert.equal(locationCall,1);
-              assert.equal(typeof resolveLocation,'function','explicit image search starts address lookup');
-              await context.__test.load(0);
+              assert.equal(locationCall,1,'the image button shares the automatic address request');
+              await context.__test.load(1);
+              assert.equal(locationCall,2,'navigation looks up only the newly displayed entry');
+              assert.equal(elements.previousEntry.disabled,false);
+              assert.equal(elements.nextEntry.disabled,true,'Next is disabled at the queue end');
               resolveLocation();
               await staleWindowClick;
-              assert.equal(loads.length,0,'Google Images fallback never assigns a provider iframe');
               assert.deepEqual(navigations,[],'stale geocoder response cannot navigate the wrong entry');
+              assert.equal(loads.length,0,'navigation does not load external reference pages');
+              assert.match(elements.locationAddress.innerHTML,/12 New Street, New City, Country/);
+              assert.doesNotMatch(elements.locationAddress.innerHTML,/Excluded Region|old query/);
               await context.__test.selectReference('foursquare');
               await context.__test.openReferenceWindow();
               assert.equal(popups.length,1,'Foursquare reuses the named Google Images window');
-              assert.deepEqual(navigations,['https://foursquare.example/venue/0'],'explicit Foursquare button navigates to the selected provider');
+              assert.deepEqual(navigations,['https://foursquare.example/venue/1']);
               await context.__test.selectReference('google-images');
-              assert.equal(locationCall,1,'returning to the tab still does not geocode');
               await context.__test.openReferenceWindow();
-              assert.equal(locationCall,2,'explicit Google Images button performs address lookup');
+              assert.equal(locationCall,2,'the image button reuses the current address');
               assert.equal(loads.length,0,'only Google Maps uses an iframe');
               assert.equal(popups.length,1,'Google Images reuses the same fallback window');
-              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved']);
+              assert.deepEqual(navigations,['https://foursquare.example/venue/1','https://images.example/resolved']);
               openedWindows[0].severed=true;
               await context.__test.openReferenceWindow();
               assert.equal(popups.length,2,'a stale proxy triggers a retry');
               assert.equal(popups[1].name,'swarm-reference-window');
-              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved','https://images.example/resolved']);
+              assert.deepEqual(navigations,['https://foursquare.example/venue/1','https://images.example/resolved','https://images.example/resolved']);
               namedTargets.get('swarm-reference-window').closed=true;
               await context.__test.openReferenceWindow();
               assert.equal(popups.length,3,'a truly closed window is reopened on an explicit click');
               assert.equal(namedTargets.size,1,'the closed named target is replaced with one new window');
-              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved','https://images.example/resolved','https://images.example/resolved']);
+              assert.deepEqual(navigations,['https://foursquare.example/venue/1','https://images.example/resolved','https://images.example/resolved','https://images.example/resolved']);
               namedTargets.get('swarm-reference-window').closed=true;
               popupBlocked=true;
               await context.__test.openReferenceWindow();
