@@ -737,7 +737,7 @@ def _load_source_media(
     include_associated: bool = True,
 ) -> list[sqlite3.Row]:
     query = """
-        WITH source_rows AS (
+        WITH primary_source_rows AS (
             SELECT
                 entries.id AS entry_id,
                 entries.entry_date,
@@ -767,6 +767,10 @@ def _load_source_media(
                 ON fallback_media.entry_id = entries.id
                 AND fallback_media.selected_default = 1
             WHERE COALESCE(external_media.id, fallback_media.id) IS NOT NULL
+        ),
+        source_rows AS (
+            SELECT *
+            FROM primary_source_rows
     """
     params: list[object] = [policy]
     if include_associated:
@@ -793,6 +797,21 @@ def _load_source_media(
                 AND associated_media.review_status = 'confirmed'
                 AND associated_media.status = 'available'
                 AND COALESCE(associated_media.storage_path, '') != ''
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM primary_source_rows
+                    WHERE primary_source_rows.entry_id = associated_media.entry_id
+                        AND (
+                            (
+                                COALESCE(primary_source_rows.storage_path, '') != ''
+                                AND primary_source_rows.storage_path = associated_media.storage_path
+                            )
+                            OR (
+                                COALESCE(primary_source_rows.source_sha256, '') != ''
+                                AND primary_source_rows.source_sha256 = associated_media.sha256
+                            )
+                        )
+                )
         """
         params.append(policy)
     query += """

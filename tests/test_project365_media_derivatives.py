@@ -85,7 +85,7 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             )
             _set_project365_export_crop(canonical_root)
             associated_path = base / "associated.jpg"
-            associated_path.write_bytes(_tiny_png())
+            associated_path.write_bytes(_tiny_png() + b"associated")
             _insert_associated_original(canonical_root, associated_path)
 
             default_readiness = derivatives.derivative_readiness_summary(
@@ -139,6 +139,49 @@ class Project365MediaDerivativesTests(unittest.TestCase):
                 )
             )
 
+    def test_same_source_is_not_exported_as_primary_and_associated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            import_dir = base / "Import"
+            canonical_root = base / "Project365Canonical"
+            import_dir.mkdir()
+            _write_zip(
+                import_dir / "1998-04.zip",
+                {"1998-04-12.png": _tiny_png()},
+            )
+            canonical_importer.import_project365_exports(
+                import_dir=import_dir,
+                canonical_root=canonical_root,
+            )
+            source_path = base / "original.jpg"
+            source_path.write_bytes(_tiny_png())
+            _insert_external_original(canonical_root, source_path)
+            _insert_associated_original(canonical_root, source_path)
+
+            readiness = derivatives.derivative_readiness_summary(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+
+            self.assertEqual(readiness.source_count, 1)
+            self.assertEqual(readiness.primary_source_count, 1)
+            self.assertEqual(readiness.associated_source_count, 0)
+            summary = derivatives.generate_derivatives(
+                canonical_root=canonical_root,
+                output_format="jpeg",
+                long_edge=64,
+                quality=80,
+            )
+            self.assertEqual(summary.generated_count, 1)
+            with Path(summary.report_path).open(newline="") as handle:
+                report_rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                [Path(row["derivative_path"]).name for row in report_rows],
+                ["Project365 Working Copy - 1998-04-12 - sq64.jpg"],
+            )
+
     def test_staged_linked_crop_is_ready_for_normal_working_copy_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -151,7 +194,7 @@ class Project365MediaDerivativesTests(unittest.TestCase):
             )
             _set_project365_export_crop(canonical_root)
             associated_path = base / "associated.jpg"
-            associated_path.write_bytes(_tiny_png())
+            associated_path.write_bytes(_tiny_png() + b"associated")
             _insert_associated_original(canonical_root, associated_path)
             with sqlite3.connect(canonical_root / "canonical.db") as connection:
                 transformation = json.loads(connection.execute(
@@ -967,6 +1010,54 @@ def _insert_associated_original(canonical_root: Path, source_path: Path) -> None
             VALUES (
                 'associated-source', 'project365:1998-04-12',
                 'external_original_associated_photo', NULL, 'associated.jpg', ?,
+                ?, ?, 'image/jpeg', 'available', 'confirmed', 0, ?, ?,
+                '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z'
+            )
+            """,
+            (
+                str(source_path),
+                hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                source_path.stat().st_size,
+                json.dumps(crop, sort_keys=True),
+                import_batch_id,
+            ),
+        )
+        connection.commit()
+
+
+def _insert_external_original(canonical_root: Path, source_path: Path) -> None:
+    crop = {
+        "source": "external_original_reference",
+        "source_path": str(source_path),
+        "review_crop": {
+            "x": 0,
+            "y": 0,
+            "size": 1,
+            "candidate_width": 1,
+            "candidate_height": 1,
+            "source": "manual",
+        },
+        "original_is_read_only": True,
+    }
+    with sqlite3.connect(canonical_root / "canonical.db") as connection:
+        import_batch_id = connection.execute(
+            """
+            SELECT import_batch_id
+            FROM media_assets
+            WHERE entry_id = 'project365:1998-04-12'
+                AND role = 'project365_export_png'
+            """
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO media_assets (
+                id, entry_id, role, source_file_id, internal_filename, storage_path,
+                sha256, byte_size, mime_type, status, review_status, selected_default,
+                transformation_json, import_batch_id, created_at, updated_at
+            )
+            VALUES (
+                'primary-source', 'project365:1998-04-12',
+                'external_original_reference', NULL, 'original.jpg', ?,
                 ?, ?, 'image/jpeg', 'available', 'confirmed', 0, ?, ?,
                 '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z'
             )

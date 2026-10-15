@@ -116,8 +116,10 @@ class Project365PhotoLibraryIndexTests(unittest.TestCase):
             old_root.mkdir()
             photo = old_root / "2022-03-14 123456.jpg"
             video = old_root / "2022-03-14 123457.mov"
+            legacy_video = old_root / "2001-02-03 040506.avi"
             photo.write_bytes(b"fake image bytes")
             video.write_bytes(b"fake video bytes")
+            legacy_video.write_bytes(b"fake legacy video bytes")
             main_db = canonical_root / "photo_library_index.sqlite"
             with sqlite3.connect(main_db) as connection:
                 connection.execute("CREATE TABLE photo_library_files (path TEXT PRIMARY KEY, root TEXT NOT NULL)")
@@ -148,7 +150,26 @@ class Project365PhotoLibraryIndexTests(unittest.TestCase):
                     "SELECT filename FROM photo_library_files ORDER BY filename"
                 ).fetchall()
 
-            self.assertEqual(rows, [(video.name,)])
+            self.assertEqual(rows, [(legacy_video.name,), (video.name,)])
+
+    def test_video_extensions_cover_ffmpeg_supported_archive_containers(self) -> None:
+        self.assertTrue(
+            {
+                ".3gp",
+                ".asf",
+                ".avi",
+                ".dv",
+                ".flv",
+                ".m2ts",
+                ".mkv",
+                ".mpg",
+                ".mts",
+                ".rm",
+                ".vob",
+                ".webm",
+                ".wmv",
+            }.issubset(photo_index.VIDEO_EXTENSIONS)
+        )
 
     def test_index_stores_media_dimensions_and_duration_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

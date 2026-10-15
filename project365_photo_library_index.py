@@ -41,7 +41,42 @@ REEXPORT_SIDECAR_INDEX_FILENAME = "photo_library_reexport_index.sqlite"
 LEGACY_VIDEO_SIDECAR_INDEX_FILENAME = "video_library_legacy_index.sqlite"
 BROAD_VISUAL_INDEX_FILENAME = "broad_visual_match.sqlite"
 PHOTO_INDEX_METADATA_VERSION = "gps-sha-date-sources-v2"
-VIDEO_EXTENSIONS = {".mov", ".mp4", ".m4v"}
+VIDEO_EXTENSIONS = {
+    ".3g2",
+    ".3gp",
+    ".amv",
+    ".asf",
+    ".avi",
+    ".divx",
+    ".dv",
+    ".f4v",
+    ".flv",
+    ".m2ts",
+    ".m2v",
+    ".m4v",
+    ".mj2",
+    ".mkv",
+    ".mod",
+    ".mov",
+    ".movie",
+    ".mp4",
+    ".mpe",
+    ".mpeg",
+    ".mpg",
+    ".mpv",
+    ".mts",
+    ".mxf",
+    ".ogv",
+    ".qt",
+    ".rm",
+    ".rmvb",
+    ".tod",
+    ".ts",
+    ".vob",
+    ".vro",
+    ".webm",
+    ".wmv",
+}
 ICLOUD_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 BATCH_SIZE = 500
 METADATA_WORKERS = 4
