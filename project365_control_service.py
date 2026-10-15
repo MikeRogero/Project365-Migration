@@ -21,8 +21,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
 DEFAULT_VIDEO_PORT = 8767
+DEFAULT_SWARM_BACKFILL_PORT = 8771
 VIDEO_SERVER_SCRIPT = "project365_video_memory_review.py"
-SERVER_SCRIPTS = ("project365_control_app.py", "project365_original_picker.py", VIDEO_SERVER_SCRIPT)
+SWARM_BACKFILL_SERVER_SCRIPT = "swarm_photo_backfill_review.py"
+SERVER_SCRIPTS = (
+    "project365_control_app.py",
+    "project365_original_picker.py",
+    VIDEO_SERVER_SCRIPT,
+    SWARM_BACKFILL_SERVER_SCRIPT,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +37,7 @@ class ServiceConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     video_port: int = DEFAULT_VIDEO_PORT
+    swarm_backfill_port: int = DEFAULT_SWARM_BACKFILL_PORT
     runtime_dir: Path = PROJECT_ROOT / "Project365Canonical" / "runtime"
 
     @property
@@ -49,12 +57,28 @@ class ServiceConfig:
         return self.runtime_dir / "project365_video_memory_review.log"
 
     @property
+    def swarm_backfill_pid_path(self) -> Path:
+        return self.runtime_dir / "swarm_photo_backfill_review.pid.json"
+
+    @property
+    def swarm_backfill_log_path(self) -> Path:
+        return self.runtime_dir / "swarm_photo_backfill_review.log"
+
+    @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
     @property
     def video_url(self) -> str:
         return f"http://{self.host}:{self.video_port}"
+
+    @property
+    def swarm_backfill_url(self) -> str:
+        return f"http://{self.host}:{self.swarm_backfill_port}"
+
+    @property
+    def swarm_backfill_summary_url(self) -> str:
+        return f"{self.swarm_backfill_url}/api/summary"
 
 
 def main() -> int:
@@ -63,10 +87,16 @@ def main() -> int:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--video-port", type=int, default=DEFAULT_VIDEO_PORT)
+    parser.add_argument("--swarm-backfill-port", type=int, default=DEFAULT_SWARM_BACKFILL_PORT)
     parser.add_argument("--open", action="store_true", help="Open the control panel in the default browser after start.")
     args = parser.parse_args()
 
-    config = ServiceConfig(host=args.host, port=args.port, video_port=args.video_port)
+    config = ServiceConfig(
+        host=args.host,
+        port=args.port,
+        video_port=args.video_port,
+        swarm_backfill_port=args.swarm_backfill_port,
+    )
     if args.command == "start":
         result = start_project365_services(config)
         print(_human_status(result))
@@ -196,23 +226,87 @@ def start_video_memory_review(config: ServiceConfig) -> dict[str, Any]:
     }
 
 
+def start_swarm_backfill_review(config: ServiceConfig) -> dict[str, Any]:
+    config.runtime_dir.mkdir(parents=True, exist_ok=True)
+    managed = _pid_record(config.swarm_backfill_pid_path)
+    if managed and _pid_running(int(managed["pid"])):
+        return {
+            "status": "running",
+            "running": True,
+            "pid": int(managed["pid"]),
+            "url": managed.get("url", config.swarm_backfill_url),
+            "message": "Swarm missing-photo review is already running.",
+        }
+
+    existing = _project_server_pids(
+        port=config.swarm_backfill_port,
+        host=config.host,
+        include_any_project_server=True,
+        server_scripts=(SWARM_BACKFILL_SERVER_SCRIPT,),
+        page_marker="Swarm representative-photo review",
+    )
+    if existing:
+        pid = existing[0]
+        _write_swarm_backfill_pid_record(config, pid)
+        return {
+            "status": "running",
+            "running": True,
+            "pid": pid,
+            "url": config.swarm_backfill_url,
+            "message": "Swarm missing-photo review was already running and is now tracked.",
+        }
+
+    command = _swarm_backfill_review_command(config)
+    with config.swarm_backfill_log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n\n=== Swarm backfill review start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        log.flush()
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    try:
+        _wait_for_swarm_backfill_review(config, process)
+    except RuntimeError:
+        _terminate_process_group(process.pid)
+        _remove_pid_record(config.swarm_backfill_pid_path)
+        raise
+    _write_swarm_backfill_pid_record(config, process.pid)
+    return {
+        "status": "started",
+        "running": True,
+        "pid": process.pid,
+        "url": config.swarm_backfill_url,
+        "log": str(config.swarm_backfill_log_path),
+        "message": "Swarm missing-photo review started.",
+    }
+
+
 def start_project365_services(config: ServiceConfig) -> dict[str, Any]:
     control = start_control_panel(config)
+    started_services = [(control, config.pid_path)]
     try:
         video = start_video_memory_review(config)
+        started_services.append((video, config.video_pid_path))
+        swarm_backfill = start_swarm_backfill_review(config)
     except Exception:
-        if control.get("status") == "started" and control.get("pid"):
-            _terminate_process_group(int(control["pid"]))
-            _remove_pid_record(config.pid_path)
+        for item, pid_path in reversed(started_services):
+            if item.get("status") == "started" and item.get("pid"):
+                _terminate_process_group(int(item["pid"]))
+                _remove_pid_record(pid_path)
         raise
-    services = {"control": control, "video": video}
+    services = {"control": control, "video": video, "swarm_backfill": swarm_backfill}
     running = all(bool(item.get("running")) for item in services.values())
     started = any(item.get("status") == "started" for item in services.values())
     return {
         "status": "started" if running and started else "running" if running else "partial",
         "running": running,
         "services": services,
-        "message": "Project365 control panel and video memory review are running."
+        "message": "Project365 control panel, video memory review, and Swarm missing-photo review are running."
         if running
         else "Only some Project365 services are running.",
     }
@@ -220,7 +314,7 @@ def start_project365_services(config: ServiceConfig) -> dict[str, Any]:
 
 def stop_project365_servers(config: ServiceConfig) -> dict[str, Any]:
     managed_pids: list[int] = []
-    for path in (config.pid_path, config.video_pid_path):
+    for path in (config.pid_path, config.video_pid_path, config.swarm_backfill_pid_path):
         managed = _pid_record(path)
         if managed and _pid_running(int(managed["pid"])):
             managed_pids.append(int(managed["pid"]))
@@ -233,6 +327,15 @@ def stop_project365_servers(config: ServiceConfig) -> dict[str, Any]:
                 include_any_project_server=True,
                 server_scripts=(VIDEO_SERVER_SCRIPT,),
                 page_marker="Project365 Video Memory Review",
+            )
+        )
+        | set(
+            _project_server_pids(
+                port=config.swarm_backfill_port,
+                host=config.host,
+                include_any_project_server=True,
+                server_scripts=(SWARM_BACKFILL_SERVER_SCRIPT,),
+                page_marker="Swarm representative-photo review",
             )
         )
     )
@@ -257,6 +360,7 @@ def stop_project365_servers(config: ServiceConfig) -> dict[str, Any]:
 
     _remove_pid_record(config.pid_path)
     _remove_pid_record(config.video_pid_path)
+    _remove_pid_record(config.swarm_backfill_pid_path)
     return {
         "status": "stopped" if stopped and not failed else "not_running" if not stopped and not failed else "partial",
         "running": False,
@@ -310,16 +414,41 @@ def video_service_status(config: ServiceConfig) -> dict[str, Any]:
     }
 
 
+def swarm_backfill_service_status(config: ServiceConfig) -> dict[str, Any]:
+    managed = _pid_record(config.swarm_backfill_pid_path)
+    managed_pid = int(managed["pid"]) if managed and _pid_running(int(managed["pid"])) else None
+    detected = _project_server_pids(
+        port=config.swarm_backfill_port,
+        host=config.host,
+        include_any_project_server=True,
+        server_scripts=(SWARM_BACKFILL_SERVER_SCRIPT,),
+        page_marker="Swarm representative-photo review",
+    )
+    running = bool(managed_pid or detected)
+    return {
+        "status": "running" if running else "stopped",
+        "running": running,
+        "pid": managed_pid,
+        "detected_pids": detected,
+        "url": managed.get("url", config.swarm_backfill_url) if managed else config.swarm_backfill_url,
+        "log": str(config.swarm_backfill_log_path),
+        "message": "Swarm missing-photo review is running."
+        if running
+        else "Swarm missing-photo review is stopped.",
+    }
+
+
 def project365_services_status(config: ServiceConfig) -> dict[str, Any]:
     control = service_status(config)
     video = video_service_status(config)
-    services = {"control": control, "video": video}
+    swarm_backfill = swarm_backfill_service_status(config)
+    services = {"control": control, "video": video, "swarm_backfill": swarm_backfill}
     running_count = sum(bool(item.get("running")) for item in services.values())
     return {
         "status": "running" if running_count == len(services) else "partial" if running_count else "stopped",
         "running": running_count == len(services),
         "services": services,
-        "message": "Project365 control panel and video memory review are running."
+        "message": "Project365 control panel, video memory review, and Swarm missing-photo review are running."
         if running_count == len(services)
         else "Only some Project365 services are running."
         if running_count
@@ -349,6 +478,19 @@ def _video_memory_review_command(config: ServiceConfig) -> list[str]:
         config.host,
         "--port",
         str(config.video_port),
+    ]
+
+
+def _swarm_backfill_review_command(config: ServiceConfig) -> list[str]:
+    return [
+        sys.executable,
+        str(PROJECT_ROOT / SWARM_BACKFILL_SERVER_SCRIPT),
+        "--source",
+        str(PROJECT_ROOT / "Source Data" / "Swarm Data Export"),
+        "--state-dir",
+        str(PROJECT_ROOT / "Project365Canonical" / "swarm_dayone_backfill"),
+        "--port",
+        str(config.swarm_backfill_port),
     ]
 
 
@@ -382,6 +524,32 @@ def _wait_for_video_memory_review(
     )
 
 
+def _wait_for_swarm_backfill_review(
+    config: ServiceConfig,
+    process: subprocess.Popen[Any],
+    timeout_seconds: float = 30.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    required_keys = {"total", "pending", "selected", "skipped"}
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Swarm missing-photo review exited early. Check {config.swarm_backfill_log_path}."
+            )
+        try:
+            with urllib.request.urlopen(config.swarm_backfill_summary_url, timeout=20) as response:
+                summary = json.loads(response.read().decode("utf-8"))
+            if isinstance(summary, dict) and required_keys.issubset(summary):
+                return
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        time.sleep(0.2)
+    raise RuntimeError(
+        "Swarm missing-photo review did not respond at "
+        f"{config.swarm_backfill_url}. Check {config.swarm_backfill_log_path}."
+    )
+
+
 def _pid_record(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -401,6 +569,17 @@ def _write_video_pid_record(config: ServiceConfig, pid: int) -> None:
         config.video_port,
         config.video_url,
         config.video_log_path,
+    )
+
+
+def _write_swarm_backfill_pid_record(config: ServiceConfig, pid: int) -> None:
+    _write_service_pid_record(
+        config.swarm_backfill_pid_path,
+        pid,
+        config.host,
+        config.swarm_backfill_port,
+        config.swarm_backfill_url,
+        config.swarm_backfill_log_path,
     )
 
 
@@ -517,6 +696,8 @@ def _is_project365_server_command(
     if "python" not in lowered:
         return False
     scripts = server_scripts or (SERVER_SCRIPTS if allow_standalone else ("project365_control_app.py",))
+    if VIDEO_SERVER_SCRIPT in command and "serve" not in command.split():
+        return False
     return any(script in command for script in scripts)
 
 
@@ -639,7 +820,11 @@ def _human_status(result: dict[str, Any]) -> str:
     lines = [str(result.get("message") or result.get("status") or "")]
     services = result.get("services")
     if isinstance(services, dict):
-        for key, label in (("control", "Control"), ("video", "Video")):
+        for key, label in (
+            ("control", "Control"),
+            ("video", "Video"),
+            ("swarm_backfill", "Swarm missing-photo review"),
+        ):
             item = services.get(key)
             if not isinstance(item, dict):
                 continue

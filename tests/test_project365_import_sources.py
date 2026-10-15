@@ -53,6 +53,20 @@ class ImportSourceSetupTests(unittest.TestCase):
             archive.write_bytes(b"test")
             self.assertTrue(sources.status(root, config)["sources"]["project365"]["ready"])
 
+    def test_swarm_export_is_ready_for_review_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Source Data"
+            config = Path(temporary) / "runtime" / "import_sources.json"
+            export = root / "Swarm Data Export" / "snapshot"
+            (export / "pix").mkdir(parents=True)
+            (export / "checkins1.json").write_text("[]", encoding="utf-8")
+
+            state = sources.status(root, config)["sources"]["swarm"]
+
+            self.assertTrue(state["ready"])
+            self.assertEqual(state["capability"], "review_tools")
+            self.assertIn("review", state["detail"].lower())
+
     def test_configured_empty_disables_existing_without_deleting_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Source Data"

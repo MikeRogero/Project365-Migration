@@ -23,6 +23,52 @@ import project365_original_reference_pipeline as pipeline
 
 
 class Project365OriginalPickerTests(unittest.TestCase):
+    def test_saved_estimate_list_changes_restart_at_oldest_result(self) -> None:
+        self.assertIn('if (options.startAtOldest) return "";', picker.CROP_HTML)
+        self.assertIn(
+            'return loadEntries("", {...options, startAtOldest: true});',
+            picker.CROP_HTML,
+        )
+        self.assertIn(
+            'const estimatedBody = await fetchJson(cropEntriesUrl("estimated", ""));',
+            picker.CROP_HTML,
+        )
+        self.assertIn(
+            'const startAtOldest = document.getElementById("cropFilter").value === "estimated";',
+            picker.CROP_HTML,
+        )
+        self.assertIn(
+            'loadEntries("", {startAtOldest});',
+            picker.CROP_HTML,
+        )
+        self.assertIn(
+            'const chronologicalSelection = options.startAtOldest ? state.entries[0] : null;',
+            picker.CROP_HTML,
+        )
+        self.assertIn(
+            'const selected = chronologicalSelection',
+            picker.CROP_HTML,
+        )
+
+    def test_crop_html_prefetches_next_window_and_photo_near_month_boundary(self) -> None:
+        self.assertIn("cropWindowPrefetch: null", picker.CROP_HTML)
+        self.assertIn("cropEntryPrefetches: new Map()", picker.CROP_HTML)
+        self.assertIn("cropImagePrefetches: new Map()", picker.CROP_HTML)
+        self.assertIn("function scheduleCropBoundaryPrefetch()", picker.CROP_HTML)
+        self.assertIn("if (remainingAfterCurrent > 3) return;", picker.CROP_HTML)
+        self.assertIn("const nextAnchorMonth = state.cropWindowMonths[1] || \"\";", picker.CROP_HTML)
+        self.assertIn("function fetchCropEntriesWindow(cropFilter, anchorMonth)", picker.CROP_HTML)
+        self.assertIn("function prefetchCropEntryDetail(entry)", picker.CROP_HTML)
+        self.assertIn("function fetchCropEntryDetail(entryId, candidatePath = \"\")", picker.CROP_HTML)
+        self.assertIn("state.currentEntry = await fetchCropEntryDetail(entryId, candidatePath);", picker.CROP_HTML)
+        self.assertIn('preloadCropEntryImages(detail, entry.candidate_path || "");', picker.CROP_HTML)
+        self.assertIn("function adjustCropWindowPrefetchAfterSave(savedEntry, cropFilter)", picker.CROP_HTML)
+        self.assertIn("totalCount: state.cropTotalCount", picker.CROP_HTML)
+        self.assertIn("const responsePredatesSave =", picker.CROP_HTML)
+        self.assertIn("adjustCropWindowPrefetchAfterSave(savedSummary, cropFilter);", picker.CROP_HTML)
+        self.assertIn("pending_count: Number(state.pendingCropCommits?.pending_count || 0) + 1", picker.CROP_HTML)
+        self.assertIn("scheduleCropBoundaryPrefetch();", picker.CROP_HTML)
+
     def test_crop_month_window_returns_anchor_and_next_populated_month(self) -> None:
         entries = [
             {"entry_id": "project365:2016-10-31", "entry_date": "2016-10-31"},
@@ -6199,8 +6245,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('updatedEntry.status === "rejected"', picker.PICKER_HTML)
 
     def test_crop_html_exposes_separate_crop_confirmation_controls(self) -> None:
-        self.assertIn("Crop confirmation", picker.CROP_HTML)
-        self.assertIn('<header>\n  <a class="control-panel-link" href="/?step=crop_confirmation" title="Return to the Project365 control panel">Project365 Control Panel</a>\n  <h1>Crop confirmation</h1>', picker.CROP_HTML)
+        self.assertIn("Crop workbench", picker.CROP_HTML)
+        self.assertIn('<header>\n  <a class="control-panel-link" href="/?step=crop_confirmation" title="Return to the Project365 control panel">Project365 Control Panel</a>\n  <h1>Crop workbench</h1>', picker.CROP_HTML)
         self.assertIn("Original Project365 target", picker.CROP_HTML)
         self.assertIn("Identified original", picker.CROP_HTML)
         self.assertIn("grid-template-columns: minmax(220px, 320px) minmax(0, 1fr)", picker.CROP_HTML)
@@ -6216,7 +6262,7 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("crop_estimate_batch", picker.CROP_HTML)
         self.assertIn("function shouldPreferSavedEstimateFilter(cropFilter, job)", picker.CROP_HTML)
         self.assertIn("function shouldProbePersistedSavedEstimateFilter(cropFilter, body)", picker.CROP_HTML)
-        self.assertIn('const estimatedBody = await fetchJson(cropEntriesUrl("estimated", anchorMonth));', picker.CROP_HTML)
+        self.assertIn('const estimatedBody = await fetchJson(cropEntriesUrl("estimated", ""));', picker.CROP_HTML)
         self.assertIn("filterControl.value = \"estimated\";", picker.CROP_HTML)
         self.assertIn("Number(body?.total_count || 0) === 0", picker.CROP_HTML)
         self.assertIn("function shouldFallBackToAllForDirectCropScope(cropFilter, body)", picker.CROP_HTML)
@@ -6249,6 +6295,16 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('id="cropRotationSlider"', picker.CROP_HTML)
         self.assertIn('min="-15" max="15" step="0.1"', picker.CROP_HTML)
         self.assertIn('id="cropRotationValue"', picker.CROP_HTML)
+        self.assertIn('id="resetCropRotationButton"', picker.CROP_HTML)
+        self.assertIn('class="icon-control rotation-reset-control"', picker.CROP_HTML)
+        self.assertIn('title="Reset rotation to 0°"', picker.CROP_HTML)
+        self.assertIn('aria-label="Reset rotation to 0 degrees"', picker.CROP_HTML)
+        self.assertIn('disabled>⟲</button>', picker.CROP_HTML)
+        self.assertIn('.rotation-reset-control {\n  width: 26px;', picker.CROP_HTML)
+        self.assertLess(
+            picker.CROP_HTML.index('id="cropRotationSlider"'),
+            picker.CROP_HTML.index('id="resetCropRotationButton"'),
+        )
         self.assertIn('id="rotateQuarterTurnButton"', picker.CROP_HTML)
         self.assertIn('id="cropBox"', picker.CROP_HTML)
         self.assertIn('id="cropResizeHandle"', picker.CROP_HTML)
@@ -6426,6 +6482,8 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn("function rotateCropDraft(rotationDegrees)", picker.CROP_HTML)
         self.assertIn("function rotateCropDraftByQuarterTurn()", picker.CROP_HTML)
         self.assertIn("function fineRotateCropDraft(offsetDegrees)", picker.CROP_HTML)
+        self.assertIn('resetButton.disabled = rotation === 0;', picker.CROP_HTML)
+        self.assertIn('document.getElementById("resetCropRotationButton").onclick = () => rotateCropDraft(0);', picker.CROP_HTML)
         self.assertIn("rotation_degrees", picker.CROP_HTML)
         self.assertIn("function cropExtendsBeyondImage(crop)", picker.CROP_HTML)
         self.assertIn("-normalizeRotationDegrees(crop.rotation_degrees)", picker.CROP_HTML)
@@ -6453,23 +6511,23 @@ class Project365OriginalPickerTests(unittest.TestCase):
         self.assertIn('const existingCrop = state.cropDraft ? {...state.cropDraft} : {};', picker.CROP_HTML)
         self.assertIn('document.getElementById("cropStatus").textContent = "Estimating crop and rotation."', picker.CROP_HTML)
         self.assertIn("crop: existingCrop", picker.CROP_HTML)
-        self.assertIn("Estimated crop loaded as a draft. Press Save crop to stage it.", picker.CROP_HTML)
+        self.assertIn("Estimated crop loaded as a draft. Press Save crop to apply it.", picker.CROP_HTML)
         self.assertIn("function shouldPreserveEstimatedCropOnReset()", picker.CROP_HTML)
         self.assertIn('preserve_estimate: preserveEstimate', picker.CROP_HTML)
         self.assertIn("Saved estimate restored. Adjust it if needed.", picker.CROP_HTML)
-        self.assertIn("const selected = boundarySelection", picker.CROP_HTML)
+        self.assertIn("const selected = chronologicalSelection", picker.CROP_HTML)
         self.assertIn("|| cropEntryById(requested, options.preferredCandidatePath || state.selectedCandidatePath)", picker.CROP_HTML)
         self.assertIn("function cropEntryAfter(entryId)", picker.CROP_HTML)
         self.assertIn("function ensureOpenCropGroup()", picker.CROP_HTML)
         self.assertIn("function hasOpenVisibleCropMonth()", picker.CROP_HTML)
         self.assertIn("rememberOpenGroups(cropEntryById(state.selectedEntryId) || state.entries[0]);", picker.CROP_HTML)
         self.assertIn("if (collection.has(key) && element) element.open = true;", picker.CROP_HTML)
-        self.assertIn("fetchJson(cropEntriesUrl(cropFilter, anchorMonth))", picker.CROP_HTML)
-        self.assertIn('fetchJson(`/api/crop-entry/', picker.CROP_HTML)
+        self.assertIn("fetchCropEntriesWindow(cropFilter, anchorMonth)", picker.CROP_HTML)
+        self.assertIn("fetchCropEntryDetail(entryId, candidatePath)", picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop"', picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop-reset"', picker.CROP_HTML)
         self.assertIn('fetchJson("/api/crop-suggestion"', picker.CROP_HTML)
-        self.assertIn("Estimated crop loaded as a draft. Press Save crop to stage it.", picker.CROP_HTML)
+        self.assertIn("Estimated crop loaded as a draft. Press Save crop to apply it.", picker.CROP_HTML)
         self.assertIn("function resizeCropDraft(size)", picker.CROP_HTML)
         self.assertIn("}, {allowOverflow: true});", picker.CROP_HTML)
         self.assertIn('document.getElementById("cropSizeSlider").oninput = event => resizeCropDraft(event.target.value);', picker.CROP_HTML)

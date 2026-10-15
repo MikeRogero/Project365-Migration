@@ -25,7 +25,7 @@ SOURCE_LABELS = {
 SOURCE_CAPABILITIES = {
     "project365": "import",
     "facebook": "dayone_package",
-    "swarm": "unavailable",
+    "swarm": "review_tools",
     "x_twitter": "stage_for_review",
     "instagram": "unavailable",
 }
@@ -70,7 +70,12 @@ def status(root: Path, settings_path: Path) -> dict[str, object]:
             except ValueError as error:
                 detail = str(error)
         elif key == "swarm":
-            detail = "Drop the Swarm export here. The importer is not built yet."
+            try:
+                resolve_swarm(folder)
+                ready = True
+                detail = "Swarm export found. Review missing photos, photo order, crops, and People tags."
+            except ValueError as error:
+                detail = str(error)
         else:
             detail = "Drop the Instagram export here. The importer is not built yet."
         items[key] = {
@@ -129,4 +134,17 @@ def resolve_x(folder: Path) -> Path:
         raise ValueError("Drop an extracted X archive containing data/tweets.js here.")
     if len(candidates) != 1:
         raise ValueError("Found multiple X archives; choose one in Advanced.")
+    return candidates[0]
+
+
+def resolve_swarm(folder: Path) -> Path:
+    """Find exactly one extracted Swarm export containing check-ins and pix/."""
+    candidates = _candidates(
+        folder,
+        lambda root: bool(list(root.glob("checkins*.json"))) and (root / "pix").is_dir(),
+    )
+    if not candidates:
+        raise ValueError("Drop an extracted Swarm export containing checkins JSON and pix/ here.")
+    if len(candidates) != 1:
+        raise ValueError("Found multiple Swarm exports; keep one export in this folder.")
     return candidates[0]

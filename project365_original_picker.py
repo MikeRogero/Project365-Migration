@@ -4965,6 +4965,13 @@ def create_handler(state: PickerState) -> type[BaseHTTPRequestHandler]:
                     self._send_json(state.summary())
                 elif parsed.path == "/api/batches":
                     self._send_json(state.batches())
+                elif parsed.path == "/api/crop-providers":
+                    from project365_crop_workbench import Project365CropProvider
+
+                    self._send_json({
+                        "default_provider": "project365",
+                        "providers": [Project365CropProvider.descriptor()],
+                    })
                 elif parsed.path == "/api/entries":
                     query = urllib.parse.parse_qs(parsed.query)
                     status = query.get("status", ["all"])[0]
@@ -12192,7 +12199,7 @@ CROP_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Project365 crop confirmation</title>
+<title>Crop workbench</title>
 <style>
 :root {
   color-scheme: light;
@@ -12536,6 +12543,11 @@ button.subtle-danger:hover {
   font-size: 16px;
   line-height: 1;
 }
+.rotation-reset-control {
+  width: 26px;
+  height: 26px;
+  font-size: 14px;
+}
 .minimal-crop-control {
   min-height: 34px;
   padding: 6px 7px;
@@ -12865,11 +12877,15 @@ button.subtle-danger:hover {
 <body>
 <header>
   <a class="control-panel-link" href="/?step=crop_confirmation" title="Return to the Project365 control panel">Project365 Control Panel</a>
-  <h1>Crop confirmation</h1>
+  <h1>Crop workbench</h1>
 </header>
 <main>
 	  <aside class="sidebar">
 	    <div class="sidebar-controls">
+	      <label>
+	        Photo source
+	        <select id="cropProvider"></select>
+	      </label>
 	      <label>
 	        Crop list
 	        <select id="cropFilter">
@@ -12933,38 +12949,39 @@ button.subtle-danger:hover {
             <input id="cropRotationSlider" type="range" min="-15" max="15" step="0.1" value="0">
             <output id="cropRotationValue">0°</output>
           </label>
+          <button id="resetCropRotationButton" class="icon-control rotation-reset-control" type="button" title="Reset rotation to 0°" aria-label="Reset rotation to 0 degrees" disabled>⟲</button>
         </div>
         <div class="control-group item-actions">
           <button id="previousCropEntryButton" title="Shortcut: Left arrow">Previous entry (Left)</button>
           <button id="nextCropEntryButton" title="Shortcut: Right arrow">Next entry (Right)</button>
-          <button id="suggestCropButton" title="Shortcut: e. Estimate crop and rotation">Estimate crop (e)</button>
+          <button id="suggestCropButton" data-capability="estimate" title="Shortcut: e. Estimate crop and rotation">Estimate crop (e)</button>
           <button id="resetCropButton">Reset crop</button>
           <button id="saveCropButton" class="primary" title="Shortcut: Return. Save crop offsets to staging">Save crop (Return)</button>
-          <button id="commitCropButton" title="Commit staged crop-window changes to the canonical database">Commit crop changes <span id="pendingCropCommitCount" class="pending-count">0 pending</span></button>
+          <button id="commitCropButton" data-capability="commit" title="Commit staged crop-window changes to the canonical database">Commit crop changes <span id="pendingCropCommitCount" class="pending-count">0 pending</span></button>
         </div>
       </div>
     </div>
     <div id="compare" class="compare">
       <div class="photo-pane target-pane">
         <div class="photo-title">
-          <strong>Original Project365 target</strong>
+          <strong id="referencePaneTitle">Original Project365 target</strong>
           <span id="targetFacts"></span>
           <span id="targetPeople"></span>
         </div>
-        <div class="photo-frame"><img id="targetImage" alt=""></div>
+        <div id="referenceImageFrame" class="photo-frame"><img id="targetImage" alt=""></div>
         <div class="crop-preview">
           <strong>Selected crop</strong>
           <canvas id="cropPreviewCanvas" width="320" height="320"></canvas>
           <div class="crop-preview-actions">
-            <button id="rejectOriginalButton" class="subtle-danger" title="Stage rejection of this original; commit to return the entry to original-photo matching">Reject original</button>
-            <label title="Private tag on all working-copy photos for this diary entry; shortcut P"><input id="privateCheckbox" type="checkbox" disabled> Private entry (P)</label>
+            <button id="rejectOriginalButton" class="subtle-danger" data-capability="reject" title="Stage rejection of this original; commit to return the entry to original-photo matching">Reject original</button>
+            <label data-capability="private" title="Private tag on all working-copy photos for this diary entry; shortcut P"><input id="privateCheckbox" type="checkbox" disabled> Private entry (P)</label>
             <span id="privateStatus" class="crop-private-status"></span>
           </div>
         </div>
       </div>
       <div class="photo-pane original-pane">
         <div class="photo-title">
-          <strong>Identified original</strong>
+          <strong id="candidatePaneTitle">Identified original</strong>
           <span id="originalFacts"></span>
         </div>
         <div class="photo-frame">
@@ -12983,6 +13000,9 @@ button.subtle-danger:hover {
 </main>
 <script>
 const state = {
+  cropProvider: "project365",
+  cropProviders: [],
+  cropProviderDescriptor: null,
   entries: [],
 	  selectedBatchId: "",
 	  selectedEntryId: "",
@@ -13006,31 +13026,92 @@ const state = {
 	    cropWindowMonths: [],
 	    cropWindowPreviousMonth: "",
 	    cropWindowNextMonth: "",
+	    cropTotalCount: 0,
+	    cropWindowPrefetch: null,
+	    cropEntryPrefetches: new Map(),
+	    cropImagePrefetches: new Map(),
 		  openYears: new Set(),
 	  openMonths: new Set()
 	};
 
-async function fetchJson(url, options) {
-  const response = await fetch(url, options);
+async function fetchJson(url, options = {}) {
+  const requestUrl = new URL(url, window.location.origin);
+  const nextOptions = {...options};
+  if (!requestUrl.pathname.endsWith("/crop-providers")) {
+    const params = requestUrl.searchParams;
+    params.set("provider", state.cropProvider);
+    if (nextOptions.body && typeof nextOptions.body === "string") {
+      const payload = JSON.parse(nextOptions.body);
+      payload.provider = state.cropProvider;
+      nextOptions.body = JSON.stringify(payload);
+    } else if (String(nextOptions.method || "GET").toUpperCase() !== "GET") {
+      nextOptions.headers = {"content-type": "application/json", ...(nextOptions.headers || {})};
+      nextOptions.body = JSON.stringify({provider: state.cropProvider});
+    }
+  }
+  const response = await fetch(`${requestUrl.pathname}${requestUrl.search}`, nextOptions);
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || response.statusText);
   return body;
+}
+
+function cropProviderCapability(name) {
+  return Boolean(state.cropProviderDescriptor?.capabilities?.[name]);
+}
+
+function applyCropProviderDescriptor(provider) {
+  state.cropProviderDescriptor = provider;
+  const filter = document.getElementById("cropFilter");
+  const previousFilter = filter.value;
+  filter.replaceChildren(...(provider.filters || []).map(item =>
+    new Option(item.label || item.id, item.id)
+  ));
+  filter.value = [...filter.options].some(option => option.value === previousFilter)
+    ? previousFilter : filter.options[0]?.value || "all";
+  document.querySelectorAll("[data-capability]").forEach(element => {
+    element.hidden = !Boolean(provider.capabilities?.[element.dataset.capability]);
+  });
+  document.getElementById("referencePaneTitle").textContent = provider.labels?.reference || "Reference";
+  document.getElementById("candidatePaneTitle").textContent = provider.labels?.candidate || "Crop source";
+  document.getElementById("referenceImageFrame").hidden = !provider.capabilities?.reference;
+  document.getElementById("saveCropButton").title = provider.save_mode === "staged"
+    ? "Shortcut: Return. Save crop offsets to staging"
+    : "Shortcut: Return. Save and render this crop";
+  updatePendingCropCommitControl();
+}
+
+async function loadCropProviders() {
+  const body = await fetchJson("/api/crop-providers");
+  state.cropProviders = body.providers || [];
+  const requested = new URLSearchParams(window.location.search).get("provider")
+    || body.default_provider || "project365";
+  const provider = state.cropProviders.find(item => item.id === requested)
+    || state.cropProviders.find(item => item.id === body.default_provider)
+    || state.cropProviders[0];
+  if (!provider) throw new Error("No crop providers are available.");
+  state.cropProvider = provider.id;
+  const select = document.getElementById("cropProvider");
+  select.replaceChildren(...state.cropProviders.map(item => new Option(item.label || item.id, item.id)));
+  select.value = state.cropProvider;
+  applyCropProviderDescriptor(provider);
 }
 
 async function loadEntries(preferredEntryId = "", options = {}) {
   const filterControl = document.getElementById("cropFilter");
   let cropFilter = filterControl.value;
   const anchorMonth = resolveCropWindowAnchor(preferredEntryId, options);
-  let body = await fetchJson(cropEntriesUrl(cropFilter, anchorMonth));
+  let body = await fetchCropEntriesWindow(cropFilter, anchorMonth);
   state.cropEstimateBatch = body.crop_estimate_batch || {};
   if (shouldPreferSavedEstimateFilter(cropFilter, state.cropEstimateBatch)) {
+    clearCropPrefetches();
     filterControl.value = "estimated";
     cropFilter = "estimated";
-    return loadEntries(preferredEntryId, options);
+    return loadEntries("", {...options, startAtOldest: true});
   }
   if (shouldProbePersistedSavedEstimateFilter(cropFilter, body)) {
-    const estimatedBody = await fetchJson(cropEntriesUrl("estimated", anchorMonth));
+    const estimatedBody = await fetchJson(cropEntriesUrl("estimated", ""));
     if ((estimatedBody.entries || []).length) {
+      clearCropPrefetches();
       filterControl.value = "estimated";
       cropFilter = "estimated";
       body = estimatedBody;
@@ -13041,6 +13122,7 @@ async function loadEntries(preferredEntryId = "", options = {}) {
   if (shouldFallBackToAllForDirectCropScope(cropFilter, body)) {
     const allBody = await fetchJson(cropEntriesUrl("all", anchorMonth));
     if ((allBody.entries || []).length) {
+      clearCropPrefetches();
       filterControl.value = "all";
       cropFilter = "all";
       body = allBody;
@@ -13055,6 +13137,7 @@ async function loadEntries(preferredEntryId = "", options = {}) {
   state.cropWindowAnchorMonth = state.cropWindowMonths[0] || anchorMonth;
   state.cropWindowPreviousMonth = body.previous_month || "";
   state.cropWindowNextMonth = body.next_month || "";
+  state.cropTotalCount = Number(body.total_count || 0);
   state.pendingCropCommits = body.pending_crop_commits || {pending_count: 0};
   updatePendingCropCommitControl();
   const missingCount = state.entries.filter(entry => !entry.crop_has_crop).length;
@@ -13070,13 +13153,15 @@ async function loadEntries(preferredEntryId = "", options = {}) {
     renderEmpty();
     return;
   }
-  const lastEntryId = window.localStorage.getItem("project365CropLastEntryId") || "";
+  const lastEntryId = window.localStorage.getItem(cropLastEntryStorageKey()) || "";
   const requested = preferredEntryId || state.selectedEntryId || lastEntryId;
   const anchorEntries = state.entries.filter(entry => cropMonth(entry.entry_date) === state.cropWindowAnchorMonth);
   const boundarySelection = options.selectLastInAnchorMonth
     ? anchorEntries[anchorEntries.length - 1]
     : options.selectFirstInAnchorMonth ? anchorEntries[0] : null;
-  const selected = boundarySelection
+  const chronologicalSelection = options.startAtOldest ? state.entries[0] : null;
+  const selected = chronologicalSelection
+    || boundarySelection
     || cropEntryById(requested, options.preferredCandidatePath || state.selectedCandidatePath)
     || cropEntryAfter(preferredEntryId || state.selectedEntryId || lastEntryId)
     || state.entries[0];
@@ -13087,6 +13172,7 @@ async function loadEntries(preferredEntryId = "", options = {}) {
   if (options.preserveCurrentEntry && state.currentEntry?.entry_id === state.selectedEntryId
       && state.selectedCandidate?.path === state.selectedCandidatePath) {
     updateCropNavigationState();
+    scheduleCropBoundaryPrefetch();
     return;
   }
   await loadEntry(selected.entry_id, selected.candidate_path);
@@ -13094,6 +13180,7 @@ async function loadEntries(preferredEntryId = "", options = {}) {
 
 function cropEntriesUrl(cropFilter, anchorMonth = "") {
   const params = new URLSearchParams({crop_filter: cropFilter});
+  params.set("provider", state.cropProvider);
   for (const entryDate of state.cropEntryDates) params.append("entry_date", entryDate);
   if (state.cropStartDate) params.set("start_date", state.cropStartDate);
   if (state.cropEndDate) params.set("end_date", state.cropEndDate);
@@ -13105,12 +13192,133 @@ function cropEntriesUrl(cropFilter, anchorMonth = "") {
   return `/api/crop-entries?${params.toString()}`;
 }
 
+async function fetchCropEntriesWindow(cropFilter, anchorMonth) {
+  const url = cropEntriesUrl(cropFilter, anchorMonth);
+  const prefetched = state.cropWindowPrefetch;
+  if (prefetched?.key === url) {
+    state.cropWindowPrefetch = null;
+    const body = await prefetched.promise;
+    if (body) {
+      return {...body, pending_crop_commits: state.pendingCropCommits};
+    }
+  }
+  return fetchJson(url);
+}
+
+function scheduleCropBoundaryPrefetch() {
+  const nextAnchorMonth = state.cropWindowMonths[1] || "";
+  if (!nextAnchorMonth || !state.currentEntry) return;
+  const anchorEntries = state.entries.filter(entry => cropMonth(entry.entry_date) === state.cropWindowAnchorMonth);
+  const currentIndex = anchorEntries.findIndex(entry => entry.entry_id === state.selectedEntryId
+    && entry.candidate_path === state.selectedCandidatePath);
+  if (currentIndex < 0) return;
+  const remainingAfterCurrent = anchorEntries.length - currentIndex - 1;
+  if (remainingAfterCurrent > 3) return;
+
+  const cropFilter = document.getElementById("cropFilter").value;
+  const url = cropEntriesUrl(cropFilter, nextAnchorMonth);
+  if (state.cropWindowPrefetch?.key !== url) {
+    state.cropWindowPrefetch = {
+      key: url,
+      totalCount: state.cropTotalCount,
+      promise: fetchJson(url).catch(() => null)
+    };
+  }
+  const firstNextEntry = state.entries.find(entry => cropMonth(entry.entry_date) === nextAnchorMonth);
+  if (firstNextEntry) prefetchCropEntryDetail(firstNextEntry);
+}
+
+function cropEntryDetailUrl(entryId, candidatePath = "") {
+  const params = new URLSearchParams({candidate_path: candidatePath});
+  params.set("provider", state.cropProvider);
+  return `/api/crop-entry/${encodeURIComponent(entryId)}?${params.toString()}`;
+}
+
+function prefetchCropEntryDetail(entry) {
+  if (!entry?.entry_id) return;
+  const url = cropEntryDetailUrl(entry.entry_id, entry.candidate_path || "");
+  if (state.cropEntryPrefetches.has(url)) return;
+  state.cropEntryPrefetches.clear();
+  const promise = fetchJson(url).then(detail => {
+    preloadCropEntryImages(detail, entry.candidate_path || "");
+    return detail;
+  }).catch(() => null);
+  state.cropEntryPrefetches.set(url, promise);
+}
+
+async function fetchCropEntryDetail(entryId, candidatePath = "") {
+  const url = cropEntryDetailUrl(entryId, candidatePath);
+  const prefetched = state.cropEntryPrefetches.get(url);
+  if (prefetched) {
+    state.cropEntryPrefetches.delete(url);
+    const detail = await prefetched;
+    if (detail) return detail;
+  }
+  return fetchJson(url);
+}
+
+function preloadCropEntryImages(detail, candidatePath = "") {
+  const candidate = (detail?.candidates || []).find(item => item.path === candidatePath)
+    || (detail?.candidates || []).find(item => item.selected)
+    || detail?.candidates?.[0];
+  if (detail?.source_token && candidate?.database_confirmed_role !== "external_original_associated_photo") {
+    preloadCropImage(cropImageUrl(detail.source_token, "", ""));
+  }
+  if (candidate?.token) {
+    preloadCropImage(cropImageUrl(candidate.token, candidate.filename, candidate.path));
+  }
+}
+
+function preloadCropImage(url) {
+  if (!url || state.cropImagePrefetches.has(url)) return;
+  const image = new Image();
+  state.cropImagePrefetches.set(url, image);
+  image.onload = image.onerror = () => state.cropImagePrefetches.delete(url);
+  image.src = url;
+  while (state.cropImagePrefetches.size > 4) {
+    state.cropImagePrefetches.delete(state.cropImagePrefetches.keys().next().value);
+  }
+}
+
+function clearCropPrefetches() {
+  state.cropWindowPrefetch = null;
+  state.cropEntryPrefetches.clear();
+  state.cropImagePrefetches.clear();
+}
+
+function adjustCropWindowPrefetchAfterSave(savedEntry, cropFilter) {
+  const prefetched = state.cropWindowPrefetch;
+  if (!prefetched || !savedEntry || !["missing", "estimated"].includes(cropFilter)) return;
+  prefetched.promise = prefetched.promise.then(body => {
+    if (!body) return null;
+    const responsePredatesSave = Number(body.total_count || 0) >= Number(prefetched.totalCount || 0);
+    const entries = (body.entries || []).filter(entry => entry.entry_id !== savedEntry.entry_id
+      || entry.candidate_path !== savedEntry.candidate_path);
+    const batches = (body.estimate_batches || []).map(batch =>
+      responsePredatesSave && batch.id === savedEntry.estimate_batch_id
+        ? {...batch, count: Math.max(0, Number(batch.count || 0) - 1)}
+        : batch
+    ).filter(batch => Number(batch.count || 0) > 0);
+    return {
+      ...body,
+      entries,
+      window_count: entries.length,
+      total_count: responsePredatesSave
+        ? Math.max(0, Number(body.total_count || 0) - 1)
+        : Number(body.total_count || 0),
+      estimate_batches: batches,
+      pending_crop_commits: state.pendingCropCommits
+    };
+  });
+}
+
 function resolveCropWindowAnchor(preferredEntryId = "", options = {}) {
+  if (options.startAtOldest) return "";
   return cropMonth(options.anchorMonth)
     || cropMonth(preferredEntryId)
     || cropMonth(state.currentEntry?.entry_date)
     || cropMonth(state.selectedEntryId)
-    || cropMonth(window.localStorage.getItem("project365CropLastEntryId"))
+    || cropMonth(window.localStorage.getItem(cropLastEntryStorageKey()))
     || state.cropWindowAnchorMonth;
 }
 
@@ -13135,6 +13343,7 @@ function updateReadyBatchControl(cropFilter, batches) {
 
 let cropEstimatePollTimer = null;
 function scheduleCropEstimatePoll() {
+  if (!cropProviderCapability("estimate_batches")) return;
   if (cropEstimatePollTimer || !["queued", "running"].includes(state.cropEstimateBatch?.status)) return;
   cropEstimatePollTimer = setTimeout(pollCropEstimateProgress, 5000);
 }
@@ -13146,6 +13355,7 @@ async function pollCropEstimateProgress() {
   try {
     const job = await fetchJson(`/api/crop-estimate-batch/${encodeURIComponent(previous.id)}`);
     if (job.completed_batch_count !== previous.completed_batch_count || job.status !== previous.status) {
+      clearCropPrefetches();
       await loadEntries(state.selectedEntryId, {
         preferredCandidatePath: state.selectedCandidatePath, preserveCurrentEntry: true
       });
@@ -13171,6 +13381,7 @@ function shouldPreferSavedEstimateFilter(cropFilter, job) {
 }
 
 function shouldProbePersistedSavedEstimateFilter(cropFilter, body) {
+  if (!cropProviderCapability("estimate_batches")) return false;
   if (state.cropFilterTouched || cropFilter !== "missing") return false;
   return Number(body?.total_count || 0) === 0 && !(body?.entries || []).length;
 }
@@ -13249,8 +13460,8 @@ function cropDateScopeSummary() {
 async function loadEntry(entryId, candidatePath = "") {
   state.selectedEntryId = entryId;
   state.selectedCandidatePath = candidatePath;
-  window.localStorage.setItem("project365CropLastEntryId", entryId);
-  state.currentEntry = await fetchJson(`/api/crop-entry/${encodeURIComponent(entryId)}?candidate_path=${encodeURIComponent(candidatePath)}`);
+  window.localStorage.setItem(cropLastEntryStorageKey(), entryId);
+  state.currentEntry = await fetchCropEntryDetail(entryId, candidatePath);
   state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.path === candidatePath)
     || (state.currentEntry.candidates || []).find(candidate => candidate.selected)
     || state.currentEntry.candidates?.[0] || null;
@@ -13260,7 +13471,8 @@ async function loadEntry(entryId, candidatePath = "") {
   rememberOpenGroups(state.currentEntry);
   renderEntries();
   renderCropEditor();
-  refreshPrivateTag(entryId);
+  if (cropProviderCapability("private")) refreshPrivateTag(entryId);
+  scheduleCropBoundaryPrefetch();
 }
 
 function cropImageUrl(token, filename, path, maxSize = 0) {
@@ -13269,7 +13481,14 @@ function cropImageUrl(token, filename, path, maxSize = 0) {
   const heicPreviewSize = /\\.(heic|heif)$/.test(source) ? 2048 : 0;
   const previewSize = Math.max(0, Math.round(Number(maxSize) || heicPreviewSize));
   const base = `/image/${encodeURIComponent(token)}`;
-  return previewSize ? `${base}?max=${previewSize}` : base;
+  const params = new URLSearchParams();
+  params.set("provider", state.cropProvider);
+  if (previewSize) params.set("max", String(previewSize));
+  return `${base}?${params.toString()}`;
+}
+
+function cropLastEntryStorageKey() {
+  return `cropWorkbenchLastEntryId:${state.cropProvider}`;
 }
 
 function renderEntries() {
@@ -13444,7 +13663,7 @@ function renderCropEditor() {
     renderEmpty();
     return;
   }
-  document.getElementById("entryHeading").textContent = entry.entry_date || entry.entry_id;
+  document.getElementById("entryHeading").textContent = entry.display_title || entry.entry_date || entry.entry_id;
   updateCropStateFlag(...cropStateFlagForEntry(entry, candidate));
   document.getElementById("cropListHint").hidden = true;
   const candidatePath = document.getElementById("candidatePath");
@@ -13453,9 +13672,9 @@ function renderCropEditor() {
   const isLinkedPhoto = candidate.database_confirmed_role === "external_original_associated_photo";
   document.getElementById("targetFacts").textContent = isLinkedPhoto
     ? "Linked photo · no reference image" : formatPhotoFacts(entry.source_file_type, entry.source_byte_size, entry.source_dimensions);
-  document.getElementById("suggestCropButton").disabled = false;
+  document.getElementById("suggestCropButton").disabled = !cropProviderCapability("estimate");
   const unlinkButton = document.getElementById("rejectOriginalButton");
-  unlinkButton.disabled = false;
+  unlinkButton.disabled = !cropProviderCapability("reject");
   unlinkButton.textContent = isLinkedPhoto ? "Unlink photo" : "Reject original";
   unlinkButton.title = isLinkedPhoto
     ? "Remove this linked photo from the day when crop changes are committed"
@@ -13467,7 +13686,7 @@ function renderCropEditor() {
     candidate.dimensions
   );
   if (entry.source_token && !isLinkedPhoto) {
-    document.getElementById("targetImage").src = `/image/${entry.source_token}`;
+    document.getElementById("targetImage").src = cropImageUrl(entry.source_token, "", "");
   } else {
     document.getElementById("targetImage").removeAttribute("src");
   }
@@ -13485,7 +13704,12 @@ function renderCropEditor() {
   const cropSource = savedCropSourceLabel(candidate);
   document.getElementById("cropStatus").textContent = hasSavedCropForCandidate(candidate)
     ? `${cropSource} loaded. Adjust it if needed.`
-    : isLinkedPhoto ? "Estimate with the local vision model, or adjust the default crop." : "Adjust the default crop, estimate this crop, or run the batch estimate.";
+    : isLinkedPhoto ? "Estimate with the local vision model, or adjust the default crop."
+      : cropProviderCapability("estimate_batches")
+        ? "Adjust the default crop, estimate this crop, or run the batch estimate."
+        : cropProviderCapability("estimate")
+          ? "Adjust the default crop or estimate this crop."
+          : "Adjust the default crop.";
   document.getElementById("savedCropLabel").textContent = cropLabel(candidate);
   updateCropNavigationState();
 }
@@ -13923,14 +14147,17 @@ function updateCropSizeControl() {
 function updateCropRotationControl() {
   const slider = document.getElementById("cropRotationSlider");
   const output = document.getElementById("cropRotationValue");
+  const resetButton = document.getElementById("resetCropRotationButton");
   if (!state.cropDraft) {
     slider.disabled = true;
+    resetButton.disabled = true;
     output.textContent = "0°";
     return;
   }
   const rotation = normalizeRotationDegrees(state.cropDraft.rotation_degrees);
   slider.disabled = false;
   slider.value = rotation - quarterTurnBase(rotation);
+  resetButton.disabled = rotation === 0;
   output.textContent = formatRotationDegrees(rotation);
 }
 
@@ -14120,7 +14347,7 @@ async function estimateCropForCurrentCandidate() {
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.path === candidatePath) || state.selectedCandidate;
     state.cropDraft = result.crop;
     renderCropEditor();
-    document.getElementById("cropStatus").textContent = "Estimated crop loaded as a draft. Press Save crop to stage it.";
+    document.getElementById("cropStatus").textContent = "Estimated crop loaded as a draft. Press Save crop to apply it.";
   } catch (error) {
     document.getElementById("cropStatus").textContent = error.message;
   } finally {
@@ -14132,6 +14359,10 @@ async function saveCropForCurrentCandidate() {
   if (!state.currentEntry || !state.selectedCandidate || !state.cropDraft) return;
   const button = document.getElementById("saveCropButton");
   const nextEntry = nextEntryIdAfterCurrent();
+  const savedSummary = cropEntryById(state.selectedEntryId, state.selectedCandidatePath);
+  const wasCommitPending = Boolean(savedSummary?.crop_commit_pending);
+  const stagesCropCommit = state.cropProviderDescriptor?.save_mode === "staged"
+    && savedSummary?.crop_source_state !== "accepted_not_applied";
   const savedEntry = cropNavigationHistoryEntry(state.currentEntry, state.selectedCandidate.path);
   button.disabled = true;
   try {
@@ -14148,20 +14379,31 @@ async function saveCropForCurrentCandidate() {
     rememberCropNavigationHistory(savedEntry);
     state.selectedCandidate = (state.currentEntry.candidates || []).find(candidate => candidate.path === state.selectedCandidatePath) || state.selectedCandidate;
     state.cropDraft = savedCropForCandidate(state.selectedCandidate) || state.cropDraft;
+    if (!wasCommitPending && stagesCropCommit) {
+      state.pendingCropCommits = {
+        ...state.pendingCropCommits,
+        pending_count: Number(state.pendingCropCommits?.pending_count || 0) + 1
+      };
+      updatePendingCropCommitControl();
+    }
     renderCropEditor();
-    document.getElementById("cropStatus").textContent = "Crop offsets staged.";
+    document.getElementById("cropStatus").textContent = stagesCropCommit
+      ? "Crop offsets staged." : "Crop saved and derivative rendered.";
     const resume = consumeCropNavigationResume(state.currentEntry.entry_id);
     if (resume) {
       const filterControl = document.getElementById("cropFilter");
       filterControl.value = resume.cropFilter;
       state.cropFilterTouched = true;
       state.cropNavigationNotice = "";
-      document.getElementById("cropStatus").textContent = `Crop offsets staged. Returned to ${cropFilterLabel(resume.cropFilter)}.`;
+      document.getElementById("cropStatus").textContent = stagesCropCommit
+        ? `Crop offsets staged. Returned to ${cropFilterLabel(resume.cropFilter)}.`
+        : `Crop saved. Returned to ${cropFilterLabel(resume.cropFilter)}.`;
       await loadEntries(resume.resumeEntryId, {preferredCandidatePath: resume.resumeCandidatePath});
       return;
     }
     const cropFilter = document.getElementById("cropFilter").value;
     const advance = ["missing", "estimated"].includes(cropFilter);
+    adjustCropWindowPrefetchAfterSave(savedSummary, cropFilter);
     await loadEntries(advance ? nextEntry?.entry_id || "" : state.currentEntry.entry_id, {
       preferredCandidatePath: advance ? nextEntry?.candidate_path || "" : state.selectedCandidatePath
     });
@@ -14178,6 +14420,7 @@ async function resetCropForCurrentCandidate() {
   const preserveEstimate = shouldPreserveEstimatedCropOnReset();
   button.disabled = true;
   try {
+    clearCropPrefetches();
     state.currentEntry = await fetchJson("/api/crop-reset", {
       method: "POST",
       headers: {"content-type": "application/json"},
@@ -14192,7 +14435,7 @@ async function resetCropForCurrentCandidate() {
     renderCropEditor();
     document.getElementById("cropStatus").textContent = preserveEstimate
       ? "Saved estimate restored. Adjust it if needed."
-      : "Crop reset staged.";
+      : state.cropProviderDescriptor?.save_mode === "staged" ? "Crop reset staged." : "Crop reset.";
     await loadEntries(state.currentEntry.entry_id, {preferredCandidatePath: state.selectedCandidatePath});
   } catch (error) {
     document.getElementById("cropStatus").textContent = error.message;
@@ -14214,6 +14457,7 @@ async function commitStagedCrops() {
   button.disabled = true;
   document.getElementById("cropStatus").textContent = "Committing staged crops.";
   try {
+    clearCropPrefetches();
     const result = await fetchJson("/api/crop-commit", {method: "POST"});
     state.pendingCropCommits = {pending_count: result.remaining_count || 0};
     updatePendingCropCommitControl();
@@ -14241,6 +14485,7 @@ async function rejectOriginalForCurrentCrop() {
   button.disabled = true;
   document.getElementById("cropStatus").textContent = linked ? "Staging photo unlink." : "Staging original rejection.";
   try {
+    clearCropPrefetches();
     await fetchJson("/api/crop-reject-original", {
       method: "POST",
       headers: {"content-type": "application/json"},
@@ -14562,28 +14807,60 @@ function handleCropKeyboardShortcut(event) {
 
 document.getElementById("cropSizeSlider").oninput = event => resizeCropDraft(event.target.value);
 document.getElementById("cropRotationSlider").oninput = event => fineRotateCropDraft(event.target.value);
+document.getElementById("resetCropRotationButton").onclick = () => rotateCropDraft(0);
 document.getElementById("rotateQuarterTurnButton").onclick = rotateCropDraftByQuarterTurn;
 document.getElementById("fillColorSampleButton").onclick = toggleFillColorSampler;
 document.getElementById("minimalFitButton").onclick = minimalFitCurrentCrop;
 document.getElementById("minimalMoveButton").onclick = minimalMoveCurrentCrop;
+document.getElementById("cropProvider").onchange = async event => {
+  const provider = state.cropProviders.find(item => item.id === event.target.value);
+  if (!provider || provider.id === state.cropProvider) return;
+  state.cropProvider = provider.id;
+  state.entries = [];
+  state.selectedEntryId = "";
+  state.selectedCandidatePath = "";
+  state.currentEntry = null;
+  state.selectedCandidate = null;
+  state.cropDraft = null;
+  state.cropFilterTouched = false;
+  state.selectedBatchId = "";
+  state.pendingCropCommits = {pending_count: 0};
+  state.cropEstimateBatch = {};
+  state.cropWindowAnchorMonth = "";
+  state.cropNavigationHistory = [];
+  state.openYears.clear();
+  state.openMonths.clear();
+  clearCropPrefetches();
+  applyCropProviderDescriptor(provider);
+  const url = new URL(window.location.href);
+  url.searchParams.set("provider", state.cropProvider);
+  url.searchParams.delete("crop_filter");
+  window.history.replaceState({}, "", url);
+  await loadEntries("", {startAtOldest: document.getElementById("cropFilter").value === "estimated"});
+};
 document.getElementById("cropFilter").onchange = () => {
+  const startAtOldest = document.getElementById("cropFilter").value === "estimated";
+  clearCropPrefetches();
   state.cropFilterTouched = true;
   state.selectedBatchId = "";
   state.cropNavigationNotice = "";
   state.cropNavigationResume = null;
-  loadEntries();
+  loadEntries("", {startAtOldest});
 };
 document.getElementById("estimateBatchFilter").onchange = event => {
+  clearCropPrefetches();
   state.selectedBatchId = event.target.value;
-  loadEntries();
+  loadEntries("", {startAtOldest: true});
 };
 document.getElementById("applyCropDateScopeButton").onclick = () => {
   if (!applyCropDateScopeControls()) return;
+  clearCropPrefetches();
   state.cropNavigationNotice = "";
   state.cropNavigationResume = null;
-  loadEntries();
+  loadEntries("", {startAtOldest: document.getElementById("cropFilter").value === "estimated"});
 };
 document.getElementById("clearCropDateScopeButton").onclick = () => {
+  clearCropPrefetches();
   state.cropEntryDates = [];
   state.cropStartDate = "";
   state.cropEndDate = "";
@@ -14592,7 +14869,7 @@ document.getElementById("clearCropDateScopeButton").onclick = () => {
   state.cropNavigationResume = null;
   document.getElementById("cropStartDate").value = "";
   document.getElementById("cropEndDate").value = "";
-  loadEntries();
+  loadEntries("", {startAtOldest: document.getElementById("cropFilter").value === "estimated"});
 };
 document.getElementById("suggestCropButton").onclick = estimateCropForCurrentCandidate;
 document.getElementById("resetCropButton").onclick = resetCropForCurrentCandidate;
@@ -14661,8 +14938,9 @@ window.addEventListener("resize", positionCropBox);
 function applyInitialCropFilterFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const requested = params.get("crop_filter") || "";
-  if (!["missing", "estimated", "confirmed", "all"].includes(requested)) return;
-  document.getElementById("cropFilter").value = requested;
+  const filter = document.getElementById("cropFilter");
+  if (![...filter.options].some(option => option.value === requested)) return;
+  filter.value = requested;
   state.cropFilterTouched = true;
 }
 
@@ -14741,9 +15019,16 @@ function normalizeCropDate(value) {
   return /^\\d{4}-\\d{2}-\\d{2}$/.test(text) ? text : "";
 }
 
-applyInitialCropFilterFromUrl();
-applyInitialCropDateScopeFromUrl();
-loadEntries().catch(error => {
+async function initializeCropWorkbench() {
+  await loadCropProviders();
+  applyInitialCropFilterFromUrl();
+  applyInitialCropDateScopeFromUrl();
+  await loadEntries("", {
+    startAtOldest: document.getElementById("cropFilter").value === "estimated"
+  });
+}
+
+initializeCropWorkbench().catch(error => {
   document.getElementById("summary").textContent = error.message;
 });
 </script>
