@@ -167,11 +167,17 @@ class Project365ControlServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = service.ServiceConfig(runtime_dir=Path(temp_dir))
             config.runtime_dir.mkdir(exist_ok=True)
-            config.pid_path.write_text(json.dumps({"pid": 12345}), encoding="utf-8")
-            with mock.patch.object(service, "_pid_running", return_value=True):
-                with mock.patch.object(service, "_project_server_pids", return_value=[]):
-                    with mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate:
-                        result = service.stop_project365_servers(config)
+            service._write_service_pid_record(
+                config.pid_path, 12345, config.host, config.port,
+                config.url, config.log_path,
+            )
+            with (
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service, "_project_server_pids", side_effect=[[12345], [], [], [], []]),
+                mock.patch.object(service.os, "getpgid", return_value=12345),
+                mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
+            ):
+                result = service.stop_project365_servers(config)
 
             self.assertFalse(config.pid_path.exists())
 
@@ -182,12 +188,18 @@ class Project365ControlServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = service.ServiceConfig(runtime_dir=Path(temp_dir))
             config.runtime_dir.mkdir(exist_ok=True)
-            config.pid_path.write_text(json.dumps({"pid": 12345}), encoding="utf-8")
-            config.video_pid_path.write_text(json.dumps({"pid": 12346}), encoding="utf-8")
-            config.swarm_backfill_pid_path.write_text(json.dumps({"pid": 12347}), encoding="utf-8")
+            for path, pid, port, url, log_path in (
+                (config.pid_path, 12345, config.port, config.url, config.log_path),
+                (config.video_pid_path, 12346, config.video_port, config.video_url, config.video_log_path),
+                (config.swarm_backfill_pid_path, 12347, config.swarm_backfill_port, config.swarm_backfill_url, config.swarm_backfill_log_path),
+                (config.swarm_media_pid_path, 12348, config.swarm_media_port, f"http://{config.host}:{config.swarm_media_port}", config.swarm_media_pid_path.with_suffix(".log")),
+                (config.twitter_pid_path, 12349, config.twitter_port, f"http://{config.host}:{config.twitter_port}", config.twitter_pid_path.with_suffix(".log")),
+            ):
+                service._write_service_pid_record(path, pid, config.host, port, url, log_path)
             with (
                 mock.patch.object(service, "_pid_running", return_value=True),
-                mock.patch.object(service, "_project_server_pids", return_value=[]),
+                mock.patch.object(service, "_project_server_pids", side_effect=[[12345], [12346], [12347], [12348], [12349]]),
+                mock.patch.object(service.os, "getpgid", side_effect=[12345, 12346, 12347, 12348, 12349]),
                 mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
             ):
                 result = service.stop_project365_servers(config)
@@ -195,18 +207,20 @@ class Project365ControlServiceTests(unittest.TestCase):
             self.assertFalse(config.pid_path.exists())
             self.assertFalse(config.video_pid_path.exists())
             self.assertFalse(config.swarm_backfill_pid_path.exists())
+            self.assertFalse(config.swarm_media_pid_path.exists())
+            self.assertFalse(config.twitter_pid_path.exists())
 
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(
             terminate.call_args_list,
-            [mock.call(12345), mock.call(12346), mock.call(12347)],
+            [mock.call(12345), mock.call(12346), mock.call(12347), mock.call(12348), mock.call(12349)],
         )
 
     def test_stop_detects_unmanaged_video_server_on_video_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = service.ServiceConfig(runtime_dir=Path(temp_dir))
             with (
-                mock.patch.object(service, "_project_server_pids", side_effect=[[], [12346], []]) as detect,
+                mock.patch.object(service, "_project_server_pids", side_effect=[[], [12346], [], [], []]) as detect,
                 mock.patch.object(service, "_pid_running", return_value=True),
                 mock.patch.object(service, "_descendant_pids", return_value=[]),
                 mock.patch.object(service, "_terminate_pids", return_value=True) as terminate,
@@ -222,7 +236,7 @@ class Project365ControlServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = service.ServiceConfig(runtime_dir=Path(temp_dir))
             with (
-                mock.patch.object(service, "_project_server_pids", side_effect=[[], [], [12347]]) as detect,
+                mock.patch.object(service, "_project_server_pids", side_effect=[[], [], [12347], [], []]) as detect,
                 mock.patch.object(service, "_pid_running", return_value=True),
                 mock.patch.object(service, "_descendant_pids", return_value=[]),
                 mock.patch.object(service, "_terminate_pids", return_value=True) as terminate,
@@ -255,6 +269,7 @@ class Project365ControlServiceTests(unittest.TestCase):
                 "start_swarm_backfill_review",
                 return_value={"status": "started", "running": True, "pid": 3},
             ) as start_swarm,
+            mock.patch.object(service, "start_review_service", return_value={"status": "running", "running": True}) as start_review,
         ):
             result = service.start_project365_services(config)
 
@@ -263,6 +278,8 @@ class Project365ControlServiceTests(unittest.TestCase):
         start_control.assert_called_once_with(config)
         start_video.assert_called_once_with(config)
         start_swarm.assert_called_once_with(config)
+        self.assertEqual(start_review.call_args_list, [mock.call(config, "swarm_media"), mock.call(config, "twitter")])
+        self.assertEqual(set(result["services"]), {"control", "video", "swarm_backfill", "swarm_media", "twitter"})
 
     def test_start_project365_services_rolls_back_new_control_when_video_fails(self) -> None:
         config = service.ServiceConfig()
@@ -319,7 +336,8 @@ class Project365ControlServiceTests(unittest.TestCase):
             mock.patch.object(service, "video_service_status", return_value={"running": False}),
             mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": True}),
         ):
-            result = service.project365_services_status(config)
+            with mock.patch.object(service, "review_service_status", return_value={"running": True}):
+                result = service.project365_services_status(config)
 
         self.assertFalse(result["running"])
         self.assertEqual(result["status"], "partial")
@@ -331,10 +349,240 @@ class Project365ControlServiceTests(unittest.TestCase):
             mock.patch.object(service, "video_service_status", return_value={"running": True}),
             mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": False}),
         ):
-            result = service.project365_services_status(config)
+            with mock.patch.object(service, "review_service_status", return_value={"running": True}):
+                result = service.project365_services_status(config)
 
         self.assertFalse(result["running"])
         self.assertEqual(result["status"], "partial")
+
+    def test_review_commands_include_expected_sources_outputs_and_ports(self) -> None:
+        config = service.ServiceConfig(swarm_media_port=9879, twitter_port=9880)
+        swarm = service._review_service_spec(config, "swarm_media")
+        twitter = service._review_service_spec(config, "twitter")
+        self.assertIn("swarm_media_workflow.py", swarm["command"][1])
+        self.assertIn("--database", swarm["command"])
+        self.assertIn("9879", swarm["command"])
+        self.assertIn("twitter_dayone_workflow.py", twitter["command"][1])
+        self.assertIn("serve", twitter["command"])
+        self.assertIn("--output-dir", twitter["command"])
+        self.assertIn("9880", twitter["command"])
+
+    def test_review_start_adopts_running_server_and_records_pid(self) -> None:
+        for key in ("swarm_media", "twitter"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                config = service.ServiceConfig(runtime_dir=Path(temporary))
+                with mock.patch.object(service, "_project_server_pids", return_value=[12348]), mock.patch.object(service.subprocess, "Popen") as popen:
+                    result = service.start_review_service(config, key)
+                spec = service._review_service_spec(config, key)
+                self.assertEqual(result["status"], "running")
+                self.assertEqual(json.loads(spec["pid_path"].read_text())["pid"], 12348)
+                popen.assert_not_called()
+
+    def test_review_start_detaches_stdin_and_cleans_failed_start(self) -> None:
+        for key in ("swarm_media", "twitter"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                config = service.ServiceConfig(runtime_dir=Path(temporary))
+                process = mock.Mock(pid=12348)
+                with (
+                    mock.patch.object(service, "_project_server_pids", return_value=[]),
+                    mock.patch.object(service.subprocess, "Popen", return_value=process) as popen,
+                    mock.patch.object(service, "_wait_for_review_service", side_effect=RuntimeError("not ready")),
+                    mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "not ready"):
+                        service.start_review_service(config, key)
+                self.assertEqual(popen.call_args.kwargs["stdin"], service.subprocess.DEVNULL)
+                terminate.assert_called_once_with(12348)
+                self.assertFalse(service._review_service_spec(config, key)["pid_path"].exists())
+
+    def test_review_health_rejects_unrelated_json(self) -> None:
+        config = service.ServiceConfig()
+        process = mock.Mock()
+        process.poll.return_value = None
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"unrelated": true}'
+        for key in ("swarm_media", "twitter"):
+            with self.subTest(key=key), mock.patch.object(service.urllib.request, "urlopen", return_value=response), mock.patch.object(service.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "did not respond"):
+                    service._wait_for_review_service(config, key, process, timeout_seconds=0.01)
+
+    def test_start_rolls_back_new_services_when_twitter_fails_and_preserves_existing(self) -> None:
+        config = service.ServiceConfig()
+        with (
+            mock.patch.object(service, "start_control_panel", return_value={"status": "running", "running": True, "pid": 1}),
+            mock.patch.object(service, "start_video_memory_review", return_value={"status": "started", "running": True, "pid": 2}),
+            mock.patch.object(service, "start_swarm_backfill_review", return_value={"status": "started", "running": True, "pid": 3}),
+            mock.patch.object(service, "start_review_service", side_effect=[{"status": "started", "running": True, "pid": 4}, RuntimeError("twitter failed")]),
+            mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
+            mock.patch.object(service, "_remove_pid_record"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "twitter failed"):
+                service.start_project365_services(config)
+        self.assertEqual(terminate.call_args_list, [mock.call(4), mock.call(3), mock.call(2)])
+
+    def test_status_is_partial_when_either_new_review_server_is_stopped(self) -> None:
+        for stopped_key in ("swarm_media", "twitter"):
+            with (
+                self.subTest(key=stopped_key),
+                mock.patch.object(service, "service_status", return_value={"running": True}),
+                mock.patch.object(service, "video_service_status", return_value={"running": True}),
+                mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": True}),
+                mock.patch.object(service, "review_service_status", side_effect=lambda config, key: {"running": key != stopped_key}),
+            ):
+                result = service.project365_services_status(service.ServiceConfig())
+            self.assertEqual(result["status"], "partial")
+            self.assertFalse(result["running"])
+
+    def test_stop_detects_unmanaged_new_review_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = service.ServiceConfig(runtime_dir=Path(temporary))
+            with (
+                mock.patch.object(service, "_project_server_pids", side_effect=[[], [], [], [12348], [12349]]),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service, "_descendant_pids", side_effect=[[], []]),
+                mock.patch.object(service, "_terminate_pids", return_value=True) as terminate,
+            ):
+                result = service.stop_project365_servers(config)
+            self.assertEqual(result["stopped_pids"], [12348, 12349])
+            self.assertEqual(terminate.call_args_list, [mock.call([12348]), mock.call([12349])])
+
+    def test_stop_failure_preserves_pid_record_and_reports_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = service.ServiceConfig(runtime_dir=Path(temporary))
+            service._write_service_pid_record(
+                config.twitter_pid_path, 12349, config.host, config.twitter_port,
+                f"http://{config.host}:{config.twitter_port}", config.runtime_dir / "twitter.log",
+            )
+            with (
+                mock.patch.object(service, "_project_server_pids", side_effect=[[], [], [], [], [12349]]),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service.os, "getpgid", return_value=12349),
+                mock.patch.object(service, "_terminate_process_group", return_value=False),
+            ):
+                result = service.stop_project365_servers(config)
+            self.assertEqual(result["status"], "partial")
+            self.assertTrue(result["running"])
+            self.assertTrue(config.twitter_pid_path.exists())
+
+    def test_discovery_ignores_global_matching_script_on_wrong_port(self) -> None:
+        with (
+            mock.patch.object(service, "_project_server_pids_from_ps", return_value=[12345]),
+            mock.patch.object(service, "_port_has_project365_page", return_value=False),
+            mock.patch.object(service, "_listening_pids", return_value=[]),
+            mock.patch.object(service, "_pid_running", return_value=True),
+        ):
+            detected = service._project_server_pids(
+                port=9879,
+                include_any_project_server=True,
+                server_scripts=(service.SWARM_MEDIA_SERVER_SCRIPT,),
+                page_marker="Swarm photo order",
+            )
+
+        self.assertEqual(detected, [])
+
+    def test_discovery_validates_listener_script_and_uses_marker_only_without_command(self) -> None:
+        def detect(command: str) -> list[int]:
+            with (
+                mock.patch.object(service, "_project_server_pids_from_ps", return_value=[]),
+                mock.patch.object(service, "_listening_pids", return_value=[12345]),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service, "_process_command", return_value=command),
+                mock.patch.object(service, "_port_has_project365_page", return_value=True),
+            ):
+                return service._project_server_pids(
+                    port=9879,
+                    include_any_project_server=True,
+                    server_scripts=(service.SWARM_MEDIA_SERVER_SCRIPT,),
+                    page_marker="Swarm photo order",
+                )
+
+        self.assertEqual(detect("python unrelated.py"), [])
+        self.assertEqual(detect(""), [12345])
+
+    def test_stop_does_not_signal_live_stale_managed_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = service.ServiceConfig(runtime_dir=Path(temporary))
+            service._write_service_pid_record(
+                config.twitter_pid_path, 12349, config.host, config.twitter_port,
+                f"http://{config.host}:{config.twitter_port}", config.runtime_dir / "twitter.log",
+            )
+            with (
+                mock.patch.object(service, "_project_server_pids", return_value=[]),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service, "_terminate_process_group") as terminate_group,
+                mock.patch.object(service, "_terminate_pids") as terminate_pids,
+            ):
+                result = service.stop_project365_servers(config)
+            self.assertEqual(result["failed_pids"], [])
+            terminate_group.assert_not_called()
+            terminate_pids.assert_not_called()
+            self.assertFalse(config.twitter_pid_path.exists())
+
+    def test_stop_adopted_service_in_shared_group_only_terminates_it_and_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = service.ServiceConfig(runtime_dir=Path(temporary))
+            service._write_service_pid_record(
+                config.twitter_pid_path, 12349, config.host, config.twitter_port,
+                f"http://{config.host}:{config.twitter_port}", config.runtime_dir / "twitter.log",
+            )
+            with (
+                mock.patch.object(service, "_project_server_pids", side_effect=[[], [], [], [], [12349]]),
+                mock.patch.object(service, "_pid_running", return_value=True),
+                mock.patch.object(service.os, "getpgid", return_value=500),
+                mock.patch.object(service, "_descendant_pids", return_value=[12350]),
+                mock.patch.object(service, "_terminate_process_group") as terminate_group,
+                mock.patch.object(service, "_terminate_pids", return_value=True) as terminate_pids,
+            ):
+                result = service.stop_project365_servers(config)
+            self.assertEqual(result["status"], "stopped")
+            terminate_group.assert_not_called()
+            terminate_pids.assert_called_once()
+            self.assertEqual(set(terminate_pids.call_args.args[0]), {12349, 12350})
+
+    def test_failed_readiness_cleanup_retains_record_and_reports_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = service.ServiceConfig(runtime_dir=Path(temporary))
+            process = mock.Mock(pid=12348)
+            with (
+                mock.patch.object(service, "_project_server_pids", return_value=[]),
+                mock.patch.object(service.subprocess, "Popen", return_value=process),
+                mock.patch.object(service, "_wait_for_review_service", side_effect=RuntimeError("not ready")),
+                mock.patch.object(service, "_terminate_process_group", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                    service.start_review_service(config, "twitter")
+            record = json.loads(config.twitter_pid_path.read_text())
+            self.assertEqual(record["pid"], 12348)
+
+    def test_failed_start_rollback_retains_record_and_reports_cleanup_failure(self) -> None:
+        config = service.ServiceConfig()
+        with (
+            mock.patch.object(service, "start_control_panel", return_value={"status": "running", "running": True, "pid": 1}),
+            mock.patch.object(
+                service,
+                "start_video_memory_review",
+                side_effect=lambda _config: (
+                    service._write_service_pid_record(
+                        config.video_pid_path, 2, config.host, config.video_port,
+                        config.video_url, config.video_log_path,
+                    )
+                    or {"status": "started", "running": True, "pid": 2}
+                ),
+            ),
+            mock.patch.object(service, "start_swarm_backfill_review", side_effect=RuntimeError("later service failed")),
+            mock.patch.object(service, "_terminate_process_group", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rollback.*failed|cleanup failed"):
+                service.start_project365_services(config)
+        self.assertTrue(config.video_pid_path.exists())
+
+    def test_command_detection_excludes_review_export_and_metadata_jobs(self) -> None:
+        self.assertTrue(service._is_project365_server_command("python3 twitter_dayone_workflow.py --source example serve"))
+        self.assertFalse(service._is_project365_server_command("python3 twitter_dayone_workflow.py --source example export-test"))
+        self.assertTrue(service._is_project365_server_command("python3 swarm_media_workflow.py --source example"))
+        self.assertFalse(service._is_project365_server_command("python3 swarm_media_workflow.py --source example --prepare-digikam"))
+        self.assertFalse(service._is_project365_server_command("python3 swarm_media_workflow.py --source example --import-digikam-people"))
 
     def test_status_detects_unmanaged_project365_server(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

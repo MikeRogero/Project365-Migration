@@ -360,7 +360,7 @@ Source Data/Original Photos matching Project365 Entries/
 
 ## Quick Start: Guided Workflow
 
-Start the local control panel:
+Start the local control panel and all five project services:
 
 ```sh
 ./start_project365.sh --open
@@ -372,11 +372,27 @@ Check server status:
 ./project365_status.sh
 ```
 
-Stop the local control panel:
+Stop all five project services, including review servers opened from the Control Panel:
 
 ```sh
 ./stop_project365.sh
 ```
+
+The start, status, and stop scripts manage:
+
+| Service | Default port |
+| --- | --- |
+| Control Panel, Original Picker, and shared Crop Workbench | 8766 |
+| Video memory review and rapid triage | 8767 |
+| Swarm missing-photo review | 8771 |
+| Swarm photo order and crop queue | 8772 |
+| Twitter/X diary review | 8773 |
+
+Start reuses existing servers. If a later service fails to start, it stops only
+servers newly launched by that invocation. Stop reports failure with a nonzero
+exit code and retains the PID record for a server it cannot stop. SQLite needs
+no separate server. LM Studio remains an optional, manually started dependency
+for AI crop estimates.
 
 The default control-panel URL is:
 
