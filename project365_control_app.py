@@ -18,7 +18,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -34,12 +36,14 @@ from project365_original_reference_pipeline import (
 )
 from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY, derivative_readiness_summary
 import project365_original_picker as original_picker
+import project365_crop_workbench as crop_workbench
 import project365_broad_visual_match as broad_visual_match
 import project365_diary_enrichment as diary_enrichment
 import project365_diary_intake as diary_intake
 import project365_media_dedupe_review as media_dedupe
 import project365_import_sources as import_sources
 from project365_paths import ORIGINAL_PHOTOS_ROOT, PROJECT365_PRO_EXPORT_ZIPS_DIR
+from swarm_media_workflow import SwarmMediaStore
 
 
 CANONICAL_ROOT = Path("Project365Canonical")
@@ -52,12 +56,18 @@ ORIGINAL_UNCLEAR_GROUPS = VERIFY_REPORT_DIR / "original_photo_unclear_groups.csv
 ORIGINAL_BATCH_PLAN = VERIFY_REPORT_DIR / "original_photo_search_batch_plan.csv"
 ORIGINAL_SEARCH_ATTEMPTS = VERIFY_REPORT_DIR / "original_photo_search_attempts.csv"
 PHOTO_LIBRARY_INDEX = CANONICAL_ROOT / "photo_library_index.sqlite"
+VIDEO_LIBRARY_INDEX = CANONICAL_ROOT / "video_library_legacy_index.sqlite"
 BROAD_VISUAL_DB = CANONICAL_ROOT / "broad_visual_match.sqlite"
 TAG_QUEUE = VERIFY_REPORT_DIR / "tag_review_queue.csv"
 DIGIKAM_PEOPLE_REPORT = VERIFY_REPORT_DIR / "digikam_people_import_report.csv"
 DIARIUM_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "diarium_import_batches"
 DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "dayone_import_batches"
 FACEBOOK_DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "facebook_dayone_batches"
+SWARM_DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "swarm_dayone"
+SWARM_MEDIA_REVIEW_DB = CANONICAL_ROOT / "swarm_dayone_media" / "review.sqlite3"
+X_ARCHIVE_STAGING_PATH = CANONICAL_ROOT / "staging" / "social" / "x_archive_posts.jsonl"
+TWITTER_REVIEW_DB = CANONICAL_ROOT / "twitter_dayone_review" / "review.sqlite3"
+TWITTER_DAYONE_IMPORT_BATCH_DIR = CANONICAL_ROOT / "exports" / "twitter_dayone"
 DIARIUM_DB_PATH = (
     Path.home() / "Library" / "Containers" / "mac.partl.Diarium" / "Data" / "data.db"
 )
@@ -68,6 +78,191 @@ ARCHIVE_RESULT_LIMIT = 25
 BROAD_REVIEW_ENTRY_LIMIT = 1
 _BROAD_MONTHLY_COVERAGE_CACHE: dict[str, Any] = {"key": None, "rows": []}
 _FACEBOOK_PACKAGE_CACHE: dict[str, Any] = {"key": None, "record": None}
+_PREPARED_IMPORT_COUNT_CACHE: dict[str, Any] = {"key": None, "counts": {}}
+_SWARM_REVIEW_LOCK = threading.Lock()
+_TWITTER_REVIEW_LOCK = threading.Lock()
+
+
+def _swarm_review_tool_specs() -> dict[str, dict[str, Any]]:
+    project_root = Path(__file__).resolve().parent
+    source = SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["swarm"]
+    return {
+        "backfill": {
+            "label": "Missing-photo review",
+            "url": "http://127.0.0.1:8771/",
+            "health_url": "http://127.0.0.1:8771/api/summary",
+            "required_summary_keys": {"total", "pending", "selected", "skipped"},
+            "log": CANONICAL_ROOT / "runtime" / "swarm_photo_backfill_review.log",
+            "command": [
+                sys.executable,
+                str(project_root / "swarm_photo_backfill_review.py"),
+                "--source", str(source),
+                "--state-dir", str(CANONICAL_ROOT / "swarm_dayone_backfill"),
+                "--port", "8771",
+            ],
+        },
+        "media": {
+            "label": "Photo order and crops",
+            "url": "http://127.0.0.1:8772/",
+            "health_url": "http://127.0.0.1:8772/api/summary",
+            "required_summary_keys": {"photo_count", "multi_photo_entry_count", "crop_queued_count"},
+            "log": CANONICAL_ROOT / "runtime" / "swarm_media_workflow.log",
+            "command": [
+                sys.executable,
+                str(project_root / "swarm_media_workflow.py"),
+                "--source", str(source),
+                "--database", str(CANONICAL_ROOT / "swarm_dayone_media" / "review.sqlite3"),
+                "--port", "8772",
+            ],
+        },
+    }
+
+
+def _twitter_review_tool_spec() -> dict[str, Any]:
+    project_root = Path(__file__).resolve().parent
+    source = SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["x_twitter"]
+    return {
+        "label": "Twitter diary review",
+        "url": "http://127.0.0.1:8773/",
+        "health_url": "http://127.0.0.1:8773/api/summary",
+        "required_summary_keys": {
+            "total", "recommended_pending", "reviewed_included", "media_count",
+        },
+        "log": CANONICAL_ROOT / "runtime" / "twitter_dayone_review.log",
+        "command": [
+            sys.executable,
+            str(project_root / "twitter_dayone_workflow.py"),
+            "--source", str(source),
+            "--database", str(TWITTER_REVIEW_DB),
+            "--output-dir", str(TWITTER_DAYONE_IMPORT_BATCH_DIR),
+            "serve", "--port", "8773",
+        ],
+    }
+
+
+def _local_json(url: str, timeout: float = 0.4) -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _swarm_review_tools_status() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for key, spec in _swarm_review_tool_specs().items():
+        summary = _local_json(str(spec["health_url"]))
+        required_keys = set(spec.get("required_summary_keys", ()))
+        if summary is not None and not required_keys.issubset(summary):
+            summary = None
+        result[key] = {
+            "label": spec["label"],
+            "url": spec["url"],
+            "running": summary is not None,
+            "summary": summary or {},
+        }
+    return result
+
+
+def _twitter_review_tool_status() -> dict[str, Any]:
+    spec = _twitter_review_tool_spec()
+    summary = _local_json(str(spec["health_url"]))
+    if summary is not None and not set(spec["required_summary_keys"]).issubset(summary):
+        summary = None
+    return {
+        "label": spec["label"],
+        "url": spec["url"],
+        "running": summary is not None,
+        "summary": summary or {},
+    }
+
+
+def _import_sources_status() -> dict[str, Any]:
+    payload = import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS)
+    swarm = payload.get("sources", {}).get("swarm")
+    if isinstance(swarm, dict):
+        swarm["review_tools"] = _swarm_review_tools_status()
+    twitter = payload.get("sources", {}).get("x_twitter")
+    if isinstance(twitter, dict):
+        twitter["review_tool"] = _twitter_review_tool_status()
+    return payload
+
+
+def _start_swarm_review_tool(key: str, timeout_seconds: float = 45.0) -> dict[str, Any]:
+    specs = _swarm_review_tool_specs()
+    if key not in specs:
+        raise ValueError("Unknown Swarm review tool")
+    import_sources.resolve_swarm(SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["swarm"])
+    with _SWARM_REVIEW_LOCK:
+        existing = _swarm_review_tools_status()[key]
+        if existing["running"]:
+            return existing
+        spec = specs[key]
+        log_path = Path(spec["log"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"\n\n=== Swarm {key} review start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            log.flush()
+            process = subprocess.Popen(
+                spec["command"],
+                cwd=Path(__file__).resolve().parent,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"Swarm {key} review exited early. Check {log_path}.")
+            summary = _local_json(str(spec["health_url"]), timeout=0.8)
+            required_keys = set(spec.get("required_summary_keys", ()))
+            if summary is not None and required_keys.issubset(summary):
+                return {
+                    "label": spec["label"], "url": spec["url"],
+                    "running": True, "summary": summary,
+                }
+            time.sleep(0.2)
+        process.terminate()
+        raise RuntimeError(f"Swarm {key} review did not start in time. Check {log_path}.")
+
+
+def _start_twitter_review_tool(timeout_seconds: float = 45.0) -> dict[str, Any]:
+    spec = _twitter_review_tool_spec()
+    import_sources.resolve_x(SOURCE_DATA_ROOT / import_sources.SOURCE_FOLDERS["x_twitter"])
+    with _TWITTER_REVIEW_LOCK:
+        existing = _twitter_review_tool_status()
+        if existing["running"]:
+            return existing
+        log_path = Path(spec["log"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"\n\n=== Twitter diary review start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            log.flush()
+            process = subprocess.Popen(
+                spec["command"],
+                cwd=Path(__file__).resolve().parent,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"Twitter diary review exited early. Check {log_path}.")
+            summary = _local_json(str(spec["health_url"]), timeout=0.8)
+            if summary is not None and set(spec["required_summary_keys"]).issubset(summary):
+                return {
+                    "label": spec["label"], "url": spec["url"],
+                    "running": True, "summary": summary,
+                }
+            time.sleep(0.2)
+        process.terminate()
+        raise RuntimeError(f"Twitter diary review did not start in time. Check {log_path}.")
 
 
 @dataclass(frozen=True)
@@ -87,6 +282,8 @@ class ControlState:
         self._job_cancel_events: dict[str, threading.Event] = {}
         self._job_processes: dict[str, subprocess.Popen[Any]] = {}
         self._picker_state: original_picker.PickerState | None = None
+        self._crop_provider_registry: crop_workbench.CropProviderRegistry | None = None
+        self._crop_provider_registry_has_swarm: bool | None = None
         self._active_photo_index_folder = ""
         self._broad_image_paths: dict[str, Path] = {}
         self.history = _load_control_run_history(CONTROL_RUN_HISTORY)
@@ -142,7 +339,7 @@ class ControlState:
             ),
             "history": self.history[-20:],
             "active_jobs": active_jobs,
-            "import_sources": import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS),
+            "import_sources": _import_sources_status(),
         }
         _attach_visual_job_progress(status)
         status["top_metrics"] = _top_metrics(
@@ -168,12 +365,14 @@ class ControlState:
             requested & {"build_photo_index", "match_easy_originals"}
         ) and "build_photo_index" not in active_owners
         include_photo_index_metric = needs_photo_index_metric and "workflow_overview" not in requested
+        include_video_index_metric = "video_memory_review" in requested
         status: dict[str, Any] = {
             "top_metrics": _initial_top_metrics(
-                include_photo_index=include_photo_index_metric
+                include_photo_index=include_photo_index_metric,
+                include_video_index=include_video_index_metric,
             ),
             "active_jobs": active_jobs,
-            "import_sources": import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS),
+            "import_sources": _import_sources_status(),
         }
         if "workflow_overview" in requested:
             status["photo_library_index"] = _photo_library_index_latest_run_status(PHOTO_LIBRARY_INDEX)
@@ -647,6 +846,8 @@ def _terminate_process_group(process: subprocess.Popen[Any], force: bool = False
 
 
 def _step_timeout_seconds(step: str) -> int:
+    if step == "prepare_video_memory_review":
+        return 7 * 24 * 60 * 60
     if step in {
         "build_photo_index",
         "refresh_photo_index_metadata",
@@ -679,6 +880,22 @@ def _clear_original_search_outputs() -> None:
 
 def _commands_for_step(step: str, payload: dict[str, Any]) -> list[list[str]]:
     python = sys.executable
+    if step == "prepare_video_memory_review":
+        command = [
+            python,
+            "project365_video_memory_review.py",
+            "--canonical-root",
+            str(CANONICAL_ROOT),
+            "prepare-batch",
+            "--all-missing",
+        ]
+        start_date = str(payload.get("start_date", "")).strip()
+        end_date = str(payload.get("end_date", "")).strip()
+        if start_date:
+            command.extend(["--start-date", start_date])
+        if end_date:
+            command.extend(["--end-date", end_date])
+        return [command]
     if step == "import_zips":
         return [
             [
@@ -1996,6 +2213,11 @@ def _summary_scope(step: str, payload: dict[str, Any]) -> list[str]:
     if step == "match_easy_originals":
         folder = str(payload.get("photo_index_folder") or "").strip()
         return [f"Photo index folder: {folder}" if folder else "Photo index folder: all indexed folders"]
+    if step == "prepare_video_memory_review":
+        return [
+            f"Capture dates: {payload.get('start_date') or 'all'} to {payload.get('end_date') or 'all'}",
+            "Mode: all indexed videos not already ready with Apple Vision",
+        ]
     if step == "broad_visual_index":
         roots = payload.get("candidate_roots") or []
         return [
@@ -2228,6 +2450,7 @@ def _step_title(step: str) -> str:
         "refresh_photo_index_metadata": "Refresh photo index metadata",
         "match_easy_originals": "Original-photo review",
         "media_dedupe_review": "Media dedupe review",
+        "prepare_video_memory_review": "Prepare video memory review",
         "search_originals": "Original-photo search",
         "broad_visual_index": "Broad descriptor index",
         "broad_visual_match": "Broad visual match",
@@ -2338,13 +2561,144 @@ def _workflow_record(
     }
 
 
+def _prepared_outside_import_entry_counts(
+    *,
+    facebook_dir: Path | None = None,
+    swarm_dir: Path | None = None,
+    x_staging_path: Path | None = None,
+) -> dict[str, int]:
+    facebook_dir = facebook_dir or FACEBOOK_DAYONE_IMPORT_BATCH_DIR
+    swarm_dir = swarm_dir or SWARM_DAYONE_IMPORT_BATCH_DIR
+    x_staging_path = x_staging_path or X_ARCHIVE_STAGING_PATH
+    facebook_manifests = list(facebook_dir.glob("facebook_dayone_*_manifest.json"))
+    swarm_manifests = list(swarm_dir.glob("swarm_dayone_*_manifest.json"))
+    paths = [*facebook_manifests, *swarm_manifests]
+    if x_staging_path.is_file():
+        paths.append(x_staging_path)
+    cache_key = tuple(
+        sorted(
+            (
+                str(path),
+                path.stat().st_mtime_ns,
+                path.stat().st_size,
+            )
+            for path in paths
+        )
+    )
+    if _PREPARED_IMPORT_COUNT_CACHE["key"] == cache_key:
+        return dict(_PREPARED_IMPORT_COUNT_CACHE["counts"])
+
+    counts: dict[str, int] = {}
+    facebook_count = _latest_manifest_entry_count(facebook_manifests, "entry_count")
+    if facebook_count:
+        counts["facebook"] = facebook_count
+    swarm_count = _latest_manifest_entry_count(swarm_manifests, "full_entry_count")
+    if swarm_count:
+        counts["swarm"] = swarm_count
+    staged_x_ids = _staged_source_ids(x_staging_path, "x_archive")
+    if staged_x_ids:
+        counts["x_archive"] = len(staged_x_ids)
+
+    _PREPARED_IMPORT_COUNT_CACHE.update(key=cache_key, counts=dict(counts))
+    return counts
+
+
+def _latest_manifest_entry_count(paths: list[Path], field: str) -> int:
+    for path in sorted(paths, key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name), reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value = payload.get(field) if isinstance(payload, dict) else None
+            if isinstance(value, bool):
+                continue
+            count = int(value)
+            if count >= 0:
+                return count
+        except (OSError, ValueError, TypeError):
+            continue
+    return 0
+
+
+def _staged_source_ids(path: Path, source_name: str) -> set[str]:
+    if not path.is_file():
+        return set()
+    identities: set[str] = set()
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict) or record.get("source_name") != source_name:
+                    continue
+                source_id = str(record.get("source_id") or "").strip()
+                if source_id:
+                    identities.add(source_id)
+    except (OSError, ValueError, TypeError):
+        return set()
+    return identities
+
+
+def _combine_diary_entry_counts(
+    canonical_counts: dict[str, int],
+    prepared_counts: dict[str, int],
+) -> dict[str, Any]:
+    source_counts = {
+        str(source): max(0, int(count or 0))
+        for source, count in canonical_counts.items()
+    }
+    for source, prepared_count in prepared_counts.items():
+        source_counts[source] = max(source_counts.get(source, 0), int(prepared_count or 0))
+    return {
+        "diary_entries": sum(source_counts.values()),
+        "project365_entries": source_counts.get("project365", 0),
+        "prepared_import_entries": sum(int(count or 0) for count in prepared_counts.values()),
+        "source_counts": dict(sorted(source_counts.items())),
+    }
+
+
+def _diary_entry_metrics(db_path: Path) -> dict[str, Any]:
+    canonical_counts: dict[str, int] = {}
+    if db_path.is_file():
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1) as connection:
+                canonical_counts = {
+                    str(source_app): int(count or 0)
+                    for source_app, count in connection.execute(
+                        "SELECT source_app, COUNT(*) FROM entries GROUP BY source_app"
+                    )
+                }
+        except sqlite3.Error:
+            canonical_counts = {}
+    return _combine_diary_entry_counts(
+        canonical_counts,
+        _prepared_outside_import_entry_counts(),
+    )
+
+
 def _top_metrics(database: dict[str, Any], photo_index: dict[str, Any]) -> dict[str, Any]:
-    project365_total = int(database.get("project365_entry_count") or 0)
+    canonical_counts = {
+        str(row.get("source_app") or ""): int(row.get("count") or 0)
+        for row in database.get("source_counts", [])
+        if isinstance(row, dict) and str(row.get("source_app") or "")
+    }
+    if not canonical_counts and database.get("entry_count"):
+        project365_count = int(database.get("project365_entry_count") or 0)
+        canonical_counts["project365"] = project365_count
+        other_count = max(0, int(database.get("entry_count") or 0) - project365_count)
+        if other_count:
+            canonical_counts["other"] = other_count
+    diary_metrics = _combine_diary_entry_counts(
+        canonical_counts,
+        _prepared_outside_import_entry_counts(),
+    )
+    project365_total = diary_metrics["project365_entries"]
     without_identified_original = int(database.get("without_identified_original_count") or 0)
     return {
         "unique_diary_days": int(database.get("unique_day_count") or 0),
-        "diary_entries": int(database.get("entry_count") or 0),
+        "diary_entries": diary_metrics["diary_entries"],
+        "prepared_import_entries": diary_metrics["prepared_import_entries"],
         "photo_index_files": int(photo_index.get("file_count") or 0),
+        "video_index_files": _initial_video_index_file_count(VIDEO_LIBRARY_INDEX),
         "project365_entries": project365_total,
         "missing_photos": without_identified_original,
         "missing_photos_percent": _percentage(without_identified_original, project365_total),
@@ -4006,6 +4360,26 @@ loadCandidate(0);
 """
 
 
+def _crop_provider_registry(state: ControlState) -> crop_workbench.CropProviderRegistry:
+    """Return the shared crop providers available in this checkout."""
+    if not isinstance(state, ControlState):
+        return crop_workbench.CropProviderRegistry([
+            crop_workbench.Project365CropProvider(lambda: state.picker_state())
+        ])
+    has_swarm = SWARM_MEDIA_REVIEW_DB.is_file()
+    with state._picker_lock:
+        registry = state._crop_provider_registry
+        if registry is not None and state._crop_provider_registry_has_swarm == has_swarm:
+            return registry
+        providers: list[Any] = [crop_workbench.Project365CropProvider(state.picker_state)]
+        if has_swarm:
+            providers.append(crop_workbench.SwarmCropProvider(SwarmMediaStore(SWARM_MEDIA_REVIEW_DB)))
+        registry = crop_workbench.CropProviderRegistry(providers)
+        state._crop_provider_registry = registry
+        state._crop_provider_registry_has_swarm = has_swarm
+        return registry
+
+
 def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPRequestHandler]:
     class ControlHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -4057,7 +4431,26 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         )
                     )
                 elif parsed.path == "/api/import-sources":
-                    self._send_json(import_sources.status(SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS))
+                    self._send_json(_import_sources_status())
+                elif parsed.path == "/swarm-review-tool":
+                    source_status = _import_sources_status()
+                    if "swarm" not in source_status["enabled"]:
+                        raise ValueError("Enable Swarm in Imports first.")
+                    query = urllib.parse.parse_qs(parsed.query)
+                    tool_status = _start_swarm_review_tool(query.get("tool", [""])[0])
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("location", str(tool_status["url"]))
+                    self.send_header("cache-control", "no-store")
+                    self.end_headers()
+                elif parsed.path == "/twitter-review-tool":
+                    source_status = _import_sources_status()
+                    if "x_twitter" not in source_status["enabled"]:
+                        raise ValueError("Enable Twitter / X in Imports first.")
+                    tool_status = _start_twitter_review_tool()
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("location", str(tool_status["url"]))
+                    self.send_header("cache-control", "no-store")
+                    self.end_headers()
                 elif parsed.path == "/api/working-copy-readiness":
                     query = urllib.parse.parse_qs(parsed.query)
                     self._send_json(
@@ -4208,9 +4601,21 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                             )
                         }
                     )
+                elif parsed.path == "/crop/api/crop-providers":
+                    self._send_json({
+                        "default_provider": crop_workbench.PROJECT365_PROVIDER_ID,
+                        "providers": _crop_provider_registry(state).descriptors(),
+                    })
                 elif parsed.path.startswith(("/picker/api/private/", "/crop/api/private/")):
                     entry_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
-                    self._send_json(state.picker_state().private_status(entry_id))
+                    if parsed.path.startswith("/crop/"):
+                        query = urllib.parse.parse_qs(parsed.query)
+                        provider = _crop_provider_registry(state).get(
+                            query.get("provider", [crop_workbench.PROJECT365_PROVIDER_ID])[0]
+                        )
+                        self._send_json(provider.private_status(entry_id))
+                    else:
+                        self._send_json(state.picker_state().private_status(entry_id))
                 elif parsed.path.startswith("/picker/api/entry/"):
                     query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/picker/api/entry/"))
@@ -4238,14 +4643,26 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                 elif parsed.path == "/crop/api/crop-entries":
                     query = urllib.parse.parse_qs(parsed.query)
+                    provider_id = query.get(
+                        "provider", [crop_workbench.PROJECT365_PROVIDER_ID]
+                    )[0]
+                    registry = _crop_provider_registry(state)
+                    provider = registry.get(provider_id)
                     crop_filter = query.get("crop_filter", ["missing"])[0]
-                    all_entries = state.picker_state().crop_entries(
+                    all_entries = provider.list_entries(
                         crop_filter=crop_filter,
                         entry_dates=set(original_picker._query_values(query, "entry_date")),
                         start_date=query.get("start_date", [""])[0],
                         end_date=query.get("end_date", [""])[0],
                     )
-                    estimate_batches = original_picker._crop_estimate_batch_options(all_entries)
+                    descriptor = next(
+                        item for item in registry.descriptors() if item.get("id") == provider_id
+                    )
+                    capabilities = descriptor.get("capabilities", {})
+                    estimate_batches = (
+                        original_picker._crop_estimate_batch_options(all_entries)
+                        if capabilities.get("estimate_batches") else []
+                    )
                     estimate_batch_id = query.get("estimate_batch_id", [""])[0].strip()
                     entries = [
                         entry for entry in all_entries
@@ -4261,6 +4678,16 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     }
                     limit = original_picker._query_int(query, "limit", None)
                     limited_entries = window["entries"][:limit] if limit and limit > 0 else window["entries"]
+                    pending = provider.pending_commits() if callable(
+                        getattr(provider, "pending_commits", None)
+                    ) else {}
+                    if not isinstance(pending, dict):
+                        pending = {"pending_count": 0}
+                    latest_job = provider.latest_estimate_job() if callable(
+                        getattr(provider, "latest_estimate_job", None)
+                    ) else {}
+                    if not isinstance(latest_job, dict):
+                        latest_job = {}
                     self._send_json(
                         {
                             "entries": limited_entries,
@@ -4270,15 +4697,17 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                             "previous_month": window["previous_month"],
                             "next_month": window["next_month"],
                             "estimate_batches": estimate_batches,
-                            "pending_crop_commits": state.picker_state().pending_crop_commits(),
-                            "crop_estimate_batch": _compact_crop_estimate_job(
-                                state.picker_state().latest_crop_estimate_job() or {}
-                            ),
+                            "pending_crop_commits": pending,
+                            "crop_estimate_batch": _compact_crop_estimate_job(latest_job),
                         }
                     )
                 elif parsed.path.startswith("/crop/api/entry/"):
+                    query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/entry/"))
-                    detail = state.picker_state().crop_entry_detail(entry_id, mark_estimated_viewed=False)
+                    provider = _crop_provider_registry(state).get(
+                        query.get("provider", [crop_workbench.PROJECT365_PROVIDER_ID])[0]
+                    )
+                    detail = provider.detail(entry_id)
                     if detail is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown entry")
                     else:
@@ -4286,8 +4715,11 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                 elif parsed.path.startswith("/crop/api/crop-entry/"):
                     query = urllib.parse.parse_qs(parsed.query)
                     entry_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/crop-entry/"))
-                    detail = state.picker_state().crop_entry_detail(
-                        entry_id, mark_estimated_viewed=False,
+                    provider = _crop_provider_registry(state).get(
+                        query.get("provider", [crop_workbench.PROJECT365_PROVIDER_ID])[0]
+                    )
+                    detail = provider.detail(
+                        entry_id,
                         candidate_path=query.get("candidate_path", [""])[0],
                     )
                     if detail is None:
@@ -4309,20 +4741,34 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     else:
                         self._send_json(job)
                 elif parsed.path.startswith("/crop/api/crop-estimate-batch/"):
+                    query = urllib.parse.parse_qs(parsed.query)
                     job_id = urllib.parse.unquote(parsed.path.removeprefix("/crop/api/crop-estimate-batch/"))
-                    job = state.picker_state().crop_estimate_job(job_id)
+                    provider = _crop_provider_registry(state).get(
+                        query.get("provider", [crop_workbench.PROJECT365_PROVIDER_ID])[0]
+                    )
+                    job = provider.estimate_job(job_id)
                     if job is None:
                         self._send_error(HTTPStatus.NOT_FOUND, "Unknown crop estimate batch")
                     else:
                         self._send_json(job)
                 elif parsed.path.startswith("/picker/image/"):
                     query = urllib.parse.parse_qs(parsed.query)
-                    self._send_picker_image(
-                        parsed.path.removeprefix("/picker/image/"),
-                        original_picker._query_int(query, "max", None),
-                    )
+                    provider_id = query.get("provider", [""])[0]
+                    if provider_id:
+                        self._send_crop_image(
+                            provider_id,
+                            parsed.path.removeprefix("/picker/image/"),
+                            original_picker._query_int(query, "max", None),
+                        )
+                    else:
+                        self._send_picker_image(
+                            parsed.path.removeprefix("/picker/image/"),
+                            original_picker._query_int(query, "max", None),
+                        )
                 else:
                     self._send_error(HTTPStatus.NOT_FOUND, "Not found")
+            except ValueError as exc:
+                self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
             except Exception as exc:  # noqa: BLE001 - local app should surface readable errors.
                 self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
@@ -4337,10 +4783,8 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                         "import_facebook_dayone": "facebook",
                         "stage_x_archive": "x_twitter",
                     }.get(step)
-                    if source_key and source_key not in import_sources.status(
-                        SOURCE_DATA_ROOT, IMPORT_SOURCE_SETTINGS
-                    )["enabled"]:
-                        raise ValueError(f"Enable {import_sources.SOURCE_LABELS[source_key]} in Step 12 first.")
+                    if source_key and source_key not in _import_sources_status()["enabled"]:
+                        raise ValueError(f"Enable {import_sources.SOURCE_LABELS[source_key]} in Imports first.")
                     self._send_json(state.start_step(step, payload))
                     return
                 if parsed.path == "/api/import-sources":
@@ -4464,10 +4908,20 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path in {"/picker/api/private", "/crop/api/private"}:
                     payload = self._read_json()
-                    self._send_json(state.picker_state().set_private(
-                        entry_id=str(payload.get("entry_id", "")),
-                        private=payload.get("private"),
-                    ))
+                    if parsed.path.startswith("/crop/"):
+                        provider = _crop_provider_registry(state).get(
+                            str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                        )
+                        result = provider.set_private(
+                            entry_id=str(payload.get("entry_id", "")),
+                            private=payload.get("private"),
+                        )
+                    else:
+                        result = state.picker_state().set_private(
+                            entry_id=str(payload.get("entry_id", "")),
+                            private=payload.get("private"),
+                        )
+                    self._send_json(result)
                     return
                 if parsed.path == "/picker/api/associated-date-choices":
                     payload = self._read_json()
@@ -4493,10 +4947,13 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path == "/crop/api/crop":
                     payload = self._read_json()
+                    provider = _crop_provider_registry(state).get(
+                        str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                    )
                     source = str(payload.get("source", "manual")).strip().lower()
                     if source not in {"manual", "estimated"}:
                         source = "manual"
-                    detail = state.picker_state().save_crop(
+                    detail = provider.save(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         crop=payload.get("crop") if isinstance(payload.get("crop"), dict) else {},
@@ -4506,7 +4963,10 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path == "/crop/api/crop-reset":
                     payload = self._read_json()
-                    detail = state.picker_state().reset_crop(
+                    provider = _crop_provider_registry(state).get(
+                        str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                    )
+                    detail = provider.reset(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         preserve_estimate=bool(payload.get("preserve_estimate")),
@@ -4514,11 +4974,18 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     self._send_json(detail)
                     return
                 if parsed.path == "/crop/api/crop-commit":
-                    self._send_json(state.picker_state().commit_staged_crops())
+                    payload = self._read_json()
+                    provider = _crop_provider_registry(state).get(
+                        str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                    )
+                    self._send_json(provider.commit())
                     return
                 if parsed.path == "/crop/api/crop-reject-original":
                     payload = self._read_json()
-                    result = state.picker_state().reject_crop_original(
+                    provider = _crop_provider_registry(state).get(
+                        str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                    )
+                    result = provider.reject(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         notes=str(payload.get("notes", "")),
@@ -4527,7 +4994,10 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path == "/crop/api/crop-suggestion":
                     payload = self._read_json()
-                    result = state.picker_state().suggest_crop_for_candidate(
+                    provider = _crop_provider_registry(state).get(
+                        str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                    )
+                    result = provider.suggest(
                         entry_id=str(payload.get("entry_id", "")),
                         candidate_path=str(payload.get("candidate_path", "")),
                         crop=payload.get("crop") if isinstance(payload.get("crop"), dict) else None,
@@ -4536,6 +5006,12 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     return
                 if parsed.path in {"/picker/api/crop-estimate-batch", "/crop/api/crop-estimate-batch"}:
                     payload = self._read_json()
+                    if (
+                        parsed.path.startswith("/crop/")
+                        and str(payload.get("provider", crop_workbench.PROJECT365_PROVIDER_ID))
+                        != crop_workbench.PROJECT365_PROVIDER_ID
+                    ):
+                        raise ValueError("This crop provider does not support estimate batches")
                     target_extensions = payload.get("target_extensions")
                     if not isinstance(target_extensions, list):
                         target_extensions = []
@@ -4836,6 +5312,21 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
             if path is None or not path.exists() or not path.is_file():
                 self._send_error(HTTPStatus.NOT_FOUND, "Image not found")
                 return
+            self._send_image_path(path)
+
+        def _send_crop_image(self, provider_id: str, token: str, max_size: int | None = None) -> None:
+            provider = _crop_provider_registry(state).get(provider_id)
+            path = provider.image_path(urllib.parse.unquote(token))
+            if path is not None and max_size is not None:
+                picker_state = state.picker_state()
+                preview_token = picker_state.image_token_for_path(path)
+                path = picker_state.preview_path(preview_token, max_size)
+            if path is None or not path.exists() or not path.is_file():
+                self._send_error(HTTPStatus.NOT_FOUND, "Image not found")
+                return
+            self._send_image_path(path)
+
+        def _send_image_path(self, path: Path) -> None:
             payload = path.read_bytes()
             mime_type, _ = mimetypes.guess_type(str(path))
             self.send_response(HTTPStatus.OK)
@@ -4992,6 +5483,7 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
 
 
 WORKFLOW_STEPS = (
+    "import_hub",
     "build_photo_index",
     "match_easy_originals",
     "media_dedupe_review",
@@ -5005,7 +5497,6 @@ WORKFLOW_STEPS = (
     "diary_enrichment",
     "generate_diarium_package",
     "generate_dayone_package",
-    "import_hub",
 )
 
 STEP_OWNER = {
@@ -5015,6 +5506,7 @@ STEP_OWNER = {
     "refresh_photo_index_metadata": "build_photo_index",
     "search_originals": "match_easy_originals",
     "apply_original_decisions": "match_easy_originals",
+    "prepare_video_memory_review": "video_memory_review",
     "broad_visual_index": "broad_visual_match",
     "broad_visual_benchmark": "broad_visual_match",
     "rough_prefilter_build": "rough_visual_match",
@@ -5081,6 +5573,7 @@ def _control_html(picker_url: str, initial_step: str = "") -> str:
         .replace("__INITIAL_UNIQUE_DIARY_DAYS__", str(metrics["unique_diary_days"]))
         .replace("__INITIAL_DIARY_ENTRIES__", str(metrics["diary_entries"]))
         .replace("__INITIAL_PHOTO_INDEX_FILES__", str(metrics["photo_index_files"]))
+        .replace("__INITIAL_VIDEO_INDEX_FILES__", str(metrics["video_index_files"]))
         .replace("__INITIAL_ASSOCIATED_PHOTOS__", str(metrics["associated_photos"]))
         .replace(
             "__INITIAL_MISSING_PHOTOS__",
@@ -5106,13 +5599,18 @@ def _control_html(picker_url: str, initial_step: str = "") -> str:
     return html
 
 
-def _initial_top_metrics(include_photo_index: bool = True) -> dict[str, Any]:
+def _initial_top_metrics(
+    include_photo_index: bool = True,
+    include_video_index: bool = True,
+) -> dict[str, Any]:
     canonical_db = CANONICAL_ROOT / "canonical.db"
     photo_gaps = _initial_project365_photo_gap_counts(canonical_db)
-    project365_entries = photo_gaps["project365_entries"]
+    diary_metrics = _diary_entry_metrics(canonical_db)
+    project365_entries = diary_metrics["project365_entries"]
     metrics = {
         "unique_diary_days": _initial_unique_day_count(canonical_db),
-        "diary_entries": _initial_entry_count(canonical_db),
+        "diary_entries": diary_metrics["diary_entries"],
+        "prepared_import_entries": diary_metrics["prepared_import_entries"],
         "project365_entries": project365_entries,
         "missing_photos": photo_gaps["without_identified_original"],
         "missing_photos_percent": _percentage(
@@ -5128,6 +5626,8 @@ def _initial_top_metrics(include_photo_index: bool = True) -> dict[str, Any]:
     }
     if include_photo_index:
         metrics["photo_index_files"] = _initial_photo_index_file_count(PHOTO_LIBRARY_INDEX)
+    if include_video_index:
+        metrics["video_index_files"] = _initial_video_index_file_count(VIDEO_LIBRARY_INDEX)
     return metrics
 
 
@@ -5140,6 +5640,10 @@ def _initial_unique_day_count(db_path: Path) -> int:
 
 
 def _initial_photo_index_file_count(index_path: Path) -> int:
+    return _initial_sqlite_count(index_path, "SELECT COUNT(*) FROM photo_library_files")
+
+
+def _initial_video_index_file_count(index_path: Path) -> int:
     return _initial_sqlite_count(index_path, "SELECT COUNT(*) FROM photo_library_files")
 
 
@@ -5223,6 +5727,7 @@ def _embedded_crop_html() -> str:
         .replace('fetchJson("/api/', 'fetchJson("/crop/api/')
         .replace('fetchJson(`/api/', 'fetchJson(`/crop/api/')
         .replace('`/api/crop-entries?${params.toString()}`', '`/crop/api/crop-entries?${params.toString()}`')
+        .replace('`/api/crop-entry/${', '`/crop/api/crop-entry/${')
         .replace('src="/image/${', 'src="/picker/image/${')
         .replace('`/image/${', '`/picker/image/${')
     )
@@ -6640,10 +7145,11 @@ a { color: var(--accent); }
 
   <section class="metric-grid" aria-label="Project summary">
     <div class="metric-card"><span>Unique diary days</span><strong id="metricUniqueDays">__INITIAL_UNIQUE_DIARY_DAYS__</strong></div>
-    <div class="metric-card"><span>Total diary entries</span><strong id="metricDiaryEntries">__INITIAL_DIARY_ENTRIES__</strong></div>
+    <div class="metric-card"><span>Unique diary entries</span><strong id="metricDiaryEntries">__INITIAL_DIARY_ENTRIES__</strong></div>
     <div class="metric-card"><span>Missing photos</span><strong id="metricMissingPhotos">__INITIAL_MISSING_PHOTOS__</strong></div>
     <div class="metric-card"><span>Associated photos</span><strong id="metricAssociatedPhotos">__INITIAL_ASSOCIATED_PHOTOS__</strong></div>
     <div class="metric-card"><span>Photos in index</span><strong id="metricPhotoIndexFiles">__INITIAL_PHOTO_INDEX_FILES__</strong></div>
+    <div class="metric-card"><span>Videos in index</span><strong id="metricVideoIndexFiles">__INITIAL_VIDEO_INDEX_FILES__</strong></div>
   </section>
   <div id="statusLoadError" class="inline-status error" role="status" aria-live="polite" hidden></div>
 
@@ -7147,6 +7653,7 @@ const STEP_OWNER = {
   refresh_photo_index_metadata: "build_photo_index",
   search_originals: "match_easy_originals",
   apply_original_decisions: "match_easy_originals",
+  prepare_video_memory_review: "video_memory_review",
   broad_visual_index: "broad_visual_match",
   broad_visual_benchmark: "broad_visual_match",
   rough_prefilter_build: "rough_visual_match",
@@ -7352,6 +7859,9 @@ function renderTopMetrics(payload) {
   if (Object.prototype.hasOwnProperty.call(metrics, "photo_index_files")) {
     setText("metricPhotoIndexFiles", metrics.photo_index_files || 0);
   }
+  if (Object.prototype.hasOwnProperty.call(metrics, "video_index_files")) {
+    setText("metricVideoIndexFiles", metrics.video_index_files || 0);
+  }
 }
 
 function formatCountPercent(count, total) {
@@ -7377,8 +7887,9 @@ function renderWorkflowSummaries(payload) {
 
 const IMPORT_SOURCE_ORDER = ["project365", "facebook", "swarm", "x_twitter", "instagram"];
 const IMPORT_RUN_STEPS = {project365: "import_zips", facebook: "import_facebook_dayone", x_twitter: "stage_x_archive"};
-const IMPORT_ACTIONS = {project365: "Import ZIPs", facebook: "Build Day One ZIP", x_twitter: "Stage for review"};
+const IMPORT_ACTIONS = {project365: "Import ZIPs", facebook: "Build Day One ZIP", swarm: "Open Swarm review tools", x_twitter: "Stage for review"};
 function importSourceResult(key, history, activeJobs) {
+  if (key === "swarm") return "Selections are saved in the persistent Swarm review database and reused by later exports.";
   const step = IMPORT_RUN_STEPS[key];
   if (!step) return "Importer not available yet.";
   const active = activeJobs.find(job => job.step === step);
@@ -7410,6 +7921,32 @@ function importSourceResult(key, history, activeJobs) {
   }
   return `<div class="import-result"><strong>${escapeHtml(state)}</strong> ${escapeHtml(date)}${summary.error ? `<br>${escapeHtml(summary.error)}` : ""}</div>`;
 }
+function swarmReviewControls(source) {
+  const tools = source.review_tools || {};
+  const backfill = tools.backfill || {};
+  const media = tools.media || {};
+  const backfillSummary = backfill.summary || {};
+  const mediaSummary = media.summary || {};
+  const status = [
+    backfill.running ? `${Number(backfillSummary.pending || 0)} missing-photo decisions pending` : "Missing-photo review starts on demand",
+    media.running ? `${Number(mediaSummary.multi_photo_entry_count || 0)} multi-photo entries` : "Photo order and crop review starts on demand"
+  ].join(" · ");
+  return `<div class="button-row">
+    <a class="button primary small" href="/swarm-review-tool?tool=backfill">Missing-photo review</a>
+    <a class="button small" href="/swarm-review-tool?tool=media">Photo order &amp; crops</a>
+  </div><p>${escapeHtml(status)}</p>`;
+}
+function twitterReviewControls(source, canRun) {
+  const tool = source.review_tool || {};
+  const summary = tool.summary || {};
+  const status = tool.running
+    ? `${Number(summary.recommended_pending || 0)} recommended entries pending · ${Number(summary.reviewed_included || 0)} approved · ${Number(summary.media_count || 0)} media`
+    : "Starts locally on demand; contextless replies stay outside the recommended queue.";
+  return `<div class="button-row">
+    <a class="button primary small" href="/twitter-review-tool">Open diary review</a>
+    <button class="button small" type="button" onclick="runImportSource('x_twitter')" ${canRun && !running ? "" : "disabled"}>Refresh staged metadata</button>
+  </div><p>${escapeHtml(status)}</p>`;
+}
 function renderImportHub(payload) {
   const config = payload.import_sources;
   if (!config) return;
@@ -7428,6 +7965,10 @@ function renderImportHub(payload) {
     const canRun = enabled && supported && (source.ready || override);
     const action = !enabled
       ? `<button class="button small" type="button" onclick="enableImportSource('${key}')">Enable</button>`
+      : key === "swarm" && source.ready
+        ? swarmReviewControls(source)
+      : key === "x_twitter" && source.ready
+        ? twitterReviewControls(source, canRun)
       : supported
         ? `<button class="button primary small" type="button" onclick="runImportSource('${key}')" ${canRun && !running ? "" : "disabled"}>${IMPORT_ACTIONS[key]}</button>`
         : `<button class="button small" type="button" disabled>Importer coming later</button>`;
@@ -7454,7 +7995,7 @@ function showImportSetup() {
   if (!setup || !choices) return;
   choices.innerHTML = IMPORT_SOURCE_ORDER.map(key => {
     const source = (config.sources || {})[key];
-    const suffix = source?.capability === "unavailable" ? " (folder only)" : source?.capability === "stage_for_review" ? " (stage only)" : "";
+    const suffix = source?.capability === "unavailable" ? " (folder only)" : source?.capability === "stage_for_review" ? " (stage only)" : source?.capability === "review_tools" ? " (review tools)" : "";
     return source ? `<label class="checkbox-line"><input type="checkbox" value="${key}" ${source.enabled ? "checked" : ""}>${escapeHtml(source.label + suffix)}</label>` : "";
   }).join("");
   setup.hidden = false;
@@ -7644,6 +8185,30 @@ async function runWorkingCopies() {
     force
   });
   await refreshWorkingCopyReadiness();
+}
+
+async function runVideoMemoryReview() {
+  const scope = dateScopeFromInputValues(
+    document.getElementById("videoMemoryStartDate").value,
+    document.getElementById("videoMemoryEndDate").value,
+    {allowBlank: true}
+  );
+  if (!scope.ok) {
+    setStepMessage("prepare_video_memory_review", scope.message, "error");
+    return;
+  }
+  const dateLabel = scope.startDate
+    ? `${scope.startDate} to ${scope.endDate}`
+    : "all indexed capture dates";
+  setStepMessage(
+    "prepare_video_memory_review",
+    `Starting missing-video preparation for ${dateLabel}...`,
+    "running"
+  );
+  await runStep("prepare_video_memory_review", {
+    start_date: scope.startDate,
+    end_date: scope.endDate
+  });
 }
 
 async function startCropEstimateBatch() {
@@ -7897,6 +8462,10 @@ function jobProgressPercent(job) {
   if (step === "generate_derivatives") {
     const progress = latestWorkingCopyProgress(job);
     if (progress) return percentComplete(progress.done, progress.total);
+  }
+  if (step === "prepare_video_memory_review") {
+    const progress = latestVideoMemoryProgress(job);
+    if (progress) return progress.percent;
   }
   return null;
 }
@@ -9281,6 +9850,7 @@ function setStepMessage(step, message, state = "") {
     rough_visual_match: "roughVisualMessage",
     rough_visual_benchmark: "roughVisualMessage",
     generate_derivatives: "workingCopyMessage",
+    prepare_video_memory_review: "videoMemoryReviewMessage",
     import_digikam_people: "digikamPeopleMessage",
     import_facebook_dayone: "importHubMessage"
   };
@@ -9301,6 +9871,7 @@ function stepCompletionMessage(step) {
   if (step === "rough_visual_match") return "No-date visual match completed. Refreshing results...";
   if (step === "rough_visual_benchmark") return "No-date visual benchmark exported.";
   if (step === "generate_derivatives") return "Working photo copies completed.";
+  if (step === "prepare_video_memory_review") return "Missing videos prepared for review.";
   if (step === "import_digikam_people") return "digiKam suggestions imported. Tag queue refreshed.";
   if (step === "import_facebook_dayone") return "Facebook Day One ZIP completed.";
   if (step === "stage_x_archive") return "X archive staged for review; no entries were imported into the journal.";
@@ -9403,6 +9974,9 @@ function progressDetail(job) {
   }
   if ((job.step || progressStep) === "generate_derivatives") {
     return workingCopyProgressDetail(job);
+  }
+  if ((job.step || progressStep) === "prepare_video_memory_review") {
+    return videoMemoryProgressDetail(job);
   }
   const latest = latestOutput(job);
   if (latest) {
@@ -9572,6 +10146,39 @@ function latestWorkingCopyProgress(job) {
     };
   }
   return null;
+}
+
+function latestVideoMemoryProgress(job) {
+  const lines = latestOutput(job).trim().split("\n").filter(Boolean).reverse();
+  for (const line of lines) {
+    const match = line.match(/^Progress:\s+(\d+)\/(\d+)\s+videos\s+·\s+prepared\s+(\d+)\s+·\s+failed\s+(\d+)(?:\s+·\s+latest\s+(.+))?$/);
+    if (!match) continue;
+    const done = Number(match[1] || 0);
+    const total = Number(match[2] || 0);
+    return {
+      done,
+      total,
+      prepared: Number(match[3] || 0),
+      failed: Number(match[4] || 0),
+      latest: match[5] || "",
+      percent: total ? Math.max(0, Math.min(100, (done / total) * 100)) : 0
+    };
+  }
+  return null;
+}
+
+function videoMemoryProgressDetail(job) {
+  const progress = latestVideoMemoryProgress(job);
+  if (!progress) {
+    if (job.status === "queued") return "Waiting to prepare videos.";
+    if (job.status === "cancelling") return "Stopping video preparation.";
+    if (job.status === "cancelled") return "Stopped.";
+    if (job.status === "pass") return "Video preparation finished.";
+    if (job.status === "fail") return job.error || "Video preparation failed.";
+    return "Discovering missing videos...";
+  }
+  const latest = progress.latest ? ` · latest ${progress.latest}` : "";
+  return `${progress.done}/${progress.total} videos · ${progress.percent.toFixed(1)}% · ${progress.prepared} prepared · ${progress.failed} failed${latest}`;
 }
 
 function genericRunningProgressDetail(job) {
@@ -9761,8 +10368,11 @@ def _patch_control_html(html: str) -> str:
             '<div class="step-kicker">Step 5</div>\n          <h2>Crop confirmation</h2>': '<div class="step-kicker">Step 6</div>\n          <h2>Crop confirmation</h2>',
             '<div class="step-kicker">Step 6</div>\n          <h2>Working photo copies</h2>': '<div class="step-kicker">Step 7</div>\n          <h2>Working photo copies</h2>',
             '<div class="step-kicker">Step 7</div>\n          <h2>People / face tagging</h2>': '<div class="step-kicker">Step 8</div>\n          <h2>People / face tagging</h2>',
-            '<div class="step-kicker">Step 8</div>\n          <h2>Diary enrichment</h2>': '<div class="step-kicker">Step 9</div>\n          <h2>Diary enrichment</h2>',
-            '<div class="step-kicker">Step 9</div>\n          <h2>Diarium import package</h2>': '<div class="step-kicker">Step 10</div>\n          <h2>Diarium import package</h2>',
+            '<div class="step-kicker">Step 8</div>\n          <h2>Diary intake</h2>': '<div class="step-kicker">Step 9</div>\n          <h2>Diary intake</h2>',
+            '<div class="step-kicker">Step 9</div>\n          <h2>Diary enrichment</h2>': '<div class="step-kicker">Step 10</div>\n          <h2>Diary enrichment</h2>',
+            '<div class="step-kicker">Step 10</div>\n          <h2>Diarium import package</h2>': '<div class="step-kicker">Step 11</div>\n          <h2>Diarium import package</h2>',
+            '<div><div class="step-kicker">Step 11</div><h2>Day One journals: Project365 + Private</h2></div>': '<div><div class="step-kicker">Step 12</div><h2>Day One journals: Project365 + Private</h2></div>',
+            '<div><div class="step-kicker">Step 12</div><h2>Import your data</h2></div>': '<div><div class="step-kicker">Step 1</div><h2>Import your data</h2></div>',
         }
         for old, new in replacements.items():
             html = html.replace(old, new, 1)
@@ -9778,15 +10388,43 @@ def _patch_control_html(html: str) -> str:
         <button class="button small step-toggle" data-step-toggle="video_memory_review" onclick="toggleWorkflowStep('video_memory_review')" aria-expanded="false">Open</button>
       </div>
       <div class="workflow-step-body">
-      <div class="subtle">Runs on its own local server so heavy thumbnail, video, and render work stays isolated from the Control Panel. Review pre-generated frames, adjust the on-device AI suggestions, set video-wide or individual screenshot privacy, choose each key frame, and explicitly queue final JPEGs.</div>
-      <div class="button-row">
-        <a class="button primary" href="http://127.0.0.1:8767/">Open video memory review</a>
+      <div class="subtle">Prepare indexed source videos that are not already ready in the review queue. Frame scoring uses Apple Vision on this Mac. Existing ready videos are skipped.</div>
+      <div class="grid">
+        <div class="field">
+          <label for="videoMemoryStartDate">Start capture date</label>
+          <input id="videoMemoryStartDate" placeholder="YYYY-MM-DD or YYYY-MM">
+        </div>
+        <div class="field">
+          <label for="videoMemoryEndDate">End capture date</label>
+          <input id="videoMemoryEndDate" placeholder="optional end">
+        </div>
       </div>
+      <div class="subtle">Leave both dates blank for all indexed capture dates. A start month means the full month; a start day means that day when no end is entered.</div>
+      <div class="button-row">
+        <button class="button primary" type="button" onclick="runVideoMemoryReview()">Prepare missing videos</button>
+        <a class="button primary" href="http://127.0.0.1:8767/triage">Continue rapid triage</a>
+        <a class="button" href="http://127.0.0.1:8767/">Open detailed video review</a>
+      </div>
+      <div id="videoMemoryReviewMessage" class="inline-status" role="status" aria-live="polite"></div>
+      <div class="step-result" data-step-result="video_memory_review"></div>
+      <div class="step-history" data-step-history="video_memory_review"></div>
       </div>
     </section>
 
 """
         html = html.replace(marker, video_section + marker, 1)
+    import_marker = '    <section class="panel workflow-step" data-step="import_hub">'
+    first_workflow_marker = '    <section class="panel workflow-step" data-step="build_photo_index">'
+    import_start = html.find(import_marker)
+    first_workflow_start = html.find(first_workflow_marker)
+    if import_start > first_workflow_start >= 0:
+        import_end = html.find('\n    </section>', import_start)
+        if import_end >= 0:
+            import_end += len('\n    </section>')
+            import_section = html[import_start:import_end]
+            html = html[:import_start] + html[import_end:]
+            first_workflow_start = html.find(first_workflow_marker)
+            html = html[:first_workflow_start] + import_section + '\n\n' + html[first_workflow_start:]
     return html
 
 CONTROL_HTML = _patch_control_html(CONTROL_HTML)

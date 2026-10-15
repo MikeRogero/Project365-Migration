@@ -160,6 +160,12 @@ The included adapter configuration is for X/Twitter archive-style exports. The
 staging JSONL may contain private social text, so it is written under ignored
 local output paths and should not be committed.
 
+The Control Panel's Twitter/X card also opens a persistent, media-first diary
+review tool. It groups replies to the account's own archived posts into threads,
+keeps replies with missing parent context outside the recommended queue, supports
+editing/rating/reversible decisions, and exports only explicitly approved entries
+to a structurally verified Day One test ZIP. See `TWITTER_DAYONE_IMPORT.md`.
+
 ### Diarium Export and Reconciliation
 
 For Day One itself, the Control Panel also has **Day One journals: Project365 +
@@ -181,7 +187,7 @@ new journals rather than updating the previous import.
 
 ### Facebook JSON Export to Day One
 
-In the Control Panel, open **Step 12: Import your data** and enable Facebook.
+In the Control Panel, open **Import your data** and enable Facebook.
 Drop the extracted Facebook **JSON** export root (the folder containing
 `your_activity_across_facebook/posts`) into the indicated source folder. Put
 other HTML/media-only exports under its `Other Facebook Data Exports` folder.
@@ -310,14 +316,34 @@ mkdir -p Project365Canonical
 mkdir -p Reports
 ```
 
-On first launch, Step 12 in the Control Panel asks which import sources to enable.
+On first launch, Imports in the Control Panel asks which import sources to enable.
 It creates drop folders under `Source Data` for the selected sources (Project365
 Pro, Facebook, Swarm, Twitter/X, and Instagram). Drop each export into the
-folder shown on its card. Disabled sources can be enabled later in Step 12.
+folder shown on its card. Disabled sources can be enabled later in Imports.
 Project365 Pro imports into the canonical database; Facebook builds a Day One
-ZIP; Twitter/X stages posts for review. Swarm and Instagram currently have
-drop-folder setup only, not working importers. An advanced folder override is
+ZIP; the standalone Swarm importer below builds a locally validated Day One
+JSON ZIP; Twitter/X stages posts for review. Instagram currently has drop-folder
+setup only, not a working importer. An advanced folder override is
 available when the export is stored elsewhere.
+
+For Swarm, start with the small Day One pilot and verify its venue names, map
+locations, entry times, photo grouping, and source links before building the
+multi-gigabyte full package:
+
+```sh
+python3 swarm_dayone_importer.py \
+  --source "Source Data/Swarm Data Export" \
+  --output-dir "Project365Canonical/exports/swarm_dayone" \
+  --pilot
+```
+
+See [the Swarm to Day One import guide](SWARM_DAYONE_IMPORT.md) for the
+conversion rules, exclusions, and full-export command.
+
+Crop review is centralized in the Crop Workbench. Its provider selector serves
+Project365 and Swarm today while preserving each importer's own persistence and
+commit semantics. Future importers should implement the shared provider
+contract in `project365_crop_workbench.py` instead of creating another crop UI.
 
 Copy Project365 monthly ZIP exports into:
 

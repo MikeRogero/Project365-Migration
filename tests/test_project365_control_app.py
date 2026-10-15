@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -20,6 +22,67 @@ import project365_control_app as control
 
 
 class Project365ControlAppTests(unittest.TestCase):
+    def test_twitter_review_tool_is_exposed_in_import_hub(self) -> None:
+        html = control.CONTROL_HTML
+
+        self.assertIn('href="/twitter-review-tool"', html)
+        self.assertIn("Open diary review", html)
+        self.assertIn("contextless replies stay outside the recommended queue", html)
+
+    def test_twitter_review_tool_uses_persistent_project_paths(self) -> None:
+        spec = control._twitter_review_tool_spec()
+
+        self.assertEqual(spec["url"], "http://127.0.0.1:8773/")
+        self.assertIn("twitter_dayone_workflow.py", [Path(value).name for value in spec["command"]])
+        self.assertIn(str(control.TWITTER_REVIEW_DB), spec["command"])
+        self.assertIn(str(control.TWITTER_DAYONE_IMPORT_BATCH_DIR), spec["command"])
+        self.assertEqual(spec["command"][-3:], ["serve", "--port", "8773"])
+
+    def test_swarm_review_tools_are_exposed_in_import_hub(self) -> None:
+        html = control.CONTROL_HTML
+
+        self.assertIn('swarm: "Open Swarm review tools"', html)
+        self.assertIn('href="/swarm-review-tool?tool=backfill"', html)
+        self.assertIn('href="/swarm-review-tool?tool=media"', html)
+
+    def test_swarm_review_tool_commands_use_persistent_project_paths(self) -> None:
+        specs = control._swarm_review_tool_specs()
+
+        self.assertEqual(set(specs), {"backfill", "media"})
+        self.assertIn("swarm_photo_backfill_review.py", " ".join(specs["backfill"]["command"]))
+        self.assertIn("Project365Canonical/swarm_dayone_backfill", " ".join(specs["backfill"]["command"]))
+        self.assertIn("swarm_media_workflow.py", " ".join(specs["media"]["command"]))
+        self.assertIn("Project365Canonical/swarm_dayone_media/review.sqlite3", " ".join(specs["media"]["command"]))
+
+    def test_swarm_review_tool_starts_detached_and_waits_for_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            process = mock.Mock()
+            process.poll.return_value = None
+            specs = {
+                "backfill": {
+                    "label": "Missing-photo review",
+                    "url": "http://127.0.0.1:8771/",
+                    "health_url": "http://127.0.0.1:8771/api/summary",
+                    "log": Path(temporary) / "backfill.log",
+                    "command": [sys.executable, "swarm_photo_backfill_review.py"],
+                }
+            }
+            with (
+                mock.patch.object(control, "_swarm_review_tool_specs", return_value=specs),
+                mock.patch.object(control.import_sources, "resolve_swarm"),
+                mock.patch.object(control, "_swarm_review_tools_status", return_value={
+                    "backfill": {"running": False},
+                }),
+                mock.patch.object(control, "_local_json", return_value={"pending": 3}),
+                mock.patch.object(control.subprocess, "Popen", return_value=process) as popen,
+            ):
+                status = control._start_swarm_review_tool("backfill")
+
+        self.assertTrue(status["running"])
+        self.assertEqual(status["summary"], {"pending": 3})
+        self.assertIs(popen.call_args.kwargs["stdin"], control.subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
     def test_import_step_uses_project365_pro_zip_source_folder(self) -> None:
         commands = control._commands_for_step("import_zips", {})
 
@@ -44,6 +107,125 @@ class Project365ControlAppTests(unittest.TestCase):
 
             self.assertEqual(control._initial_entry_count(db_path), 3)
             self.assertEqual(control._initial_unique_day_count(db_path), 2)
+
+    def test_prepared_import_counts_use_latest_source_summary_and_unique_staged_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            facebook_dir = root / "facebook"
+            swarm_dir = root / "swarm"
+            facebook_dir.mkdir()
+            swarm_dir.mkdir()
+            old_facebook = facebook_dir / "facebook_dayone_old_manifest.json"
+            new_facebook = facebook_dir / "facebook_dayone_new_manifest.json"
+            old_facebook.write_text(json.dumps({"entry_count": 2}), encoding="utf-8")
+            new_facebook.write_text(json.dumps({"entry_count": 4}), encoding="utf-8")
+            old_swarm = swarm_dir / "swarm_dayone_old_manifest.json"
+            new_swarm = swarm_dir / "swarm_dayone_new_manifest.json"
+            old_swarm.write_text(json.dumps({"full_entry_count": 3}), encoding="utf-8")
+            new_swarm.write_text(json.dumps({"full_entry_count": 6}), encoding="utf-8")
+            os.utime(old_facebook, (1, 1))
+            os.utime(new_facebook, (2, 2))
+            os.utime(old_swarm, (1, 1))
+            os.utime(new_swarm, (2, 2))
+            staging = root / "x.jsonl"
+            staging.write_text(
+                "\n".join(
+                    json.dumps({"source_name": "x_archive", "source_id": source_id})
+                    for source_id in ("one", "one", "two")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            counts = control._prepared_outside_import_entry_counts(
+                facebook_dir=facebook_dir,
+                swarm_dir=swarm_dir,
+                x_staging_path=staging,
+            )
+
+        self.assertEqual(counts, {"facebook": 4, "swarm": 6, "x_archive": 2})
+
+    def test_diary_entry_metrics_combine_sources_without_counting_prepared_reruns_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "canonical.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE entries (id TEXT PRIMARY KEY, entry_date TEXT, source_app TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO entries VALUES (?, ?, ?)",
+                    [
+                        ("project365:one", "2020-01-01", "project365"),
+                        ("project365:two", "2020-01-02", "project365"),
+                        ("social:facebook:one", "2020-01-01", "facebook"),
+                        ("social:x_archive:one", "2020-01-01", "x_archive"),
+                        ("manual:one", "2020-01-03", "manual"),
+                    ],
+                )
+            with mock.patch.object(
+                control,
+                "_prepared_outside_import_entry_counts",
+                return_value={"facebook": 4, "swarm": 3, "x_archive": 1},
+            ):
+                metrics = control._diary_entry_metrics(db_path)
+
+        self.assertEqual(metrics["project365_entries"], 2)
+        self.assertEqual(metrics["prepared_import_entries"], 8)
+        self.assertEqual(metrics["diary_entries"], 11)
+        self.assertEqual(
+            metrics["source_counts"],
+            {"facebook": 4, "manual": 1, "project365": 2, "swarm": 3, "x_archive": 1},
+        )
+
+    def test_initial_video_index_file_count_uses_dedicated_video_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "video_library_legacy_index.sqlite"
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("CREATE TABLE photo_library_files (path TEXT PRIMARY KEY)")
+                connection.executemany(
+                    "INSERT INTO photo_library_files (path) VALUES (?)",
+                    [("one.mov",), ("two.avi",), ("three.mp4",)],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(control._initial_video_index_file_count(db_path), 3)
+            self.assertEqual(
+                control._initial_video_index_file_count(Path(tmpdir) / "missing.sqlite"),
+                0,
+            )
+
+    def test_initial_top_metrics_can_include_only_video_index_count(self) -> None:
+        with (
+            mock.patch.object(control, "_initial_project365_photo_gap_counts", return_value={
+                "project365_entries": 0,
+                "without_identified_original": 0,
+                "associated_photos": 0,
+            }),
+            mock.patch.object(control, "_initial_unique_day_count", return_value=0),
+            mock.patch.object(control, "_initial_entry_count", return_value=0),
+            mock.patch.object(control, "_diary_entry_metrics", return_value={
+                "diary_entries": 0,
+                "project365_entries": 0,
+                "prepared_import_entries": 0,
+                "source_counts": {},
+            }),
+            mock.patch.object(control, "_initial_video_index_file_count", return_value=42),
+            mock.patch.object(
+                control,
+                "_initial_photo_index_file_count",
+                side_effect=AssertionError("photo index count should be omitted"),
+            ),
+        ):
+            metrics = control._initial_top_metrics(
+                include_photo_index=False,
+                include_video_index=True,
+            )
+
+        self.assertEqual(metrics["video_index_files"], 42)
+        self.assertNotIn("photo_index_files", metrics)
 
     def test_search_step_includes_default_original_folder_and_extra_roots(self) -> None:
         commands = control._commands_for_step(
@@ -1437,13 +1619,72 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn("reject_duplicate", control.MEDIA_DEDUPE_HTML)
         self.assertIn('event.key === "ArrowRight"', control.MEDIA_DEDUPE_HTML)
 
+    def test_control_workflow_starts_with_imports_and_has_sequential_step_labels(self) -> None:
+        cards = re.findall(
+            r'<section class="panel workflow-step" data-step="([^"]+)">.*?'
+            r'<div class="step-kicker">([^<]+)</div>.*?</section>',
+            control.CONTROL_HTML,
+            re.DOTALL,
+        )
+
+        self.assertEqual(
+            cards,
+            [
+                ("import_hub", "Step 1"),
+                ("build_photo_index", "Step 2"),
+                ("match_easy_originals", "Step 3"),
+                ("media_dedupe_review", "Step 4"),
+                ("video_memory_review", "Independent tool"),
+                ("broad_visual_match", "Step 5"),
+                ("rough_visual_match", "Step 5B"),
+                ("crop_confirmation", "Step 6"),
+                ("generate_derivatives", "Step 7"),
+                ("face_tagging", "Step 8"),
+                ("diary_intake", "Step 9"),
+                ("diary_enrichment", "Step 10"),
+                ("generate_diarium_package", "Step 11"),
+                ("generate_dayone_package", "Step 12"),
+            ],
+        )
+        self.assertIn("Unique diary entries", control.CONTROL_HTML)
+
     def test_video_memory_review_is_available_from_control_panel(self) -> None:
         self.assertIn("video_memory_review", control.WORKFLOW_STEPS)
         self.assertIn('data-step="video_memory_review"', control.CONTROL_HTML)
+        self.assertIn('href="http://127.0.0.1:8767/triage"', control.CONTROL_HTML)
         self.assertIn('href="http://127.0.0.1:8767/"', control.CONTROL_HTML)
+        self.assertIn('id="videoMemoryStartDate"', control.CONTROL_HTML)
+        self.assertIn('id="videoMemoryEndDate"', control.CONTROL_HTML)
+        self.assertIn("function runVideoMemoryReview()", control.CONTROL_HTML)
+        self.assertIn('runStep("prepare_video_memory_review"', control.CONTROL_HTML)
+        self.assertIn("function latestVideoMemoryProgress(job)", control.CONTROL_HTML)
+        self.assertIn('step === "prepare_video_memory_review"', control.CONTROL_HTML)
+        self.assertIn("progress.percent.toFixed(1)", control.CONTROL_HTML)
         source = Path(control.__file__).read_text()
         self.assertNotIn("import project365_video_memory_review", source)
         self.assertNotIn('parsed.path == "/video-memory/api/videos"', source)
+
+    def test_video_memory_review_prepare_step_queues_all_missing_in_date_scope(self) -> None:
+        command = control._commands_for_step(
+            "prepare_video_memory_review",
+            {"start_date": "2020-02-01", "end_date": "2020-02-29"},
+        )[0]
+
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                "project365_video_memory_review.py",
+                "--canonical-root",
+                "Project365Canonical",
+                "prepare-batch",
+                "--all-missing",
+                "--start-date",
+                "2020-02-01",
+                "--end-date",
+                "2020-02-29",
+            ],
+        )
 
     def test_media_dedupe_api_adds_media_urls_and_records_decisions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2167,10 +2408,12 @@ class Project365ControlAppTests(unittest.TestCase):
         html = control._embedded_crop_html()
 
         self.assertIn('href="/?step=crop_confirmation"', html)
-        self.assertIn("fetchJson(cropEntriesUrl(cropFilter, anchorMonth))", html)
+        self.assertIn("fetchCropEntriesWindow(cropFilter, anchorMonth)", html)
         self.assertIn("`/crop/api/crop-entries?${params.toString()}`", html)
         self.assertIn('params.set("start_date", state.cropStartDate);', html)
-        self.assertIn('fetchJson(`/crop/api/crop-entry/', html)
+        self.assertIn("fetchCropEntryDetail(entryId, candidatePath)", html)
+        self.assertIn('`/crop/api/crop-entry/${encodeURIComponent(entryId)}', html)
+        self.assertNotIn('`/api/crop-entry/${encodeURIComponent(entryId)}', html)
         self.assertIn('fetchJson("/crop/api/crop"', html)
         self.assertIn('fetchJson("/crop/api/crop-reset"', html)
         self.assertIn('fetchJson("/crop/api/crop-commit"', html)
@@ -2180,11 +2423,76 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('fetchJson(`/crop/api/crop-estimate-batch/', html)
         self.assertNotIn('id="estimateCropBatchButton"', html)
         self.assertIn('const base = `/picker/image/${encodeURIComponent(token)}`;', html)
-        self.assertIn("`/picker/image/${entry.source_token}`", html)
+        self.assertIn('cropImageUrl(entry.source_token, "", "")', html)
         self.assertNotIn('fetchJson("/api/', html)
         self.assertNotIn('fetchJson(`/api/', html)
         self.assertNotIn('src="/image/${', html)
         self.assertNotIn("`/image/${", html)
+
+    def test_crop_provider_selection_and_api_dispatch_are_isolated(self) -> None:
+        state = mock.Mock()
+        swarm_provider = mock.Mock()
+        swarm_provider.list_entries.return_value = [{"entry_id": "swarm:one"}]
+        descriptors = [
+            {
+                "id": "project365",
+                "label": "Project365",
+                "capabilities": {"commit": True},
+                "filters": ["missing", "all"],
+            },
+            {
+                "id": "swarm",
+                "label": "Swarm",
+                "capabilities": {"commit": False},
+                "filters": ["missing", "confirmed", "all"],
+            },
+        ]
+        registry = mock.Mock()
+        registry.descriptors.return_value = descriptors
+        registry.get.side_effect = lambda provider_id: (
+            swarm_provider if provider_id == "swarm" else (_ for _ in ()).throw(ValueError("Unknown crop provider"))
+        )
+        server = control.ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            control.create_handler(state, control.ControlConfig("127.0.0.1", 0, "/picker")),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with mock.patch.object(control, "_crop_provider_registry", return_value=registry, create=True):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/crop?provider=swarm", timeout=5
+                ) as response:
+                    crop_html = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/crop/api/crop-providers", timeout=5
+                ) as response:
+                    provider_result = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?provider=swarm&crop_filter=missing",
+                    timeout=5,
+                ) as response:
+                    entry_result = json.loads(response.read().decode("utf-8"))
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/crop/api/crop-entries?provider=unknown",
+                        timeout=5,
+                    )
+                raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertIn('id="cropProvider"', crop_html)
+        self.assertIn('new URLSearchParams(window.location.search).get("provider")', crop_html)
+        self.assertEqual(provider_result["providers"], descriptors)
+        self.assertEqual(entry_result["entries"], [{"entry_id": "swarm:one"}])
+        swarm_provider.list_entries.assert_called_once_with(
+            crop_filter="missing", entry_dates=set(), start_date="", end_date=""
+        )
+        self.assertIn(raised.exception.code, {400, 404})
+        self.assertGreaterEqual(registry.get.call_count, 2)
 
     def test_control_routes_crop_save(self) -> None:
         state = mock.Mock()
@@ -3514,7 +3822,10 @@ class Project365ControlAppTests(unittest.TestCase):
         ):
             status = state.status(["workflow_overview"])
 
-        top_metrics.assert_called_once_with(include_photo_index=False)
+        top_metrics.assert_called_once_with(
+            include_photo_index=False,
+            include_video_index=False,
+        )
         latest_index.assert_called_once_with(control.PHOTO_LIBRARY_INDEX)
         self.assertIn("workflow_history", status)
 
@@ -4347,6 +4658,10 @@ class Project365ControlAppTests(unittest.TestCase):
         self.assertIn('id="metricAssociatedPhotos"', control.CONTROL_HTML)
         self.assertIn("metrics.associated_photos", control.CONTROL_HTML)
         self.assertIn('hasOwnProperty.call(metrics, "photo_index_files")', control.CONTROL_HTML)
+        self.assertIn('<span>Videos in index</span>', control.CONTROL_HTML)
+        self.assertIn('id="metricVideoIndexFiles"', control.CONTROL_HTML)
+        self.assertIn('__INITIAL_VIDEO_INDEX_FILES__', control.CONTROL_HTML)
+        self.assertIn('hasOwnProperty.call(metrics, "video_index_files")', control.CONTROL_HTML)
         self.assertNotIn('id="metricWithoutIdentifiedOriginal"', control.CONTROL_HTML)
         self.assertIn("function formatCountPercent(count, total)", control.CONTROL_HTML)
 
