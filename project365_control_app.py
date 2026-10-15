@@ -239,6 +239,7 @@ def _start_swarm_review_tool(key: str, timeout_seconds: float = 45.0) -> dict[st
                 start_new_session=True,
                 close_fds=True,
             )
+        service_lifecycle.reap_process_on_exit(process)
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -278,6 +279,7 @@ def _start_twitter_review_tool(timeout_seconds: float = 45.0) -> dict[str, Any]:
                 start_new_session=True,
                 close_fds=True,
             )
+        service_lifecycle.reap_process_on_exit(process)
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if process.poll() is not None:

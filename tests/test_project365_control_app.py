@@ -118,6 +118,7 @@ class Project365ControlAppTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(control, "_keep_review_tool_alive"),
+                mock.patch.object(control.service_lifecycle, "reap_process_on_exit") as reap,
                 mock.patch.object(control, "_swarm_review_tool_specs", return_value=specs),
                 mock.patch.object(control.import_sources, "resolve_swarm"),
                 mock.patch.object(control, "_swarm_review_tools_status", return_value={
@@ -129,6 +130,7 @@ class Project365ControlAppTests(unittest.TestCase):
                 status = control._start_swarm_review_tool("backfill")
 
         self.assertTrue(status["running"])
+        reap.assert_called_once_with(process)
         self.assertEqual(status["summary"], {"pending": 3})
         self.assertIs(popen.call_args.kwargs["stdin"], control.subprocess.DEVNULL)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])

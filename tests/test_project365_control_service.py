@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,20 @@ import project365_control_service as service
 
 
 class Project365ControlServiceTests(unittest.TestCase):
+    def test_reap_process_on_exit_waits_for_short_lived_child(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+
+        try:
+            waiter = service.reap_process_on_exit(process)
+        except Exception:
+            process.wait()
+            raise
+        self.assertTrue(waiter.daemon)
+        waiter.join(timeout=5)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(process.returncode, 0)
+
     def test_control_panel_command_starts_local_control_app(self) -> None:
         config = service.ServiceConfig(host="127.0.0.1", port=9876)
 

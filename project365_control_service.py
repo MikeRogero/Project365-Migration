@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +35,13 @@ SERVER_SCRIPTS = (
     SWARM_MEDIA_SERVER_SCRIPT,
     TWITTER_SERVER_SCRIPT,
 )
+
+
+def reap_process_on_exit(process: subprocess.Popen[Any]) -> threading.Thread:
+    """Wait asynchronously so completed child processes are reaped."""
+    waiter = threading.Thread(target=process.wait, daemon=True)
+    waiter.start()
+    return waiter
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,7 @@ def start_control_panel(config: ServiceConfig) -> dict[str, Any]:
             start_new_session=True,
             close_fds=True,
         )
+        reap_process_on_exit(process)
     _write_pid_record(config, process.pid)
     try:
         _wait_for_control_panel(config, process)
@@ -207,6 +216,7 @@ def start_video_memory_review(config: ServiceConfig) -> dict[str, Any]:
             start_new_session=True,
             close_fds=True,
         )
+        reap_process_on_exit(process)
     _write_video_pid_record(config, process.pid)
     try:
         _wait_for_video_memory_review(config, process)
@@ -256,6 +266,7 @@ def start_swarm_backfill_review(config: ServiceConfig) -> dict[str, Any]:
             start_new_session=True,
             close_fds=True,
         )
+        reap_process_on_exit(process)
     _write_swarm_backfill_pid_record(config, process.pid)
     try:
         _wait_for_swarm_backfill_review(config, process)
@@ -343,6 +354,7 @@ def start_review_service(config: ServiceConfig, key: str) -> dict[str, Any]:
             spec["command"], cwd=PROJECT_ROOT, stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
         )
+        reap_process_on_exit(process)
     _write_service_pid_record(
         spec["pid_path"], process.pid, config.host, spec["port"], spec["url"], spec["log_path"],
     )
