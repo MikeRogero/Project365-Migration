@@ -273,7 +273,10 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
               'referenceUpdate'];
             const loads = [];
             const popups = [];
+            const openedWindows = [];
+            const namedTargets = new Map();
             const navigations = [];
+            let popupBlocked = false;
             const elements = Object.fromEntries(ids.map(id => [id, {
               id, dataset:{}, classList:{add(){},remove(){},toggle(){}},
               setAttribute(){}, addEventListener(){}, removeAttribute(name){if(name==='src')this.src=''},
@@ -313,7 +316,12 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
             };
             const window = {addEventListener(){},open(url,name,features){
               popups.push({url,name,features});
-              return {closed:false,focus(){},location:{set href(value){navigations.push(value)}}};
+              if(popupBlocked)return null;
+              let target=namedTargets.get(name);
+              if(!target||target.closed){target={closed:false};namedTargets.set(name,target)}
+              const opened={severed:false,get closed(){return this.severed||target.closed},focus(){},location:{set href(value){navigations.push(value)}}};
+              openedWindows.push(opened);
+              return opened;
             }};
             const context = {document,window,fetch,localStorage:{getItem(){return 'true'},setItem(){}},
               navigator:{},screen:{availWidth:1200,availHeight:800,availLeft:0,availTop:0},
@@ -362,6 +370,21 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
               assert.equal(loads.length,0,'only Google Maps uses an iframe');
               assert.equal(popups.length,1,'Google Images reuses the same fallback window');
               assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved']);
+              openedWindows[0].severed=true;
+              await context.__test.openReferenceWindow();
+              assert.equal(popups.length,2,'a stale proxy triggers a retry');
+              assert.equal(popups[1].name,'swarm-reference-window');
+              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved','https://images.example/resolved']);
+              namedTargets.get('swarm-reference-window').closed=true;
+              await context.__test.openReferenceWindow();
+              assert.equal(popups.length,3,'a truly closed window is reopened on an explicit click');
+              assert.equal(namedTargets.size,1,'the closed named target is replaced with one new window');
+              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved','https://images.example/resolved','https://images.example/resolved']);
+              namedTargets.get('swarm-reference-window').closed=true;
+              popupBlocked=true;
+              await context.__test.openReferenceWindow();
+              assert.equal(popups.length,4,'a blocked reopen is attempted on an explicit click');
+              assert.match(elements.referenceStatus.textContent,/browser blocked the new window/i);
             })().catch(error=>{console.error(error);process.exitCode=1});
         """)
         result = subprocess.run(
