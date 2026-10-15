@@ -270,7 +270,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
               'googleMapsPrompt','googleImagesPanel','googleImagesPrompt','googleImagesQuery',
               'copyGoogleImages','googleImagesStatus','openGoogleImages','locationAddress',
               'drop','dropStatus','localImageInput','commonsButton','webStatus','referenceStatus',
-              'referenceUpdate'];
+              'referenceUpdate','submitBatch','batchProgress','reviewStatus','queuePosition'];
             const loads = [];
             const popups = [];
             const openedWindows = [];
@@ -327,7 +327,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
               navigator:{},screen:{availWidth:1200,availHeight:800,availLeft:0,availTop:0},
               console:{warn(){}},URL,Blob,DOMParser:class{},setTimeout,clearTimeout};
             let script = match[1];
-            script = script.replace(/wireDrop\(\);\s*load\(\);\s*$/, `wireDrop(); globalThis.__test={load,selectReference,submitSelectedReference,openReferenceWindow}; globalThis.__initialLoad=load();`);
+            script = script.replace(/wireDrop\(\);\s*runReviewAction\(\(\)=>load\(0,true\)\);\s*$/, `wireDrop(); globalThis.__test={load,selectReference,submitSelectedReference,openReferenceWindow}; globalThis.__initialLoad=load();`);
             vm.runInNewContext(script, context, {timeout:2000});
             (async()=>{
               await context.__initialLoad;
@@ -646,8 +646,8 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
 
             state.select_previous(repeat_payload["entry_token"], previous[0]["repeat_token"])
 
-            first_decision = state.store.get(first.source_key)
-            repeat_decision = state.store.get(repeat.source_key)
+            first_decision = state.store.staged_decisions()[first.source_key]
+            repeat_decision = state.store.staged_decisions()[repeat.source_key]
             self.assertEqual(repeat_decision["status"], "selected")
             self.assertEqual(
                 repeat_decision["candidate"]["relative_path"],
@@ -782,7 +782,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
         self.assertIn("body:payload", upload_handler)
         self.assertNotIn("body:file", upload_handler)
 
-    def test_manual_drop_persists_and_advances_the_pending_queue(self) -> None:
+    def test_manual_drop_stages_and_preserves_the_pending_queue(self) -> None:
         first = self._entry("checkin:first", "checkin", 2020, venue_id="venue-1")
         second = self._entry("checkin:second", "checkin", 2021, venue_id="venue-2")
         payload = b"\xff\xd8\xffrepresentative-photo"
@@ -793,14 +793,17 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
 
             state.save_manual(first_token, "maya.jpg", payload)
 
-            decision = state.store.get("checkin:first")
-            next_pending = state.entry_payload("pending", 0)
+            decision = state.store.staged_decisions()["checkin:first"]
+            next_pending = state.entry_payload("pending", 1)
             stored_path = state_dir / decision["candidate"]["relative_path"]
             self.assertEqual(decision["status"], "selected")
             self.assertEqual(decision["candidate"]["kind"], "manual")
             self.assertEqual(stored_path.read_bytes(), payload)
             self.assertEqual(next_pending["entry"]["title"], second.title)
-            self.assertEqual(next_pending["count"], 1)
+            self.assertEqual(next_pending["count"], 2)
+            self.assertIsNone(state.store.get("checkin:first"))
+            self.assertEqual(state.submit(), 1)
+            self.assertEqual(state.entry_payload("pending", 0)["count"], 1)
 
     def test_remote_image_drop_fetches_only_the_image_and_records_its_source(self) -> None:
         class Headers:
@@ -842,7 +845,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
                     "https://images.smartshanghai.com.cn/uploads/example.jpg",
                 )
 
-            candidate = state.store.get(entry.source_key)["candidate"]
+            candidate = state.store.staged_decisions()[entry.source_key]["candidate"]
             self.assertEqual(candidate["kind"], "manual")
             self.assertEqual(
                 candidate["source_url"],

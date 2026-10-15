@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from project365_service_activity import (
     activity_handler,
@@ -268,8 +268,12 @@ class BackfillDecisionStore:
             return {"schema_version": 1, "decisions": {}}
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if (not isinstance(payload, dict) or payload.get("schema_version") != 1
-                or not isinstance(payload.get("decisions"), dict)):
+                or not isinstance(payload.get("decisions"), dict)
+                or not isinstance(payload.get("staged_decisions", {}), dict)):
             raise ValueError("Invalid Swarm backfill decision file")
+        if any(not isinstance(key, str) or not isinstance(value, dict)
+               for key, value in payload.get("staged_decisions", {}).items()):
+            raise ValueError("Invalid staged Swarm backfill decision")
         return payload
 
     def get(self, source_key: str) -> dict[str, Any] | None:
@@ -284,7 +288,11 @@ class BackfillDecisionStore:
                 if isinstance(key, str) and isinstance(value, dict)
             }
 
-    def select(self, source_key: str, candidate: dict[str, Any]) -> None:
+    def staged_decisions(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return dict(self._payload().get("staged_decisions", {}))
+
+    def select(self, source_key: str, candidate: dict[str, Any], *, staged: bool = False) -> None:
         allowed = {
             "kind", "photo_source_id", "source_entry_key", "source_url", "label",
             "relative_path", "title", "author", "license", "license_url",
@@ -295,27 +303,51 @@ class BackfillDecisionStore:
             raise ValueError("Invalid representative-photo candidate")
         with self._lock:
             payload = self._payload()
-            payload["decisions"][source_key] = {
+            payload.setdefault("staged_decisions" if staged else "decisions", {})[source_key] = {
                 "status": "selected",
                 "updated_at": dt.datetime.now(dt.UTC).isoformat(),
                 "candidate": clean,
             }
             self._write(payload)
 
-    def skip(self, source_key: str) -> None:
+    def skip(self, source_key: str, *, staged: bool = False) -> None:
         with self._lock:
             payload = self._payload()
-            payload["decisions"][source_key] = {
+            payload.setdefault("staged_decisions" if staged else "decisions", {})[source_key] = {
                 "status": "skipped",
                 "updated_at": dt.datetime.now(dt.UTC).isoformat(),
             }
             self._write(payload)
 
-    def clear(self, source_key: str) -> None:
+    def clear(self, source_key: str, *, staged: bool = False) -> None:
         with self._lock:
             payload = self._payload()
-            payload["decisions"].pop(source_key, None)
+            if staged:
+                drafts = payload.setdefault("staged_decisions", {})
+                if source_key in payload["decisions"]:
+                    drafts[source_key] = {"status": "pending"}
+                else:
+                    drafts.pop(source_key, None)
+            else:
+                payload["decisions"].pop(source_key, None)
             self._write(payload)
+
+    def submit(self, validate: Callable[[str, dict[str, Any]], None]) -> int:
+        with self._lock:
+            payload = self._payload()
+            drafts = payload.get("staged_decisions", {})
+            for source_key, decision in drafts.items():
+                validate(source_key, decision)
+            if not drafts:
+                return 0
+            for source_key, decision in drafts.items():
+                if decision["status"] == "pending":
+                    payload["decisions"].pop(source_key, None)
+                else:
+                    payload["decisions"][source_key] = decision
+            payload["staged_decisions"] = {}
+            self._write(payload)
+            return len(drafts)
 
     def _write(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -401,6 +433,7 @@ class BackfillReviewState:
     def __init__(self, entries: list[Entry], state_dir: Path,
                  geocoder_url: str = NOMINATIM_REVERSE_URL):
         self.targets = build_review_targets(entries)
+        self.entries_by_key = {entry.source_key: entry for entry in entries}
         self.state_dir = state_dir.resolve()
         self.media_dir = self.state_dir / "media"
         self.store = BackfillDecisionStore(self.state_dir / "decisions.json")
@@ -567,6 +600,8 @@ class BackfillReviewState:
 
     def summary(self) -> dict[str, int]:
         decisions = self.store.decisions()
+        drafts = self.store.staged_decisions()
+        staged_counts = Counter(decision.get("status") for decision in drafts.values())
         counts = Counter(
             decision.get("status") for decision in decisions.values()
             if decision.get("status") in {"selected", "skipped"}
@@ -578,6 +613,10 @@ class BackfillReviewState:
             "skipped": counts["skipped"],
             "with_local_candidates": sum(bool(target.candidates) for target in self.targets),
             "without_local_candidates": sum(not target.candidates for target in self.targets),
+            "staged": len(drafts),
+            "staged_selected": staged_counts["selected"],
+            "staged_skipped": staged_counts["skipped"],
+            "staged_cleared": staged_counts["pending"],
         }
 
     def filtered(self, status: str) -> list[ReviewTarget]:
@@ -615,6 +654,7 @@ class BackfillReviewState:
         if not venue_id:
             return []
         decisions = self.store.decisions()
+        decisions.update(self.store.staged_decisions())
         matching_targets = sorted(
             (
                 other for other in self.targets
@@ -655,15 +695,28 @@ class BackfillReviewState:
             }, dict(candidate)))
         return choices
 
-    def entry_payload(self, status: str, index: int) -> dict[str, Any]:
+    def entry_payload(self, status: str, index: int, *, resume: bool = False) -> dict[str, Any]:
         filtered = self.filtered(status)
         if not filtered:
             return {"entry": None, "index": 0, "count": 0, "summary": self.summary()}
+        drafts = self.store.staged_decisions()
+        if resume and status == "pending":
+            index = next((i for i, target in enumerate(filtered)
+                          if target.entry.source_key not in drafts), len(filtered) - 1)
         bounded = max(0, min(index, len(filtered) - 1))
         target = filtered[bounded]
         entry = target.entry
         entry_token = self.entry_tokens[entry.source_key]
-        decision = self.store.get(entry.source_key)
+        decision = drafts.get(entry.source_key, self.store.get(entry.source_key))
+        selected_candidate = None
+        if decision and decision.get("status") == "selected":
+            candidate = decision.get("candidate", {})
+            if not isinstance(candidate, dict):
+                candidate = {}
+            selected_path = self._selected_candidate_path(candidate)
+            selected_candidate = {**candidate, "preview_url": (
+                f"/media/{self._media_token(selected_path)}" if selected_path is not None else ""
+            )}
         candidates = []
         for candidate in target.candidates:
             candidate_token = hashlib.sha256(
@@ -716,6 +769,8 @@ class BackfillReviewState:
                     payload for payload, _ in self._previous_candidate_choices(target)
                 ],
                 "decision": decision,
+                "staged": entry.source_key in drafts,
+                "selected_candidate": selected_candidate,
             },
             "index": bounded,
             "count": len(filtered),
@@ -735,7 +790,7 @@ class BackfillReviewState:
             "label": candidate.rationale,
             "width": candidate.photo.width,
             "height": candidate.photo.height,
-        })
+        }, staged=True)
 
     def select_previous(self, entry_token: str, repeat_token: str) -> None:
         target = self._target(entry_token)
@@ -748,13 +803,31 @@ class BackfillReviewState:
         )
         if candidate is None:
             raise ValueError("Unknown previously selected candidate")
-        self.store.select(target.entry.source_key, candidate)
+        self.store.select(target.entry.source_key, candidate, staged=True)
 
     def skip(self, entry_token: str) -> None:
-        self.store.skip(self._target(entry_token).entry.source_key)
+        self.store.skip(self._target(entry_token).entry.source_key, staged=True)
 
     def clear(self, entry_token: str) -> None:
-        self.store.clear(self._target(entry_token).entry.source_key)
+        self.store.clear(self._target(entry_token).entry.source_key, staged=True)
+
+    def submit(self) -> int:
+        def validate(source_key: str, decision: dict[str, Any]) -> None:
+            target = self.targets_by_source_key.get(source_key)
+            if target is None or not isinstance(decision, dict):
+                raise ValueError("Staged decision references an unknown review entry")
+            if decision.get("status") in {"skipped", "pending"}:
+                return
+            candidate = decision.get("candidate")
+            if (decision.get("status") != "selected" or not isinstance(candidate, dict)
+                    or self._selected_candidate_path(candidate) is None):
+                raise ValueError("A staged photo is missing or invalid. Revisit it before submitting.")
+            if candidate.get("kind") == "export":
+                source = self.entries_by_key.get(str(candidate.get("source_entry_key", "")))
+                if source is None or not target.entry.venue_id or source.venue_id != target.entry.venue_id:
+                    raise ValueError("Staged photo is not from the exact same venue")
+
+        return self.store.submit(validate)
 
     def save_manual(self, entry_token: str, filename: str, payload: bytes) -> None:
         target = self._target(entry_token)
@@ -803,7 +876,7 @@ class BackfillReviewState:
         }
         if source_url:
             candidate["source_url"] = source_url
-        self.store.select(target.entry.source_key, candidate)
+        self.store.select(target.entry.source_key, candidate, staged=True)
 
     def commons_candidates(self, entry_token: str) -> list[dict[str, Any]]:
         if entry_token in self.commons_cache:
@@ -880,7 +953,7 @@ class BackfillReviewState:
             "width": candidate["width"],
             "height": candidate["height"],
             "label": "Wikimedia Commons representative venue image",
-        })
+        }, staged=True)
 
     def _commons_query(self, generator: dict[str, str]) -> list[dict[str, Any]]:
         parameters = {
@@ -919,13 +992,13 @@ def _review_html(csrf_token: str) -> str:
 header{{background:#ffffffee;border-bottom:1px solid var(--line);backdrop-filter:blur(10px);padding:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}} h1{{font-size:16px;line-height:1.2;margin:0;flex:1 1 130px}} a{{color:var(--accent)}} .control-panel-link{{border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);padding:5px 7px;text-decoration:none;font-size:12px;font-weight:650;white-space:nowrap;flex:0 0 auto}} #summary{{flex:1 1 100%;font-size:12px;color:var(--muted)}} button,select,textarea{{background:#fff;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font:inherit}} button{{cursor:pointer}} button:hover,.control-panel-link:hover{{border-color:var(--accent)}} button.primary,button.good{{background:var(--accent);border-color:var(--accent);color:#fff}} button.warn{{background:#fff8e1;border-color:#d8b45b;color:#614700}} button:disabled{{opacity:.5;cursor:default}}
 .workspace{{display:grid;grid-template-columns:25% 75%;height:100%}} .review-column{{min-width:0;min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}} .review-pane{{min-height:0;flex:1;padding:10px;overflow:auto}} .review-pane.drop-active{{background:var(--accent-soft)}} .local-image-input{{display:block;width:100%;min-height:46px;margin-top:10px;padding:8px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink)}} .entry{{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}} .eyebrow{{color:var(--accent);font-weight:650}} h2{{margin:5px 0 4px;font-size:21px;line-height:1.2}} .location-address{{margin:0 0 5px;color:#344054;overflow-wrap:anywhere}} .location-address .attribution{{display:block;margin-top:2px;font-size:11px;color:var(--muted)}} .meta,.status,.source{{color:var(--muted)}} .note{{white-space:pre-wrap;margin-top:12px}}
 .notice{{border-left:4px solid var(--warn);padding:9px 10px;background:#fff8e1;border-radius:6px;margin:12px 0}} .candidate-heading{{margin:14px 0 7px;font-size:14px}} .grid{{display:grid;grid-template-columns:1fr;gap:10px}} .candidate{{background:#fff;border:2px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;position:relative}} .candidate:hover{{border-color:var(--accent)}} .candidate.same-visit,.candidate.same-visit:hover{{border-color:#b42318;box-shadow:0 0 0 1px #b42318}} .candidate img{{display:block;width:100%;height:180px;object-fit:cover;background:#eef0ed}} .candidate .copy{{padding:9px}} .number{{position:absolute;top:8px;left:8px;background:#202124dd;color:#fff;border-radius:20px;padding:4px 9px;font-weight:700}} .visit-window{{display:block;color:#b42318;font-weight:650}}
-.drop{{margin:14px 0;border:2px dashed var(--line);border-radius:8px;padding:18px 10px;text-align:center;color:var(--muted);background:#f9faf8}} .drop button{{display:block;margin:10px auto 0}} .drop.error{{border-color:#b42318;color:#b42318;background:#fff3f1}} .controls{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}} .spacer{{flex:1}} .empty{{padding:28px 12px;text-align:center;color:var(--muted)}}
+.drop{{margin:14px 0;border:2px dashed var(--line);border-radius:8px;padding:18px 10px;text-align:center;color:var(--muted);background:#f9faf8}} .drop button{{display:block;margin:10px auto 0}} .drop.error{{border-color:#b42318;color:#b42318;background:#fff3f1}} .controls{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}} .spacer{{flex:1}} .batch-footer{{padding:10px;border-top:1px solid var(--line);background:#fff}} .batch-footer .controls{{margin-top:6px}} #batchProgress{{font-weight:650;color:var(--accent)}} #reviewStatus{{font-size:12px;margin:6px 0 0;color:var(--muted)}} #reviewStatus.error{{color:#b42318}} .selected-preview{{border:2px solid var(--accent);border-radius:8px;padding:8px;margin:10px 0}} .selected-preview img{{display:block;width:100%;max-height:180px;object-fit:contain}} .empty{{padding:28px 12px;text-align:center;color:var(--muted)}}
 .reference-pane{{min-width:0;background:#fff;display:flex;flex-direction:column}} .reference-toolbar{{min-height:50px;display:flex;flex-wrap:wrap;align-items:end;border-bottom:1px solid var(--line);background:var(--bg)}} .reference-tabs{{display:flex;align-items:end;gap:4px;padding:8px 0 0 12px;flex:1}} .reference-tab{{display:inline-block;background:#fff;color:var(--ink);border:1px solid var(--line);border-radius:6px 6px 0 0;padding:8px 12px;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}} .reference-tab[aria-selected="true"]{{color:var(--accent);border-color:var(--accent);background:#fff}} .reference-controls{{display:flex;align-items:center;gap:12px;padding:6px 12px;font-size:13px;flex-wrap:wrap}} .reference-controls button{{padding:5px 10px}} .reference-status{{margin:0;padding:8px 12px;background:var(--bg);border-bottom:1px solid var(--line);color:var(--muted);font-size:13px}} .reference-panel{{flex:1;min-height:0;position:relative}} .reference-message{{max-width:620px;margin:11vh auto;padding:28px;border:1px solid var(--line);border-radius:10px;background:var(--bg);text-align:center}} .reference-message h2{{font-size:24px}} .reference-message p{{color:var(--muted)}} .reference-panel iframe{{display:block;width:100%;height:100%;border:0}} .query-field{{display:block;width:100%;min-height:88px;margin:16px 0 10px;resize:vertical;text-align:left}} .reference-actions{{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}} [hidden]{{display:none!important}}
 @media(max-width:560px){{body{{overflow:auto}} .workspace{{display:block;height:auto}} .review-column{{border-right:0}} .reference-pane{{min-height:70vh;border-top:1px solid var(--line)}}}}
 </style></head><body>
 <div class="workspace"><div class="review-column">
 <header><a class="control-panel-link" href="http://127.0.0.1:8766/?step=import_hub">← Project365 Control Panel</a><h1>Swarm representative-photo review</h1><span id="summary"></span><select id="filter"><option value="pending">Pending</option><option value="selected">Selected</option><option value="skipped">Skipped</option><option value="all">All</option></select></header>
-<main id="reviewPane" class="review-pane"><section id="entry" class="entry"><div class="empty">Loading…</div></section></main></div>
+<main id="reviewPane" class="review-pane"><section id="entry" class="entry"><div class="empty">Loading…</div></section></main><footer class="batch-footer"><div id="queuePosition" class="eyebrow" aria-live="polite"></div><div id="batchProgress" aria-live="polite">0 choices staged</div><div class="controls"><button id="submitBatch" class="primary" onclick="submitBatch()" disabled>Submit (0)</button><span class="status">Choices are staged until Submit.</span></div><p id="reviewStatus" role="status">Previous lets you revisit and change a staged choice.</p></footer></div>
 <aside class="reference-pane" aria-label="Venue references">
 <div class="reference-toolbar"><div class="reference-tabs" role="tablist" aria-label="Venue reference">
 <button class="reference-tab" data-reference="foursquare" role="tab" aria-selected="true" onclick="selectReference('foursquare')">Foursquare</button>
@@ -942,14 +1015,21 @@ header{{background:#ffffffee;border-bottom:1px solid var(--line);backdrop-filter
 </section>
 </aside></div>
 <script>
-const csrf={token_json};let index=0;let current=null;let commons=[];let currentCount=0;let activeReference='foursquare';let referenceWindow=null;let commonsRequestToken='';let referenceRequest=0;let referenceBusy=false;const referenceLoaded={{}};const referenceProviders=['foursquare','google','google-images'];
+const csrf={token_json};let index=0;let current=null;let commons=[];let currentCount=0;let reviewBusy=false;let loadRequest=0;let stagedCount=0;let activeReference='foursquare';let referenceWindow=null;let commonsRequestToken='';let referenceRequest=0;let referenceBusy=false;const referenceLoaded={{}};const referenceProviders=['foursquare','google','google-images'];
 const entryEl=document.getElementById('entry'),filterEl=document.getElementById('filter'),reviewPane=document.getElementById('reviewPane');
 async function jsonFetch(url,options={{}}){{const response=await fetch(url,options);let body;try{{body=await response.json()}}catch{{body={{error:`HTTP ${{response.status}}`}}}}if(!response.ok)throw new Error(body.error||`HTTP ${{response.status}}`);return body}}
 function esc(value){{return String(value??'').replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]))}}
 function summaryText(s){{return `${{s.pending}} pending · ${{s.selected}} selected · ${{s.skipped}} skipped · ${{s.with_local_candidates}} with local candidates`}}
-async function load(next=index){{index=Math.max(0,next);commons=[];const data=await jsonFetch(`/api/entry?status=${{encodeURIComponent(filterEl.value)}}&index=${{index}}`);document.getElementById('summary').textContent=summaryText(data.summary);index=data.index;if(current?.entry_token!==data.entry?.entry_token)resetReferenceFrames();current=data.entry;currentCount=data.count;render(currentCount);selectReference(activeReference,false)}}
+function reviewMessage(message,error=false){{const element=document.getElementById('reviewStatus');element.textContent=message;element.classList.toggle('error',error)}}
+function updateBatch(summary){{stagedCount=summary.staged||0;document.getElementById('batchProgress').textContent=`${{stagedCount}} choice${{stagedCount===1?'':'s'}} staged · ${{summary.staged_selected||0}} photo${{summary.staged_selected===1?'':'s'}} · ${{summary.staged_skipped||0}} skipped${{summary.staged_cleared?` · ${{summary.staged_cleared}} cleared`:''}}`;const button=document.getElementById('submitBatch');button.textContent=`Submit (${{stagedCount}})`;button.disabled=reviewBusy||!stagedCount}}
+function setReviewBusy(value){{reviewBusy=value;filterEl.disabled=value;document.getElementById('submitBatch').disabled=value||!stagedCount;for(const button of document.querySelectorAll('.review-navigation button'))button.disabled=value||(button.dataset.boundary==='true');const input=document.getElementById('localImageInput');if(input)input.disabled=value}}
+async function runReviewAction(action){{if(reviewBusy)return;setReviewBusy(true);try{{await action()}}catch(error){{reviewMessage(error.message,true)}}finally{{setReviewBusy(false)}}}}
+async function load(next=index,resume=false){{const request=++loadRequest;const requested=Math.max(0,next);const data=await jsonFetch(`/api/entry?status=${{encodeURIComponent(filterEl.value)}}&index=${{requested}}&resume=${{resume?1:0}}`);if(request!==loadRequest)return;commons=[];document.getElementById('summary').textContent=summaryText(data.summary);updateBatch(data.summary);index=data.index;const changed=current?.entry_token!==data.entry?.entry_token;if(changed)resetReferenceFrames();current=data.entry;currentCount=data.count;document.getElementById('queuePosition').textContent=current?`${{current.kind==='checkin'?'Check-in':'Tip'}} ${{index+1}} of ${{currentCount}}`:'Queue complete';render(currentCount);if(changed)reviewPane.scrollTop=0;selectReference(activeReference,false);setReviewBusy(reviewBusy)}}
+async function navigate(delta){{await runReviewAction(async()=>{{await load(index+delta);reviewMessage('Choices are staged until Submit. Use Previous or Next to review the batch.')}})}}
+async function saveChoice(operation,advance=true){{await runReviewAction(async()=>{{if(!current)return;const token=current.entry_token;await operation(token);await load(index+(advance?1:0));reviewMessage(advance&&index===currentCount-1&&current?.staged?'End of queue. Submit your staged choices, or use Previous to review them.':advance?'Choice staged. Use Previous to review, or Submit to commit the batch.':'Choice cleared. Any change to a submitted choice takes effect on Submit.')}})}}
+async function submitBatch(){{await runReviewAction(async()=>{{const result=await jsonFetch('/api/submit',{{method:'POST',headers:{{'X-Backfill-Token':csrf}}}});await load(0,true);reviewMessage(`Submitted ${{result.submitted}} choices. Ready for the next batch.`)}})}}
 function candidateCard(candidate,number,kind='local'){{const action=kind==='commons'?`chooseCommons('${{candidate.candidate_id}}')`:kind==='previous'?`choosePrevious('${{candidate.repeat_token}}')`:`chooseLocal('${{candidate.candidate_token}}')`;const source=candidate.source_url?`<a href="${{esc(candidate.source_url)}}" target="_blank" rel="noopener" onclick="event.stopPropagation()">source</a>`:'';const detail=kind==='commons'?`${{esc(candidate.author)}} · ${{esc(candidate.license)}}`:kind==='previous'?`Previously used for ${{esc(candidate.selected_for_date)}}`:esc(candidate.source_date);const sameVisitClass=candidate.same_visit?' same-visit':'';const sameVisitNote=candidate.same_visit?'<span class="visit-window">Within 7 days of this visit</span>':'';return `<article class="candidate${{sameVisitClass}}" onclick="${{action}}"><span class="number">${{number}}</span><img src="${{esc(candidate.preview_url||candidate.image_url)}}" alt="Representative candidate" loading="lazy"><div class="copy"><strong>${{esc(candidate.label||candidate.title)}}</strong><div class="source">${{detail}} ${{source}}</div>${{sameVisitNote}}</div></article>`}}
-function render(count){{if(!current){{entryEl.innerHTML='<div class="empty">No entries in this filter.</div>';updateReferencePane();return}}const localCards=current.local_candidates.map((candidate,i)=>candidateCard(candidate,i+1)).join('');const previousStart=current.local_candidates.length;const previousCards=current.previous_candidates.map((candidate,i)=>candidateCard(candidate,previousStart+i+1,'previous')).join('');const commonsStart=previousStart+current.previous_candidates.length;const commonsCards=commons.map((candidate,i)=>candidateCard(candidate,commonsStart+i+1,'commons')).join('');const archiveCards=localCards+commonsCards;const previousSection=previousCards?`<h3 class="candidate-heading">Previously selected for this venue</h3><div class="grid">${{previousCards}}</div>`:'';entryEl.innerHTML=`<div class="eyebrow">${{esc(current.kind)}} · ${{index+1}} of ${{count}}</div><h2>${{esc(current.title)}}</h2><div id="locationAddress" class="location-address"></div><div class="meta">${{esc(current.local_time)}} · ${{current.has_location?'Mapped location':'Location unresolved'}}</div>${{current.body?`<div class="note">${{esc(current.body)}}</div>`:''}}<div class="notice">Selected images are representative venue references—not photos captured during this visit.</div><h3 class="candidate-heading">Photos from this venue</h3><div class="grid">${{archiveCards||'<div class="empty">No exact-venue photos are available in the export.</div>'}}</div>${{previousSection}}<div class="controls"><button id="commonsButton" onclick="findCommons()">Find Wikimedia photos</button><span class="status" id="webStatus">On demand · 1–2 serial searches.</span></div><div id="drop" class="drop"><span id="dropStatus">Drop the image file directly on the native control below, or click Choose File.</span><input id="localImageInput" class="local-image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" onchange="handleChosenFile(this)"></div><div class="controls"><button onclick="load(index-1)">← Previous</button><button class="warn" onclick="decide('skip')">Skip (S)</button><button onclick="decide('clear')">Clear</button><span class="spacer"></span><button onclick="load(index+1)">Next →</button></div>`;updateLocationDisplay();updateReferencePane()}}
+function render(count){{if(!current){{entryEl.innerHTML='<div class="empty">No entries in this filter.</div>';updateReferencePane();return}}const choice=current.decision;const choiceLabel=current.staged?'Staged — not submitted':choice?'Submitted choice':'No choice staged';const selected=current.selected_candidate;const choicePreview=selected?`<div class="selected-preview"><strong>${{esc(choiceLabel)}}: photo selected</strong>${{selected.preview_url?`<img src="${{esc(selected.preview_url)}}" alt="Selected representative photo">`:'<p>Selected photo is missing. Choose it again before submitting.</p>'}}</div>`:`<p class="status">${{esc(choiceLabel)}}${{choice?.status==='skipped'?' · skipped':choice?.status==='pending'?' · cleared':''}}</p>`;const localCards=current.local_candidates.map((candidate,i)=>candidateCard(candidate,i+1)).join('');const previousStart=current.local_candidates.length;const previousCards=current.previous_candidates.map((candidate,i)=>candidateCard(candidate,previousStart+i+1,'previous')).join('');const commonsStart=previousStart+current.previous_candidates.length;const commonsCards=commons.map((candidate,i)=>candidateCard(candidate,commonsStart+i+1,'commons')).join('');const archiveCards=localCards+commonsCards;const previousSection=previousCards?`<h3 class="candidate-heading">Previously selected for this venue</h3><div class="grid">${{previousCards}}</div>`:'';entryEl.innerHTML=`<div class="eyebrow">${{esc(current.kind)}} · ${{index+1}} of ${{count}}</div><h2>${{esc(current.title)}}</h2>${{choicePreview}}<div id="locationAddress" class="location-address"></div><div class="meta">${{esc(current.local_time)}} · ${{current.has_location?'Mapped location':'Location unresolved'}}</div>${{current.body?`<div class="note">${{esc(current.body)}}</div>`:''}}<div class="notice">Selected images are representative venue references—not photos captured during this visit.</div><h3 class="candidate-heading">Photos from this venue</h3><div class="grid">${{archiveCards||'<div class="empty">No exact-venue photos are available in the export.</div>'}}</div>${{previousSection}}<div class="controls"><button id="commonsButton" onclick="findCommons()">Find Wikimedia photos</button><span class="status" id="webStatus">On demand · 1–2 serial searches.</span></div><div id="drop" class="drop"><span id="dropStatus">Drop the image file directly on the native control below, or click Choose File.</span><input id="localImageInput" class="local-image-input" type="file" accept="image/jpeg,image/png,image/heic,image/heif,.jpg,.jpeg,.png,.heic,.heif" onchange="handleChosenFile(this)"></div><div class="controls review-navigation"><button onclick="navigate(-1)" data-boundary="${{index===0}}" ${{index===0?'disabled':''}}>← Previous</button><button class="warn" onclick="decide('skip')">Skip (S)</button><button onclick="decide('clear')">Clear</button><span class="spacer"></span><button onclick="navigate(1)" data-boundary="${{index>=count-1}}" ${{index>=count-1?'disabled':''}}>Next →</button></div>`;updateLocationDisplay();updateReferencePane()}}
 function updateLocationDisplay(){{const element=document.getElementById('locationAddress');if(!element||!current)return;if(current.location?.available){{element.innerHTML=`${{esc(current.location.display)}}<a class="attribution" href="${{esc(current.location.attribution_url)}}" target="_blank" rel="noopener">${{esc(current.location.attribution)}}</a>`}}else if(current.location?.lookup_error)element.textContent=current.location.lookup_error;else if(!current.has_location)element.textContent='Address unavailable — this entry has no coordinates.';else if(current.location)element.textContent='No street address was found for these coordinates.';else element.textContent='Open Google Images to look up the address.'}}
 function referenceUrl(name=activeReference,embed=false){{
   if(!current)return '';
@@ -1043,22 +1123,22 @@ async function loadGoogleImagesLocation(){{
   return locationRequestPromise;
 }}
 async function copyGoogleImagesQuery(){{const field=document.getElementById('googleImagesQuery');if(!field.value)return;try{{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(field.value);else throw new Error('Clipboard API unavailable');document.getElementById('googleImagesStatus').textContent='Image-search query copied.'}}catch{{field.focus();field.select();document.execCommand('copy');document.getElementById('googleImagesStatus').textContent='Image-search query selected and copied.'}}}}
-async function chooseLocal(candidate){{await jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:current.entry_token,action:'select',candidate_token:candidate}})}});await load(index)}}
-async function choosePrevious(candidate){{await jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:current.entry_token,action:'select_previous',repeat_token:candidate}})}});await load(index)}}
-async function decide(action){{await jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:current.entry_token,action}})}});await load(index)}}
-async function findCommons(){{const token=current?.entry_token;if(!token||commonsRequestToken===token)return;commonsRequestToken=token;let status=document.getElementById('webStatus');const button=document.getElementById('commonsButton');if(button)button.disabled=true;status.textContent='Searching Wikimedia Commons…';try{{const results=await jsonFetch(`/api/commons?entry=${{encodeURIComponent(token)}}`);if(current?.entry_token!==token)return;commons=results;render(currentCount);status=document.getElementById('webStatus');status.textContent=commons.length?`${{commons.length}} licensed Commons candidates found.`:'No suitable Commons candidates found.'}}catch(error){{if(current?.entry_token===token){{status=document.getElementById('webStatus');if(status)status.textContent=error.message}}}}finally{{if(commonsRequestToken===token)commonsRequestToken='';if(current?.entry_token===token){{const currentButton=document.getElementById('commonsButton');if(currentButton)currentButton.disabled=false}}}}}}
-async function chooseCommons(candidate_id){{await jsonFetch('/api/select-commons',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:current.entry_token,candidate_id}})}});await load(index)}}
+async function chooseLocal(candidate){{await saveChoice(token=>jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:token,action:'select',candidate_token:candidate}})}}))}}
+async function choosePrevious(candidate){{await saveChoice(token=>jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:token,action:'select_previous',repeat_token:candidate}})}}))}}
+async function decide(action){{await saveChoice(token=>jsonFetch('/api/decision',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:token,action}})}}),action!=='clear')}}
+async function findCommons(){{if(reviewBusy)return;const token=current?.entry_token;if(!token||commonsRequestToken===token)return;commonsRequestToken=token;let status=document.getElementById('webStatus');const button=document.getElementById('commonsButton');if(button)button.disabled=true;status.textContent='Searching Wikimedia Commons…';try{{const results=await jsonFetch(`/api/commons?entry=${{encodeURIComponent(token)}}`);if(current?.entry_token!==token)return;commons=results;render(currentCount);status=document.getElementById('webStatus');status.textContent=commons.length?`${{commons.length}} licensed Commons candidates found.`:'No suitable Commons candidates found.'}}catch(error){{if(current?.entry_token===token){{status=document.getElementById('webStatus');if(status)status.textContent=error.message}}}}finally{{if(commonsRequestToken===token)commonsRequestToken='';if(current?.entry_token===token){{const currentButton=document.getElementById('commonsButton');if(currentButton)currentButton.disabled=false}}}}}}
+async function chooseCommons(candidate_id){{await saveChoice(token=>jsonFetch('/api/select-commons',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:token,candidate_id}})}}))}}
 function droppedFileLooksSupported(file){{const type=String(file?.type||'').split(';',1)[0].trim().toLowerCase();return ['image/jpeg','image/png','image/heic','image/heif'].includes(type)||/\\.(jpe?g|png|heic|heif)$/i.test(file?.name||'')}}
 function droppedImageFile(transfer){{const files=Array.from(transfer?.files||[]);for(const item of Array.from(transfer?.items||[])){{if(item.kind==='file'){{const file=item.getAsFile();if(file&&!files.includes(file))files.push(file)}}}}return files.find(droppedFileLooksSupported)||(files.length===1?files[0]:null)}}
 function describeDropTransfer(transfer){{const types=Array.from(transfer?.types||[]).join(', ')||'none';const items=Array.from(transfer?.items||[]).map(item=>`${{item.kind||'unknown'}}:${{item.type||'unknown'}}`).join(', ')||'none';const files=Array.from(transfer?.files||[]).map(file=>`${{file.name||'unnamed'}}:${{file.type||'unknown'}}:${{file.size||0}}`).join(', ')||'none';return `Safari exposed types=[${{types}}]; items=[${{items}}]; files=[${{files}}].`}}
 function droppedImageUrl(transfer){{const htmlValue=transfer.getData('text/html');if(htmlValue){{const documentValue=new DOMParser().parseFromString(htmlValue,'text/html');const image=documentValue.querySelector('img[src]');if(image?.src)return image.src}}const uri=transfer.getData('text/uri-list').split(String.fromCharCode(10)).map(value=>value.trim()).find(value=>value&&!value.startsWith('#'));if(uri?.toLowerCase().startsWith('https://'))return uri;const plain=transfer.getData('text/plain').trim();return plain.toLowerCase().startsWith('https://')?plain:''}}
 function dropStatus(message,error=false){{const zone=document.getElementById('drop'),status=document.getElementById('dropStatus');if(status)status.textContent=message;if(zone)zone.classList.toggle('error',error)}}
-async function uploadLocalFile(file){{if(!current||!file)return;const token=current.entry_token;const contentType=file.type||'application/octet-stream';dropStatus(`Uploading ${{file.name||'dropped image'}}…`);const bytes=await file.arrayBuffer();const payload=new Blob([bytes],{{type:contentType}});await jsonFetch(`/api/drop?entry=${{encodeURIComponent(token)}}&filename=${{encodeURIComponent(file.name||'')}}`,{{method:'POST',headers:{{'Content-Type':contentType,'X-Backfill-Token':csrf}},body:payload}});if(current?.entry_token===token)await load(index)}}
+async function uploadLocalFile(file){{if(!current||!file)return;await saveChoice(async token=>{{const contentType=file.type||'application/octet-stream';dropStatus(`Uploading ${{file.name||'dropped image'}}…`);const bytes=await file.arrayBuffer();const payload=new Blob([bytes],{{type:contentType}});await jsonFetch(`/api/drop?entry=${{encodeURIComponent(token)}}&filename=${{encodeURIComponent(file.name||'')}}`,{{method:'POST',headers:{{'Content-Type':contentType,'X-Backfill-Token':csrf}},body:payload}})}})}}
 async function handleChosenFile(input){{const file=input.files?.[0];if(!file)return;try{{await uploadLocalFile(file)}}catch(error){{dropStatus(error.message,true)}}finally{{input.value=''}}}}
-async function handleDrop(event){{event.preventDefault();reviewPane.classList.remove('drop-active');if(!current)return;const token=current.entry_token;const file=droppedImageFile(event.dataTransfer);const sourceUrl=file?'':droppedImageUrl(event.dataTransfer);if(!file&&!sourceUrl){{console.warn(describeDropTransfer(event.dataTransfer));dropStatus('Safari did not provide the dragged file. Drop it directly on Choose File below.',true);const input=document.getElementById('localImageInput');if(input)input.focus();return}}try{{if(file)await uploadLocalFile(file);else{{dropStatus('Fetching dragged image…');await jsonFetch('/api/drop-url',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:token,source_url:sourceUrl}})}});if(current?.entry_token===token)await load(index)}}}}catch(error){{dropStatus(error.message,true)}}}}
+async function handleDrop(event){{event.preventDefault();reviewPane.classList.remove('drop-active');if(!current)return;const token=current.entry_token;const file=droppedImageFile(event.dataTransfer);const sourceUrl=file?'':droppedImageUrl(event.dataTransfer);if(!file&&!sourceUrl){{console.warn(describeDropTransfer(event.dataTransfer));dropStatus('Safari did not provide the dragged file. Drop it directly on Choose File below.',true);const input=document.getElementById('localImageInput');if(input)input.focus();return}}try{{if(file)await uploadLocalFile(file);else{{dropStatus('Fetching dragged image…');await saveChoice(entryToken=>jsonFetch('/api/drop-url',{{method:'POST',headers:{{'Content-Type':'application/json','X-Backfill-Token':csrf}},body:JSON.stringify({{entry_token:entryToken,source_url:sourceUrl}})}}))}}}}catch(error){{dropStatus(error.message,true)}}}}
 function dropTargetsReviewPane(event){{if(reviewPane.contains(event.target))return true;const rect=reviewPane.getBoundingClientRect();return event.clientX>=rect.left&&event.clientX<=rect.right&&event.clientY>=rect.top&&event.clientY<=rect.bottom}}
 function wireDrop(){{for(const name of ['dragenter','dragover'])window.addEventListener(name,event=>{{if(event.target?.id==='localImageInput')return;if(!dropTargetsReviewPane(event))return;event.preventDefault();event.dataTransfer.dropEffect='copy';reviewPane.classList.add('drop-active')}});reviewPane.addEventListener('dragleave',event=>{{if(!reviewPane.contains(event.relatedTarget))reviewPane.classList.remove('drop-active')}});window.addEventListener('drop',event=>{{if(event.target?.id==='localImageInput')return;if(!dropTargetsReviewPane(event))return;handleDrop(event)}})}}
-filterEl.addEventListener('change',()=>{{index=0;load(0)}});document.addEventListener('keydown',event=>{{if(event.metaKey||event.ctrlKey||event.altKey)return;const n=Number(event.key);const candidates=[...current?.local_candidates||[],...current?.previous_candidates||[],...commons];if(n>=1&&n<=candidates.length){{event.preventDefault();const candidate=candidates[n-1];if(n<=current.local_candidates.length)chooseLocal(candidate.candidate_token);else if(n<=current.local_candidates.length+current.previous_candidates.length)choosePrevious(candidate.repeat_token);else chooseCommons(candidate.candidate_id)}}else if(event.key.toLowerCase()==='s'){{event.preventDefault();decide('skip')}}else if(event.key==='ArrowLeft'){{event.preventDefault();load(index-1)}}else if(event.key==='ArrowRight'){{event.preventDefault();load(index+1)}}}});wireDrop();load();
+filterEl.addEventListener('change',()=>{{runReviewAction(()=>load(0))}});document.addEventListener('keydown',event=>{{if(reviewBusy||event.metaKey||event.ctrlKey||event.altKey||event.target?.closest?.('input,textarea,select,[contenteditable]'))return;const n=Number(event.key);const candidates=[...current?.local_candidates||[],...current?.previous_candidates||[],...commons];if(n>=1&&n<=candidates.length){{event.preventDefault();const candidate=candidates[n-1];if(n<=current.local_candidates.length)chooseLocal(candidate.candidate_token);else if(n<=current.local_candidates.length+current.previous_candidates.length)choosePrevious(candidate.repeat_token);else chooseCommons(candidate.candidate_id)}}else if(event.key.toLowerCase()==='s'){{event.preventDefault();decide('skip')}}else if(event.key==='ArrowLeft'){{event.preventDefault();navigate(-1)}}else if(event.key==='ArrowRight'){{event.preventDefault();navigate(1)}}}});wireDrop();runReviewAction(()=>load(0,true));
 </script></body></html>""")
 
 
@@ -1077,7 +1157,9 @@ def create_handler(state: BackfillReviewState) -> type[BaseHTTPRequestHandler]:
                     if status not in {"pending", "selected", "skipped", "all"}:
                         raise ValueError("Invalid review filter")
                     index = int(query.get("index", ["0"])[0])
-                    self._send_json(state.entry_payload(status, index))
+                    self._send_json(state.entry_payload(
+                        status, index, resume=query.get("resume", [""])[0] == "1",
+                    ))
                 elif parsed.path == "/api/summary":
                     self._send_json(state.summary())
                 elif parsed.path == "/api/location":
@@ -1122,6 +1204,10 @@ def create_handler(state: BackfillReviewState) -> type[BaseHTTPRequestHandler]:
                             str(payload.get("entry_token", "")),
                             str(payload.get("source_url", "")),
                         )
+                    elif parsed.path == "/api/submit":
+                        submitted = state.submit()
+                        self._send_json({"ok": True, "submitted": submitted, "summary": state.summary()})
+                        return
                     elif parsed.path == "/api/decision":
                         action = payload.get("action")
                         if action == "select":

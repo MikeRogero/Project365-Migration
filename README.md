@@ -394,6 +394,12 @@ The lifecycle scripts manage:
 | Swarm photo order and crop queue | 8772 | Starts when opened from Control |
 | Twitter/X diary review | 8773 | Starts when opened from Control |
 
+Swarm missing-photo review stages photo choices and skips until you press
+**Submit**. The queue position advances through the batch, and the fixed footer
+shows its staged count. **Previous** revisits choices; **Clear** removes a draft
+or stages clearing a submitted choice. Drafts survive refreshes and restarts;
+only submitted choices are used by exports.
+
 Start reuses an existing Control Panel and leaves already-running review tools
 alone. Stop reports failure with a nonzero exit code and retains the PID record
 for a server it cannot stop. SQLite needs no separate server. LM Studio remains
