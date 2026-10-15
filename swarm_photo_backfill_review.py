@@ -25,6 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from project365_service_activity import (
+    activity_handler,
+    inject_activity,
+    start_idle_shutdown,
+)
 from swarm_dayone_importer import Entry, Photo, _build_entries, _export_root
 
 
@@ -905,7 +910,7 @@ class BackfillReviewState:
 
 def _review_html(csrf_token: str) -> str:
     token_json = json.dumps(csrf_token)
-    return f"""<!doctype html>
+    return inject_activity(f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Swarm representative-photo review</title>
 <style>
@@ -1054,7 +1059,7 @@ async function handleDrop(event){{event.preventDefault();reviewPane.classList.re
 function dropTargetsReviewPane(event){{if(reviewPane.contains(event.target))return true;const rect=reviewPane.getBoundingClientRect();return event.clientX>=rect.left&&event.clientX<=rect.right&&event.clientY>=rect.top&&event.clientY<=rect.bottom}}
 function wireDrop(){{for(const name of ['dragenter','dragover'])window.addEventListener(name,event=>{{if(event.target?.id==='localImageInput')return;if(!dropTargetsReviewPane(event))return;event.preventDefault();event.dataTransfer.dropEffect='copy';reviewPane.classList.add('drop-active')}});reviewPane.addEventListener('dragleave',event=>{{if(!reviewPane.contains(event.relatedTarget))reviewPane.classList.remove('drop-active')}});window.addEventListener('drop',event=>{{if(event.target?.id==='localImageInput')return;if(!dropTargetsReviewPane(event))return;handleDrop(event)}})}}
 filterEl.addEventListener('change',()=>{{index=0;load(0)}});document.addEventListener('keydown',event=>{{if(event.metaKey||event.ctrlKey||event.altKey)return;const n=Number(event.key);const candidates=[...current?.local_candidates||[],...current?.previous_candidates||[],...commons];if(n>=1&&n<=candidates.length){{event.preventDefault();const candidate=candidates[n-1];if(n<=current.local_candidates.length)chooseLocal(candidate.candidate_token);else if(n<=current.local_candidates.length+current.previous_candidates.length)choosePrevious(candidate.repeat_token);else chooseCommons(candidate.candidate_id)}}else if(event.key.toLowerCase()==='s'){{event.preventDefault();decide('skip')}}else if(event.key==='ArrowLeft'){{event.preventDefault();load(index-1)}}else if(event.key==='ArrowRight'){{event.preventDefault();load(index+1)}}}});wireDrop();load();
-</script></body></html>"""
+</script></body></html>""")
 
 
 def create_handler(state: BackfillReviewState) -> type[BaseHTTPRequestHandler]:
@@ -1192,7 +1197,10 @@ def main() -> int:
     root = _export_root(args.source)
     entries, _, _, _ = _build_entries(root)
     state = BackfillReviewState(entries, args.state_dir, geocoder_url=args.geocoder_url)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), create_handler(state))
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", args.port), activity_handler(create_handler(state))
+    )
+    start_idle_shutdown(server)
     print(json.dumps({
         "url": f"http://127.0.0.1:{args.port}/",
         "targets": len(state.targets),

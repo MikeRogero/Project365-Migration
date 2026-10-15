@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -22,6 +23,54 @@ import project365_control_app as control
 
 
 class Project365ControlAppTests(unittest.TestCase):
+    def test_video_links_use_on_demand_control_gateway(self) -> None:
+        self.assertIn('href="/video-review-tool?view=triage"', control.CONTROL_HTML)
+        self.assertIn('href="/video-review-tool?view=detail"', control.CONTROL_HTML)
+        self.assertNotIn('href="http://127.0.0.1:8767/', control.CONTROL_HTML)
+
+    def test_video_gateway_starts_service_and_redirects_to_requested_view(self) -> None:
+        config = control.ControlConfig("127.0.0.1", 0, "/picker")
+        server = control.ThreadingHTTPServer(("127.0.0.1", 0), control.create_handler(mock.Mock(), config))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with mock.patch.object(control, "_start_video_review_tool", return_value={"url": "http://127.0.0.1:8767/triage"}) as start:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                connection.request("GET", "/video-review-tool?view=triage")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 302)
+                self.assertEqual(response.getheader("Location"), "http://127.0.0.1:8767/triage")
+                start.assert_called_once_with("triage")
+                response.read()
+                connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_video_start_reuses_managed_service_and_renews_page_activity(self) -> None:
+        with (
+            mock.patch.object(control.service_lifecycle, "start_video_memory_review", return_value={"running": True, "url": "http://127.0.0.1:8767"}) as start,
+            mock.patch.object(control, "_keep_review_tool_alive") as keep_alive,
+        ):
+            result = control._start_video_review_tool("triage")
+            self.assertEqual(result["url"], "http://127.0.0.1:8767/triage")
+            start.assert_called_once()
+            keep_alive.assert_called_once_with("http://127.0.0.1:8767")
+        with mock.patch.object(control.service_lifecycle, "start_video_memory_review") as start:
+            with self.assertRaises(ValueError):
+                control._start_video_review_tool("invalid")
+            start.assert_not_called()
+
+    def test_explicit_tool_open_renews_activity_with_local_post(self) -> None:
+        response = mock.MagicMock()
+        with mock.patch.object(control.urllib.request, "urlopen", return_value=response) as urlopen:
+            control._keep_review_tool_alive("http://127.0.0.1:8771/")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8771/api/service-activity")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("X-project365-page"), "1")
+
     def test_twitter_review_tool_is_exposed_in_import_hub(self) -> None:
         html = control.CONTROL_HTML
 
@@ -68,6 +117,7 @@ class Project365ControlAppTests(unittest.TestCase):
                 }
             }
             with (
+                mock.patch.object(control, "_keep_review_tool_alive"),
                 mock.patch.object(control, "_swarm_review_tool_specs", return_value=specs),
                 mock.patch.object(control.import_sources, "resolve_swarm"),
                 mock.patch.object(control, "_swarm_review_tools_status", return_value={
@@ -1651,8 +1701,8 @@ class Project365ControlAppTests(unittest.TestCase):
     def test_video_memory_review_is_available_from_control_panel(self) -> None:
         self.assertIn("video_memory_review", control.WORKFLOW_STEPS)
         self.assertIn('data-step="video_memory_review"', control.CONTROL_HTML)
-        self.assertIn('href="http://127.0.0.1:8767/triage"', control.CONTROL_HTML)
-        self.assertIn('href="http://127.0.0.1:8767/"', control.CONTROL_HTML)
+        self.assertIn('href="/video-review-tool?view=triage"', control.CONTROL_HTML)
+        self.assertIn('href="/video-review-tool?view=detail"', control.CONTROL_HTML)
         self.assertIn('id="videoMemoryStartDate"', control.CONTROL_HTML)
         self.assertIn('id="videoMemoryEndDate"', control.CONTROL_HTML)
         self.assertIn("function runVideoMemoryReview()", control.CONTROL_HTML)

@@ -251,7 +251,7 @@ class Project365ControlServiceTests(unittest.TestCase):
         )
         terminate.assert_called_once_with([12347])
 
-    def test_start_project365_services_starts_control_video_and_swarm_backfill(self) -> None:
+    def test_start_project365_services_starts_only_the_control_panel(self) -> None:
         config = service.ServiceConfig()
         with (
             mock.patch.object(
@@ -259,101 +259,62 @@ class Project365ControlServiceTests(unittest.TestCase):
                 "start_control_panel",
                 return_value={"status": "started", "running": True, "pid": 1},
             ) as start_control,
-            mock.patch.object(
-                service,
-                "start_video_memory_review",
-                return_value={"status": "started", "running": True, "pid": 2},
-            ) as start_video,
-            mock.patch.object(
-                service,
-                "start_swarm_backfill_review",
-                return_value={"status": "started", "running": True, "pid": 3},
-            ) as start_swarm,
-            mock.patch.object(service, "start_review_service", return_value={"status": "running", "running": True}) as start_review,
+            mock.patch.object(service, "start_video_memory_review") as start_video,
+            mock.patch.object(service, "start_swarm_backfill_review") as start_swarm,
+            mock.patch.object(service, "start_review_service") as start_review,
+            mock.patch.object(service, "stop_project365_servers") as stop_all,
         ):
             result = service.start_project365_services(config)
 
         self.assertTrue(result["running"])
         self.assertEqual(result["status"], "started")
         start_control.assert_called_once_with(config)
-        start_video.assert_called_once_with(config)
-        start_swarm.assert_called_once_with(config)
-        self.assertEqual(start_review.call_args_list, [mock.call(config, "swarm_media"), mock.call(config, "twitter")])
-        self.assertEqual(set(result["services"]), {"control", "video", "swarm_backfill", "swarm_media", "twitter"})
+        self.assertEqual(result["services"], {"control": {"status": "started", "running": True, "pid": 1}})
+        start_video.assert_not_called()
+        start_swarm.assert_not_called()
+        start_review.assert_not_called()
+        stop_all.assert_not_called()
 
-    def test_start_project365_services_rolls_back_new_control_when_video_fails(self) -> None:
+    def test_control_running_is_healthy_with_optional_services_stopped(self) -> None:
         config = service.ServiceConfig()
         with (
-            mock.patch.object(
-                service,
-                "start_control_panel",
-                return_value={"status": "started", "running": True, "pid": 12345},
-            ),
-            mock.patch.object(service, "start_video_memory_review", side_effect=RuntimeError("video failed")),
-            mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
-            mock.patch.object(service, "_remove_pid_record") as remove_record,
+            mock.patch.object(service, "service_status", return_value={"running": True, "status": "running"}),
+            mock.patch.object(service, "video_service_status", return_value={"running": False, "status": "stopped"}),
+            mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": False, "status": "stopped"}),
+            mock.patch.object(service, "review_service_status", return_value={"running": False, "status": "stopped"}),
         ):
-            with self.assertRaisesRegex(RuntimeError, "video failed"):
-                service.start_project365_services(config)
+            result = service.project365_services_status(config)
 
-        terminate.assert_called_once_with(12345)
-        remove_record.assert_called_once_with(config.pid_path)
-
-    def test_start_project365_services_rolls_back_new_services_when_swarm_fails(self) -> None:
-        config = service.ServiceConfig()
+        self.assertTrue(result["running"])
+        self.assertEqual(result["status"], "running")
+        status_text = service._human_status(result)
+        self.assertIn("Video: stopped (starts on demand)", status_text)
+        self.assertIn("Swarm photo order and crops: stopped (starts on demand)", status_text)
+        self.assertIn("Twitter diary review: stopped (starts on demand)", status_text)
         with (
-            mock.patch.object(
-                service,
-                "start_control_panel",
-                return_value={"status": "started", "running": True, "pid": 12345},
-            ),
-            mock.patch.object(
-                service,
-                "start_video_memory_review",
-                return_value={"status": "started", "running": True, "pid": 12346},
-            ),
-            mock.patch.object(
-                service,
-                "start_swarm_backfill_review",
-                side_effect=RuntimeError("swarm failed"),
-            ),
-            mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
-            mock.patch.object(service, "_remove_pid_record") as remove_record,
+            mock.patch.object(service.sys, "argv", ["project365_control_service.py", "status"]),
+            mock.patch.object(service, "project365_services_status", return_value=result),
+            mock.patch("builtins.print"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "swarm failed"):
-                service.start_project365_services(config)
+            self.assertEqual(service.main(), 0)
 
-        self.assertEqual(terminate.call_args_list, [mock.call(12346), mock.call(12345)])
-        self.assertEqual(
-            remove_record.call_args_list,
-            [mock.call(config.video_pid_path), mock.call(config.pid_path)],
-        )
-
-    def test_project365_services_status_is_partial_when_video_is_stopped(self) -> None:
+    def test_control_down_is_unhealthy_even_when_optional_services_run(self) -> None:
         config = service.ServiceConfig()
         with (
-            mock.patch.object(service, "service_status", return_value={"running": True}),
-            mock.patch.object(service, "video_service_status", return_value={"running": False}),
-            mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": True}),
-        ):
-            with mock.patch.object(service, "review_service_status", return_value={"running": True}):
-                result = service.project365_services_status(config)
-
-        self.assertFalse(result["running"])
-        self.assertEqual(result["status"], "partial")
-
-    def test_project365_services_status_is_partial_when_swarm_backfill_is_stopped(self) -> None:
-        config = service.ServiceConfig()
-        with (
-            mock.patch.object(service, "service_status", return_value={"running": True}),
+            mock.patch.object(service, "service_status", return_value={"running": False, "status": "stopped"}),
             mock.patch.object(service, "video_service_status", return_value={"running": True}),
-            mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": False}),
+            mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": True}),
+            mock.patch.object(service, "review_service_status", return_value={"running": True, "status": "running"}),
         ):
-            with mock.patch.object(service, "review_service_status", return_value={"running": True}):
-                result = service.project365_services_status(config)
+            result = service.project365_services_status(config)
 
         self.assertFalse(result["running"])
-        self.assertEqual(result["status"], "partial")
+        with (
+            mock.patch.object(service.sys, "argv", ["project365_control_service.py", "status"]),
+            mock.patch.object(service, "project365_services_status", return_value=result),
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(service.main(), 1)
 
     def test_review_commands_include_expected_sources_outputs_and_ports(self) -> None:
         config = service.ServiceConfig(swarm_media_port=9879, twitter_port=9880)
@@ -407,32 +368,25 @@ class Project365ControlServiceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "did not respond"):
                     service._wait_for_review_service(config, key, process, timeout_seconds=0.01)
 
-    def test_start_rolls_back_new_services_when_twitter_fails_and_preserves_existing(self) -> None:
-        config = service.ServiceConfig()
-        with (
-            mock.patch.object(service, "start_control_panel", return_value={"status": "running", "running": True, "pid": 1}),
-            mock.patch.object(service, "start_video_memory_review", return_value={"status": "started", "running": True, "pid": 2}),
-            mock.patch.object(service, "start_swarm_backfill_review", return_value={"status": "started", "running": True, "pid": 3}),
-            mock.patch.object(service, "start_review_service", side_effect=[{"status": "started", "running": True, "pid": 4}, RuntimeError("twitter failed")]),
-            mock.patch.object(service, "_terminate_process_group", return_value=True) as terminate,
-            mock.patch.object(service, "_remove_pid_record"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "twitter failed"):
-                service.start_project365_services(config)
-        self.assertEqual(terminate.call_args_list, [mock.call(4), mock.call(3), mock.call(2)])
-
-    def test_status_is_partial_when_either_new_review_server_is_stopped(self) -> None:
+    def test_status_stays_healthy_when_either_new_optional_server_is_stopped(self) -> None:
         for stopped_key in ("swarm_media", "twitter"):
             with (
                 self.subTest(key=stopped_key),
                 mock.patch.object(service, "service_status", return_value={"running": True}),
                 mock.patch.object(service, "video_service_status", return_value={"running": True}),
                 mock.patch.object(service, "swarm_backfill_service_status", return_value={"running": True}),
-                mock.patch.object(service, "review_service_status", side_effect=lambda config, key: {"running": key != stopped_key}),
+                mock.patch.object(
+                    service,
+                    "review_service_status",
+                    side_effect=lambda config, key: {
+                        "running": key != stopped_key,
+                        "status": "running" if key != stopped_key else "stopped",
+                    },
+                ),
             ):
                 result = service.project365_services_status(service.ServiceConfig())
-            self.assertEqual(result["status"], "partial")
-            self.assertFalse(result["running"])
+            self.assertEqual(result["status"], "running")
+            self.assertTrue(result["running"])
 
     def test_stop_detects_unmanaged_new_review_servers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -554,28 +508,6 @@ class Project365ControlServiceTests(unittest.TestCase):
                     service.start_review_service(config, "twitter")
             record = json.loads(config.twitter_pid_path.read_text())
             self.assertEqual(record["pid"], 12348)
-
-    def test_failed_start_rollback_retains_record_and_reports_cleanup_failure(self) -> None:
-        config = service.ServiceConfig()
-        with (
-            mock.patch.object(service, "start_control_panel", return_value={"status": "running", "running": True, "pid": 1}),
-            mock.patch.object(
-                service,
-                "start_video_memory_review",
-                side_effect=lambda _config: (
-                    service._write_service_pid_record(
-                        config.video_pid_path, 2, config.host, config.video_port,
-                        config.video_url, config.video_log_path,
-                    )
-                    or {"status": "started", "running": True, "pid": 2}
-                ),
-            ),
-            mock.patch.object(service, "start_swarm_backfill_review", side_effect=RuntimeError("later service failed")),
-            mock.patch.object(service, "_terminate_process_group", return_value=False),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "rollback.*failed|cleanup failed"):
-                service.start_project365_services(config)
-        self.assertTrue(config.video_pid_path.exists())
 
     def test_command_detection_excludes_review_export_and_metadata_jobs(self) -> None:
         self.assertTrue(service._is_project365_server_command("python3 twitter_dayone_workflow.py --source example serve"))

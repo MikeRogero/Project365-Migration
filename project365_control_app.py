@@ -35,6 +35,7 @@ from project365_original_reference_pipeline import (
     REJECT_DECISIONS,
 )
 from project365_media_derivatives import DEFAULT_DERIVATIVE_POLICY, derivative_readiness_summary
+import project365_control_service as service_lifecycle
 import project365_original_picker as original_picker
 import project365_crop_workbench as crop_workbench
 import project365_broad_visual_match as broad_visual_match
@@ -81,6 +82,7 @@ _FACEBOOK_PACKAGE_CACHE: dict[str, Any] = {"key": None, "record": None}
 _PREPARED_IMPORT_COUNT_CACHE: dict[str, Any] = {"key": None, "counts": {}}
 _SWARM_REVIEW_LOCK = threading.Lock()
 _TWITTER_REVIEW_LOCK = threading.Lock()
+_VIDEO_REVIEW_LOCK = threading.Lock()
 
 
 def _swarm_review_tool_specs() -> dict[str, dict[str, Any]]:
@@ -189,6 +191,29 @@ def _import_sources_status() -> dict[str, Any]:
     return payload
 
 
+def _keep_review_tool_alive(url: str) -> None:
+    request = urllib.request.Request(
+        f"{url.rstrip('/')}/api/service-activity",
+        data=b"", method="POST", headers={"X-Project365-Page": "1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2):
+            pass
+    except (OSError, urllib.error.URLError):
+        # Older running services have no heartbeat endpoint until restarted.
+        pass
+
+
+def _start_video_review_tool(view: str = "detail") -> dict[str, Any]:
+    if view not in {"triage", "detail"}:
+        raise ValueError("Unknown video review view")
+    with _VIDEO_REVIEW_LOCK:
+        result = service_lifecycle.start_video_memory_review(service_lifecycle.ServiceConfig())
+        base = str(result["url"]).rstrip("/")
+        _keep_review_tool_alive(base)
+        return {**result, "url": f"{base}/triage" if view == "triage" else f"{base}/"}
+
+
 def _start_swarm_review_tool(key: str, timeout_seconds: float = 45.0) -> dict[str, Any]:
     specs = _swarm_review_tool_specs()
     if key not in specs:
@@ -197,6 +222,7 @@ def _start_swarm_review_tool(key: str, timeout_seconds: float = 45.0) -> dict[st
     with _SWARM_REVIEW_LOCK:
         existing = _swarm_review_tools_status()[key]
         if existing["running"]:
+            _keep_review_tool_alive(existing["url"])
             return existing
         spec = specs[key]
         log_path = Path(spec["log"])
@@ -220,6 +246,7 @@ def _start_swarm_review_tool(key: str, timeout_seconds: float = 45.0) -> dict[st
             summary = _local_json(str(spec["health_url"]), timeout=0.8)
             required_keys = set(spec.get("required_summary_keys", ()))
             if summary is not None and required_keys.issubset(summary):
+                _keep_review_tool_alive(spec["url"])
                 return {
                     "label": spec["label"], "url": spec["url"],
                     "running": True, "summary": summary,
@@ -235,6 +262,7 @@ def _start_twitter_review_tool(timeout_seconds: float = 45.0) -> dict[str, Any]:
     with _TWITTER_REVIEW_LOCK:
         existing = _twitter_review_tool_status()
         if existing["running"]:
+            _keep_review_tool_alive(existing["url"])
             return existing
         log_path = Path(spec["log"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +284,7 @@ def _start_twitter_review_tool(timeout_seconds: float = 45.0) -> dict[str, Any]:
                 raise RuntimeError(f"Twitter diary review exited early. Check {log_path}.")
             summary = _local_json(str(spec["health_url"]), timeout=0.8)
             if summary is not None and set(spec["required_summary_keys"]).issubset(summary):
+                _keep_review_tool_alive(spec["url"])
                 return {
                     "label": spec["label"], "url": spec["url"],
                     "running": True, "summary": summary,
@@ -4432,6 +4461,13 @@ def create_handler(state: ControlState, config: ControlConfig) -> type[BaseHTTPR
                     )
                 elif parsed.path == "/api/import-sources":
                     self._send_json(_import_sources_status())
+                elif parsed.path == "/video-review-tool":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    tool_status = _start_video_review_tool(query.get("view", ["detail"])[0])
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("location", str(tool_status["url"]))
+                    self.send_header("cache-control", "no-store")
+                    self.end_headers()
                 elif parsed.path == "/swarm-review-tool":
                     source_status = _import_sources_status()
                     if "swarm" not in source_status["enabled"]:
@@ -10402,8 +10438,8 @@ def _patch_control_html(html: str) -> str:
       <div class="subtle">Leave both dates blank for all indexed capture dates. A start month means the full month; a start day means that day when no end is entered.</div>
       <div class="button-row">
         <button class="button primary" type="button" onclick="runVideoMemoryReview()">Prepare missing videos</button>
-        <a class="button primary" href="http://127.0.0.1:8767/triage">Continue rapid triage</a>
-        <a class="button" href="http://127.0.0.1:8767/">Open detailed video review</a>
+        <a class="button primary" href="/video-review-tool?view=triage">Continue rapid triage</a>
+        <a class="button" href="/video-review-tool?view=detail">Open detailed video review</a>
       </div>
       <div id="videoMemoryReviewMessage" class="inline-status" role="status" aria-live="polite"></div>
       <div class="step-result" data-step-result="video_memory_review"></div>

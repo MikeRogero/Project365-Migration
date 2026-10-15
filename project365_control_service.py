@@ -376,39 +376,14 @@ def _wait_for_review_service(
 
 def start_project365_services(config: ServiceConfig) -> dict[str, Any]:
     control = start_control_panel(config)
-    started_services = [(control, config.pid_path)]
-    try:
-        video = start_video_memory_review(config)
-        started_services.append((video, config.video_pid_path))
-        swarm_backfill = start_swarm_backfill_review(config)
-        started_services.append((swarm_backfill, config.swarm_backfill_pid_path))
-        services = {"control": control, "video": video, "swarm_backfill": swarm_backfill}
-        for key in ("swarm_media", "twitter"):
-            services[key] = start_review_service(config, key)
-            started_services.append((services[key], _review_service_spec(config, key)["pid_path"]))
-    except Exception as error:
-        failed_cleanup: list[int] = []
-        for item, pid_path in reversed(started_services):
-            if item.get("status") == "started" and item.get("pid"):
-                pid = int(item["pid"])
-                if _terminate_process_group(pid):
-                    _remove_pid_record(pid_path)
-                else:
-                    failed_cleanup.append(pid)
-        if failed_cleanup:
-            raise RuntimeError(
-                f"Startup rollback failed; could not stop processes {failed_cleanup}. PID records retained."
-            ) from error
-        raise
-    running = all(bool(item.get("running")) for item in services.values())
-    started = any(item.get("status") == "started" for item in services.values())
+    running = bool(control.get("running"))
     return {
-        "status": "started" if running and started else "running" if running else "partial",
+        "status": control.get("status", "running" if running else "stopped"),
         "running": running,
-        "services": services,
-        "message": "All five Project365 services are running."
+        "services": {"control": control},
+        "message": "Project365 Control Panel is running."
         if running
-        else "Only some Project365 services are running.",
+        else "Project365 Control Panel is not running.",
     }
 
 
@@ -559,16 +534,14 @@ def project365_services_status(config: ServiceConfig) -> dict[str, Any]:
     services = {"control": control, "video": video, "swarm_backfill": swarm_backfill}
     for key in ("swarm_media", "twitter"):
         services[key] = review_service_status(config, key)
-    running_count = sum(bool(item.get("running")) for item in services.values())
+    running = bool(control.get("running"))
     return {
-        "status": "running" if running_count == len(services) else "partial" if running_count else "stopped",
-        "running": running_count == len(services),
+        "status": "running" if running else "stopped",
+        "running": running,
         "services": services,
-        "message": "All five Project365 services are running."
-        if running_count == len(services)
-        else "Only some Project365 services are running."
-        if running_count
-        else "No Project365 service is running.",
+        "message": "Project365 Control Panel is running; optional review tools start on demand."
+        if running
+        else "Project365 Control Panel is stopped; optional tools may still be running.",
     }
 
 
@@ -978,7 +951,10 @@ def _human_status(result: dict[str, Any]) -> str:
             item = services.get(key)
             if not isinstance(item, dict):
                 continue
-            lines.append(f"{label}: {item.get('status', 'unknown')}")
+            status = str(item.get("status", "unknown"))
+            if key in {"video", "swarm_backfill", "swarm_media", "twitter"} and not item.get("running"):
+                status += " (starts on demand)"
+            lines.append(f"{label}: {status}")
             if item.get("url"):
                 lines.append(f"  URL: {item['url']}")
             if item.get("pid"):

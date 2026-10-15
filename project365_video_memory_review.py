@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from project365_photo_library_index import VIDEO_EXTENSIONS
+from project365_service_activity import activity_handler, inject_activity, start_idle_shutdown
 
 
 FRAME_COUNT = 16
@@ -4870,6 +4871,16 @@ class VideoMemoryServerState:
         self._synopsis_threads: dict[str, threading.Thread] = {}
         self.synopsis_root = (self.canonical_root / "media" / "video_synopses").resolve()
 
+    def has_background_work(self) -> bool:
+        with self._render_lock:
+            if self._render_thread is not None and self._render_thread.is_alive():
+                return True
+        with self._playback_job_lock:
+            if any(thread.is_alive() for thread in self._playback_threads.values()):
+                return True
+        with self._synopsis_job_lock:
+            return any(thread.is_alive() for thread in self._synopsis_threads.values())
+
     def ready_playback_path(self, video_id: str) -> Path | None:
         path = playback_proxy_path(self.cache_root, video_id)
         return path if path.is_file() and path.stat().st_size > 0 else None
@@ -5586,7 +5597,7 @@ def create_handler(state: VideoMemoryServerState) -> type[BaseHTTPRequestHandler
             return payload
 
         def _send_html(self, value: str) -> None:
-            payload = value.encode("utf-8")
+            payload = inject_activity(value).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("cache-control", "no-store")
@@ -5662,7 +5673,8 @@ def serve(canonical_root: Path, host: str = "127.0.0.1", port: int = 8767) -> No
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Video Memory Review must bind to loopback")
     state = VideoMemoryServerState(canonical_root)
-    server = ThreadingHTTPServer((host, port), create_handler(state))
+    server = ThreadingHTTPServer((host, port), activity_handler(create_handler(state)))
+    start_idle_shutdown(server, busy=state.has_background_work)
     print(f"Video Memory Review: http://{host}:{server.server_port}/", flush=True)
     try:
         server.serve_forever()

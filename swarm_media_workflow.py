@@ -21,6 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from project365_service_activity import (
+    activity_handler,
+    inject_activity,
+    start_idle_shutdown,
+)
+
 from project365_digikam_people_importer import _extract_people_from_xmp
 from project365_media_derivatives import _convert_image_atomically
 from project365_original_picker import _normalized_review_crop
@@ -870,7 +876,7 @@ class SwarmMediaReviewState:
 
 
 def _order_html(csrf: str) -> str:
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    return inject_activity(f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Swarm photo order</title><style>{_COMMON_CSS}
 .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}}.photo-slot{{min-width:0;padding:8px;border:3px dashed #aeb5ad;border-radius:12px;background:#f7f9f7;transition:border-color .12s,background .12s,box-shadow .12s}}.slot-label{{display:flex;justify-content:space-between;gap:8px;align-items:center;min-height:30px;padding:0 3px 7px;color:var(--muted);font-size:13px;font-weight:700}}.slot-position{{color:var(--ink)}}.slot-hint{{white-space:nowrap}}.slot-content{{min-height:304px}}.photo-slot.cover-slot{{border-color:var(--accent)}}.photo-slot.rejected-slot{{border-style:dotted;background:#f3f3f0}}.grid.drag-active .photo-slot:not(.rejected-slot){{border-color:#6c9c94;background:#f1f8f6}}.photo-slot.drop-target{{border-color:var(--accent)!important;border-style:solid!important;background:var(--accent-soft)!important;box-shadow:0 0 0 4px #17695d2e}}.photo-slot.drop-target .slot-hint{{color:var(--accent)}}.photo-slot.drag-source{{opacity:.6}}.photo{{height:100%;background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:grab}}.photo.dragging{{opacity:.35}}.photo.rejected{{cursor:default;border-style:dashed;opacity:.72}}.photo.rejected img{{filter:grayscale(1)}}.photo img{{width:100%;height:220px;object-fit:cover;display:block;background:#eef0ed}}.copy{{padding:10px}}.item-actions{{display:flex;gap:8px;align-items:center;margin-top:10px}}.item-actions button{{flex:1 1 0}}.item-actions button[aria-pressed="true"]{{background:var(--accent);border-color:var(--accent);color:#fff}}.item-actions .reject[aria-pressed="true"]{{background:#8b2c2c;border-color:#8b2c2c}}.submit-count{{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;margin-left:5px;padding:0 6px;border-radius:11px;background:#fff;color:var(--accent);font-size:12px;font-weight:800}}#orderStatus{{color:var(--muted)}}button:disabled{{opacity:.45;cursor:default}}</style></head><body>
 <header><a class="control-panel-link" href="http://127.0.0.1:8766/?step=import_hub">← Project365 Control Panel</a><h1>Swarm photo order</h1><span id="summary"></span><span id="orderStatus" role="status"></span><button class="tool-link" id="scopeButton" onclick="toggleScope()">All items</button><a class="tool-link" href="http://127.0.0.1:8766/crop?provider=swarm">Open shared crop workbench</a><button class="tool-link primary" id="submitOrdersButton" onclick="submitOrders()" disabled>Submit <span class="submit-count" id="stagedOrderCount">0</span></button></header><main><section class="panel" id="entry">Loading…</section></main>
@@ -891,7 +897,7 @@ async function queueCrop(photo_token,selected){{syncCurrentOrder();const d=await
 async function setRejected(photo_token,rejected){{syncCurrentOrder();const d=await api('/api/reject',{{method:'POST',headers:{{'Content-Type':'application/json','X-Swarm-Token':csrf}},body:JSON.stringify({{photo_token,rejected}})}});current.photos.find(photo=>photo.photo_token===photo_token).rejected=rejected;updateHeader(d.summary);render(entryCount)}}
 async function submitOrders(){{if(submitting||!summary?.pending_order_commit_count)return;const status=document.getElementById('orderStatus');submitting=true;updateHeader(summary);status.textContent='Submitting…';try{{const d=await api('/api/submit-orders',{{method:'POST',headers:{{'Content-Type':'application/json','X-Swarm-Token':csrf}},body:'{{}}'}});status.textContent=`Submitted ${{d.submitted_count}} order${{d.submitted_count===1?'':'s'}}.`;updateHeader(d.summary);revisitFrontier=null;await load(allItems?Math.min(index,Math.max(0,d.summary.multi_photo_entry_count-1)):0,true)}}catch(error){{status.textContent=error.message}}finally{{submitting=false;updateHeader(summary)}}}}
 function toggleScope(){{allItems=!allItems;index=0;revisitFrontier=null;load(0,true)}}
-document.onkeydown=e=>{{if(e.key==='ArrowLeft')goPrevious();if(e.key==='ArrowRight')stageAndNext()}};load(0,true);</script></body></html>"""
+document.onkeydown=e=>{{if(e.key==='ArrowLeft')goPrevious();if(e.key==='ArrowRight')stageAndNext()}};load(0,true);</script></body></html>""")
 
 
 _COMMON_CSS = """
@@ -1053,7 +1059,10 @@ def main() -> int:
     if not 1024 <= args.port <= 65535:
         raise ValueError("Port must be between 1024 and 65535")
     state = SwarmMediaReviewState(store)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), create_handler(state))
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", args.port), activity_handler(create_handler(state))
+    )
+    start_idle_shutdown(server)
     print(json.dumps({"url": f"http://127.0.0.1:{args.port}/", "sync": sync, "summary": store.summary()}, indent=2))
     try:
         server.serve_forever()

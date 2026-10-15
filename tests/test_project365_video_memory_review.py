@@ -17,6 +17,19 @@ import project365_video_memory_review as review
 
 
 class VideoMemoryReviewTests(unittest.TestCase):
+    def test_idle_shutdown_waits_for_render_playback_and_synopsis_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = review.VideoMemoryServerState(Path(temporary))
+            self.assertFalse(state.has_background_work())
+            for attribute in ("_render_thread", "_playback_threads", "_synopsis_threads"):
+                with self.subTest(attribute=attribute):
+                    worker = mock.Mock()
+                    worker.is_alive.return_value = True
+                    setattr(state, attribute, worker if attribute == "_render_thread" else {"fixture": worker})
+                    self.assertTrue(state.has_background_work())
+                    worker.is_alive.return_value = False
+                    self.assertFalse(state.has_background_work())
+
     def _add_duplicate_test_video(
         self,
         store: review.VideoMemoryStore,

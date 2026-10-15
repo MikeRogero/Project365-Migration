@@ -360,7 +360,7 @@ Source Data/Original Photos matching Project365 Entries/
 
 ## Quick Start: Guided Workflow
 
-Start the local control panel and all five project services:
+Start the local control panel:
 
 ```sh
 ./start_project365.sh --open
@@ -372,27 +372,32 @@ Check server status:
 ./project365_status.sh
 ```
 
-Stop all five project services, including review servers opened from the Control Panel:
+Stop the control panel and any review servers that were opened from it:
 
 ```sh
 ./stop_project365.sh
 ```
 
-The start, status, and stop scripts manage:
+The control panel starts the review services when you open them. Stopped optional
+services appear as “starts on demand” in status output. A review tool stays
+ready while its local page sends heartbeats. It stops after 15 minutes with
+no page heartbeat and no active work; opening it again starts or reuses it.
+`./stop_project365.sh` still stops the Control Panel and all review services.
 
-| Service | Default port |
-| --- | --- |
-| Control Panel, Original Picker, and shared Crop Workbench | 8766 |
-| Video memory review and rapid triage | 8767 |
-| Swarm missing-photo review | 8771 |
-| Swarm photo order and crop queue | 8772 |
-| Twitter/X diary review | 8773 |
+The lifecycle scripts manage:
 
-Start reuses existing servers. If a later service fails to start, it stops only
-servers newly launched by that invocation. Stop reports failure with a nonzero
-exit code and retains the PID record for a server it cannot stop. SQLite needs
-no separate server. LM Studio remains an optional, manually started dependency
-for AI crop estimates.
+| Service | Default port | Lifecycle |
+| --- | --- | --- |
+| Control Panel, Original Picker, and shared Crop Workbench | 8766 | Starts with `start_project365.sh` |
+| Video memory review and rapid triage | 8767 | Starts when opened from Control |
+| Swarm missing-photo review | 8771 | Starts when opened from Control |
+| Swarm photo order and crop queue | 8772 | Starts when opened from Control |
+| Twitter/X diary review | 8773 | Starts when opened from Control |
+
+Start reuses an existing Control Panel and leaves already-running review tools
+alone. Stop reports failure with a nonzero exit code and retains the PID record
+for a server it cannot stop. SQLite needs no separate server. LM Studio remains
+an optional, manually started dependency for AI crop estimates.
 
 The default control-panel URL is:
 

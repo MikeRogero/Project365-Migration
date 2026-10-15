@@ -30,6 +30,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from project365_service_activity import (
+    activity_handler,
+    inject_activity,
+    start_idle_shutdown,
+)
+
 
 SCHEMA_VERSION = "1"
 DAYONE_MEDIA_LIMIT = 30
@@ -1080,7 +1086,7 @@ class TwitterReviewState:
 
 def _review_html(csrf_token: str) -> str:
     token = html.escape(csrf_token, quote=True)
-    return f"""<!doctype html>
+    return inject_activity(f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Twitter diary review</title>
 <style>
@@ -1114,7 +1120,7 @@ function message(value){{document.getElementById('message').textContent=value}}
 async function save(decision,reviewed){{if(!current)return;try{{await request('/api/review',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{entry_key:current.entry_key,decision,rating,title:document.getElementById('entryTitle').value,body:document.getElementById('entryBody').value,context_note:document.getElementById('contextNote').value,reviewed}})}});message(reviewed?'Decision saved.':'Draft saved.');await load()}}catch(error){{message(error.message)}}}}
 async function buildExport(){{try{{const payload=await request('/api/export',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{limit:Number(document.getElementById('exportLimit').value)}})}});message(`Created ${{payload.entry_count}}-entry ZIP: ${{payload.package_path}}`)}}catch(error){{message(error.message)}}}}
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>{{document.querySelectorAll('[data-view]').forEach(x=>x.classList.remove('active'));button.classList.add('active');view=button.dataset.view;index=0;load()}}));renderRating();load();
-</script></body></html>"""
+</script></body></html>""")
 
 
 def create_handler(state: TwitterReviewState) -> type[BaseHTTPRequestHandler]:
@@ -1267,7 +1273,10 @@ def main() -> int:
         print(json.dumps(build_reviewed_package(store, args.output_dir, limit=args.limit), indent=2))
         return 0
     state = TwitterReviewState(store, args.output_dir.expanduser().resolve(), secrets.token_urlsafe(32))
-    server = ThreadingHTTPServer((args.host, args.port), create_handler(state))
+    server = ThreadingHTTPServer(
+        (args.host, args.port), activity_handler(create_handler(state))
+    )
+    start_idle_shutdown(server)
     print(f"Twitter diary review: http://{args.host}:{server.server_port}/", flush=True)
     print(json.dumps(summary, sort_keys=True), flush=True)
     try:
