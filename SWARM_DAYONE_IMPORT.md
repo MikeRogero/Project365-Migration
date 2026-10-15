@@ -107,28 +107,29 @@ same exact Foursquare venue appear in a separate reusable-choice section.
 The review workspace keeps the decision tool in the left 25% and venue
 references in the right 75%, with Foursquare first, Google Maps second, and
 Google Images third.
-Foursquare sends `X-Frame-Options: SAMEORIGIN`, so its photos page opens in one
-reused right-side browser window; Google Maps is embedded in the page. After
-the Foursquare window is opened once, it follows the current check-in. A local
-image file or an image from any publicly routable HTTPS host can be dropped
-anywhere in the left pane. Local/private-network targets, insecure URLs, and
-unsupported drag payloads produce a visible error.
+Google Maps loads inside its panel only when its tab or **Update map** is
+pressed. Foursquare and Google Images refuse embedding, so each tab instead
+shows one central **Open in new window** button. Selecting either tab makes no
+provider or address-lookup request. Opening the tool, changing entries, and
+rendering candidates make no provider requests. Auto-submit has been removed,
+including reuse of the old browser preference.
 
-Provider access is deliberately lazy. **Auto-submit** defaults off, so loading,
-navigating, or selecting a provider sends no request to Foursquare, Google, or
-OpenStreetMap. Each provider has an explicit Submit button. Google Images
-reverse-geocodes the entry only after submission, displays the cached address
-below the venue name, and prepares an exact venue-plus-address query. Nominatim
-requests are serialized to at most one per second and cached atomically in
-`location_cache.json`; results are attributed to OpenStreetMap contributors.
+The Open buttons request one popup-sized named window shared by the photo
+services. Subsequent explicit Open clicks reuse it when the browser allows.
+There are no additional reference links or blocked iframe attempts. Browser
+preferences, popup blocking, and provider isolation policies can affect window
+reuse and whether it opens as a window or tab. No headers, cookies, or browser
+fingerprints are changed to bypass provider restrictions.
+
+Google Images reverse-geocodes only after its Open button is pressed, displays
+the cached address below the venue name, and prepares a venue-plus-address query.
+Nominatim requests are serialized to at most one per second and cached atomically
+in `location_cache.json`; results are attributed to OpenStreetMap contributors.
 The endpoint can be replaced with `--geocoder-url`.
 
-The Auto-submit choice is stored locally in the browser. When enabled, only the
-selected provider follows later target changes. Foursquare and Google Images
-still need one user-initiated submission to establish their reusable browser
-windows because browsers block unsolicited popups; Google Maps can update its
-embedded frame directly. Google Images opens a blank reusable window first,
-then navigates it once to the completed venue-plus-address search.
+A local image file or an image from a publicly routable HTTPS host can be dropped
+anywhere in the left pane. Local/private-network targets, insecure URLs, and
+unsupported drag payloads produce a visible error.
 
 ```sh
 python3 swarm_photo_backfill_review.py \

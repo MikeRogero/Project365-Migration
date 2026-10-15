@@ -4,9 +4,11 @@ import datetime as dt
 import io
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import time
+import textwrap
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -223,7 +225,7 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
             "Example+State%2C+Example+Country",
         )
 
-    def test_reference_workspace_is_foursquare_first_and_uses_a_25_75_split(self) -> None:
+    def test_reference_workspace_has_three_tabs_and_maps_iframe(self) -> None:
         html = _review_html("csrf")
 
         self.assertIn("grid-template-columns:25% 75%", html)
@@ -233,11 +235,13 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
             html.index('data-reference="foursquare"'),
             html.index('data-reference="google"'),
         )
-        self.assertIn("Submit to Foursquare", html)
-        self.assertIn('target="swarm-location-window"', html)
         self.assertIn('id="googleFrame"', html)
-        self.assertIn('id="submitGoogleMaps"', html)
-        self.assertIn("Submit to Google Maps", html)
+        self.assertNotIn('id="foursquareFrame"', html)
+        self.assertNotIn('id="googleImagesFrame"', html)
+        self.assertIn('id="foursquareButton"', html)
+        self.assertIn('id="openGoogleImages"', html)
+        self.assertIn('Open Foursquare in new window', html)
+        self.assertIn('Open Google Images in new window', html)
 
     def test_google_images_is_a_third_tab_after_google_maps(self) -> None:
         html = _review_html("csrf")
@@ -247,97 +251,127 @@ class SwarmPhotoBackfillReviewTests(unittest.TestCase):
         self.assertLess(maps_tab, images_tab)
         self.assertIn("Google Images", html[images_tab:])
         self.assertIn('id="googleImagesPanel"', html)
-        self.assertIn('id="googleImagesQuery"', html)
-        self.assertIn('id="copyGoogleImages"', html)
-        self.assertIn('id="openGoogleImages"', html)
-        self.assertIn("Copy search", html)
-        self.assertIn("Submit to Google Images", html)
-        self.assertIn("document.getElementById('googleImagesPanel').hidden=name!=='google-images'", html)
-        self.assertIn(
-            '<a class="reference-tab" data-reference="google-images" role="tab" '
-            'aria-selected="false" href="https://www.google.com/search?tbm=isch" '
-            'target="swarm-google-images-window" rel="noopener" '
-            'onclick="selectReference(\'google-images\');return false">Google Images</a>',
-            html,
-        )
-        load_function = html[
-            html.index("async function load(next=index)"):
-            html.index("function candidateCard")
-        ]
-        self.assertNotIn("/api/location", load_function)
+        self.assertIn("onclick=\"openReferenceWindow()\"", html)
+        for provider in ("foursquare", "google", "google-images"):
+            self.assertIn(f"selectReference('{provider}')", html)
+        self.assertNotIn("autoSubmit", html)
 
-    def test_auto_submit_defaults_off_and_persists_the_user_choice(self) -> None:
+    def test_reference_ui_loads_only_after_explicit_user_actions(self) -> None:
+        """Execute the emitted browser script with deterministic DOM/network stubs."""
         html = _review_html("csrf")
-
-        self.assertIn('id="autoSubmit" type="checkbox"', html)
-        self.assertNotIn('id="autoSubmit" type="checkbox" checked', html)
-        self.assertIn(
-            "let autoSubmit=localStorage.getItem(autoSubmitKey)==='true'",
-            html,
+        node_harness = textwrap.dedent(r"""
+            const assert = require('node:assert/strict');
+            const vm = require('node:vm');
+            const html = require('node:fs').readFileSync(0, 'utf8');
+            const match = html.match(/<script>([\s\S]*?)<\/script>/);
+            assert.ok(match, 'review page emits a script');
+            const ids = ['entry','filter','reviewPane','summary','referenceTitle',
+              'foursquarePanel','foursquarePrompt','foursquareButton','googlePanel','googleFrame',
+              'googleMapsPrompt','googleImagesPanel','googleImagesPrompt','googleImagesQuery',
+              'copyGoogleImages','googleImagesStatus','openGoogleImages','locationAddress',
+              'drop','dropStatus','localImageInput','commonsButton','webStatus','referenceStatus',
+              'referenceUpdate'];
+            const loads = [];
+            const popups = [];
+            const navigations = [];
+            const elements = Object.fromEntries(ids.map(id => [id, {
+              id, dataset:{}, classList:{add(){},remove(){},toggle(){}},
+              setAttribute(){}, addEventListener(){}, removeAttribute(name){if(name==='src')this.src=''},
+              focus(){}, select(){}, contains(){return false}, getBoundingClientRect(){return {left:0,right:100,bottom:100,top:0}},
+              _src:'', set src(value){this._src=value;if(value)loads.push([id,value])}, get src(){return this._src}
+            }]));
+            const tabs = ['foursquare','google','google-images'].map(name => ({
+              dataset:{reference:name}, setAttribute(key,value){this[key]=value}
+            }));
+            const document = {
+              getElementById(id){return elements[id] || (elements[id]={id,dataset:{},classList:{add(){},remove(){},toggle(){}},setAttribute(){},addEventListener(){},removeAttribute(){},focus(){},select(){}})},
+              querySelectorAll(selector){return selector==='.reference-tab'?tabs:[]},
+              addEventListener(){}, createElement(){return {click(){}}}, execCommand(){return true}
+            };
+            let resolveLocation;
+            let entryNumber = 0;
+            const entries = [0,1].map(n => ({
+              entry_token:`entry-${n}`, title:`Venue ${n}`, kind:'checkin', local_time:'', body:'',
+              has_location:true, location:null, local_candidates:[], previous_candidates:[],
+              foursquare_url:`https://foursquare.example/venue/${n}`,
+              google_maps_url:`https://maps.example/search/${n}`,
+              google_maps_embed_url:`https://maps.example/embed/${n}`,
+              google_images_query:`Venue ${n}`, google_images_url:`https://images.example/search/${n}`
+            }));
+            let locationCall=0;
+            const fetch = async url => {
+              if(url.startsWith('/api/entry')) {
+                entryNumber = Number(new URL(url,'http://local').searchParams.get('index'));
+                return {ok:true,json:async()=>({index:entryNumber,count:2,entry:entries[entryNumber],summary:{pending:2,selected:0,skipped:0,with_local_candidates:0}})};
+              }
+              if(url.startsWith('/api/location')) {
+                locationCall++;
+                if(locationCall===1) return new Promise(resolve=>{resolveLocation=()=>resolve({ok:true,json:async()=>({available:true,google_images_query:'old query',google_images_url:'https://images.example/old'})})});
+                return {ok:true,json:async()=>({available:true,google_images_query:'resolved query',google_images_url:'https://images.example/resolved'})};
+              }
+              throw new Error(`Unexpected fetch: ${url}`);
+            };
+            const window = {addEventListener(){},open(url,name,features){
+              popups.push({url,name,features});
+              return {closed:false,focus(){},location:{set href(value){navigations.push(value)}}};
+            }};
+            const context = {document,window,fetch,localStorage:{getItem(){return 'true'},setItem(){}},
+              navigator:{},screen:{availWidth:1200,availHeight:800,availLeft:0,availTop:0},
+              console:{warn(){}},URL,Blob,DOMParser:class{},setTimeout,clearTimeout};
+            let script = match[1];
+            script = script.replace(/wireDrop\(\);\s*load\(\);\s*$/, `wireDrop(); globalThis.__test={load,selectReference,submitSelectedReference,openReferenceWindow}; globalThis.__initialLoad=load();`);
+            vm.runInNewContext(script, context, {timeout:2000});
+            (async()=>{
+              await context.__initialLoad;
+              assert.equal(loads.length,0,'startup ignores the legacy auto-submit preference');
+              assert.equal(popups.length,0,'startup does not open a reference window');
+              await context.__test.selectReference('google');
+              assert.deepEqual(loads.map(([id])=>id),['googleFrame'],'explicit submit loads only the selected iframe');
+              assert.equal(loads.at(-1)[1],entries[0].google_maps_embed_url);
+              await context.__test.selectReference('google');
+              assert.equal(loads.length,1,'repeating the same provider and URL is deduplicated');
+              await context.__test.submitSelectedReference(true);
+              assert.equal(loads.length,2,'Update forces one reload');
+              loads.length=0;
+              await context.__test.load(1);
+              assert.equal(loads.length,0,'Next does not load external content');
+              await context.__test.selectReference('google-images');
+              assert.equal(loads.length,0,'Google Images tab only selects its panel');
+              assert.equal(popups.length,0,'Google Images tab does not open a window');
+              assert.equal(locationCall,0,'Google Images tab does not geocode');
+              const staleWindowClick = context.__test.openReferenceWindow();
+              assert.equal(popups.length,1,'explicit Google Images button opens one named window');
+              assert.equal(popups[0].url,'about:blank');
+              assert.equal(popups[0].name,'swarm-reference-window');
+              assert.equal(navigations.length,0,'Google Images window waits for its address lookup');
+              assert.equal(locationCall,1);
+              assert.equal(typeof resolveLocation,'function','explicit image search starts address lookup');
+              await context.__test.load(0);
+              resolveLocation();
+              await staleWindowClick;
+              assert.equal(loads.length,0,'Google Images fallback never assigns a provider iframe');
+              assert.deepEqual(navigations,[],'stale geocoder response cannot navigate the wrong entry');
+              await context.__test.selectReference('foursquare');
+              await context.__test.openReferenceWindow();
+              assert.equal(popups.length,1,'Foursquare reuses the named Google Images window');
+              assert.deepEqual(navigations,['https://foursquare.example/venue/0'],'explicit Foursquare button navigates to the selected provider');
+              await context.__test.selectReference('google-images');
+              assert.equal(locationCall,1,'returning to the tab still does not geocode');
+              await context.__test.openReferenceWindow();
+              assert.equal(locationCall,2,'explicit Google Images button performs address lookup');
+              assert.equal(loads.length,0,'only Google Maps uses an iframe');
+              assert.equal(popups.length,1,'Google Images reuses the same fallback window');
+              assert.deepEqual(navigations,['https://foursquare.example/venue/0','https://images.example/resolved']);
+            })().catch(error=>{console.error(error);process.exitCode=1});
+        """)
+        result = subprocess.run(
+            ["node", "-e", node_harness],
+            input=html,
+            text=True,
+            capture_output=True,
+            check=False,
         )
-        self.assertIn("autoSubmitEl.checked=autoSubmit", html)
-        self.assertIn(
-            "localStorage.setItem(autoSubmitKey,String(autoSubmit))",
-            html,
-        )
-
-    def test_entry_load_keeps_provider_but_only_submits_when_auto_enabled(self) -> None:
-        html = _review_html("csrf")
-        load_function = html[
-            html.index("async function load(next=index)"):
-            html.index("function candidateCard")
-        ]
-        select_function = html[
-            html.index("async function selectReference"):
-            html.index("function setAutoSubmit")
-        ]
-        submit_function = html[
-            html.index("async function submitSelectedReference"):
-            html.index("function syncFoursquareWindow")
-        ]
-        reference_pane_function = html[
-            html.index("function updateReferencePane"):
-            html.index("async function selectReference")
-        ]
-
-        self.assertNotIn("activeReference='foursquare'", load_function)
-        self.assertIn("selectReference(activeReference,false)", load_function)
-        self.assertIn("if(autoSubmit)await submitSelectedReference()", load_function)
-        self.assertNotIn("await submitSelectedReference()", load_function.replace(
-            "if(autoSubmit)await submitSelectedReference()", ""
-        ))
-        self.assertIn(
-            "if(submit&&autoSubmit)",
-            select_function,
-        )
-        self.assertIn(
-            "if(activeReference==='foursquare')syncFoursquareWindow()",
-            submit_function,
-        )
-        self.assertIn("else if(activeReference==='google')submitGoogleMaps()", submit_function)
-        self.assertIn(
-            "else if(activeReference==='google-images'){"
-            "if(!windowIsOpen(googleImagesWindow))return;await loadGoogleImagesLocation();"
-            "syncGoogleImagesWindow()}",
-            submit_function,
-        )
-        self.assertIn("googleMapsEntryToken===current?.entry_token", reference_pane_function)
-        self.assertNotIn("activeReference==='google')", reference_pane_function)
-
-    def test_all_three_providers_have_manual_submit_paths(self) -> None:
-        html = _review_html("csrf")
-        google_images_submit = html[
-            html.index("async function openGoogleImages"):
-            html.index("async function chooseLocal")
-        ]
-
-        self.assertIn('onclick="openFoursquare()">Submit to Foursquare', html)
-        self.assertIn('onclick="submitGoogleMaps()">Submit to Google Maps', html)
-        self.assertIn('onclick="openGoogleImages()">Submit to Google Images', html)
-        self.assertIn("Submit to Google Images to look up the address.", html)
-        self.assertIn("window.open('about:blank'", html)
-        self.assertIn("await loadGoogleImagesLocation()", google_images_submit)
-        self.assertIn("syncGoogleImagesWindow()", google_images_submit)
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_foursquare_photo_deep_link_is_appended_exactly_once(self) -> None:
         entry = self._entry("checkin:target", "checkin", 2020, venue_id="venue-1")
